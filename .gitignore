@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime / debug
+bot.log
+_debug/
+_help_preview.png
+
+# OS
+Thumbs.db
+desktop.ini
