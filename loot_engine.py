@@ -19,9 +19,10 @@ class LootEngine:
         h, w = frame_shape[:2]
         return (w // 2 + self.center_offset[0], h // 2 + self.center_offset[1])
 
-    def targets_in_radius(self, points, frame_shape):
-        """Цели (cx, cy, area) в пределах радиуса от центра персонажа."""
-        cx, cy = self.center(frame_shape)
+    def targets_in_radius(self, points, frame_shape, center=None):
+        """Цели (cx, cy, area) в пределах радиуса от центра персонажа.
+        center — переопределить центр (для детекции по ROI-кропу вокруг персонажа)."""
+        cx, cy = center if center is not None else self.center(frame_shape)
         r2 = self.radius * self.radius
         return [p for p in points if (p[0] - cx) ** 2 + (p[1] - cy) ** 2 <= r2]
 

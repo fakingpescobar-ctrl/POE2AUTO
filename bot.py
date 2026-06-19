@@ -137,6 +137,19 @@ def main():
         crop_cfg["orb"] = {"cx": (ocx - ox1) / sw, "cy": (ocy - oy1) / sh, "r": orp / sh}
         hp_det_crop = HPDetector(crop_cfg)
 
+    # быстрый захват лута: детектим не весь экран, а окно вокруг персонажа
+    # (лут важен только в радиусе подбора) → в разы меньше пикселей, выше fps.
+    lr = int(loot["pickup_radius_px"] * 1.15)   # радиус подбора + запас
+    lccx = region["left"] + region["width"] // 2 + loot["center_offset_xy"][0]
+    lccy = region["top"] + region["height"] // 2 + loot["center_offset_xy"][1]
+    ll = max(region["left"], lccx - lr)
+    lt = max(region["top"], lccy - lr)
+    lrr = min(region["left"] + region["width"], lccx + lr)
+    lbb = min(region["top"] + region["height"], lccy + lr)
+    loot_region = {"left": ll, "top": lt, "width": lrr - ll, "height": lbb - lt}
+    loot_center = (lccx - ll, lccy - lt)        # центр персонажа в координатах ROI
+    log.info("Захват лута: ROI %s, центр персонажа в кропе %s", loot_region, loot_center)
+
     if hp_det:
         log.info("Автофляска ВКЛ: порог=%.0f%% кулдаун=%dмс подтв=%d кадра кнопка=%s | быстрый захват орба %s",
                  hp_threshold * 100, hp_cfg.get("cooldown_ms", 3000), hp_confirm,
@@ -197,23 +210,36 @@ def main():
         while not stop.is_set():
             foreground = win.is_foreground() if win.hwnd else True
 
-            # F8 включён → грабим весь экран (нужен для детекции лута).
-            # F8 выключен → грабим только зону орба → высокий fps, мгновенная фляга.
-            # Диагностика (F7) → принудительно полный кадр, чтобы улика содержала весь экран.
-            if auto.on or orb_region is None or diag.enabled:
-                frame = cap.grab(region)
-                hp_d, hp_frame = hp_det, frame
+            # --- захват ---
+            # F8/F7 → ОДИН полный грабь, из него вырезаем зону орба (HP) и ROI вокруг
+            #   персонажа (лут). Один грабь принципиально: dxcam на второй вызов подряд
+            #   отдаёт устаревший кадр (None→last), что ломало детекцию лута.
+            # F8 выкл → грабим только кроп орба → высокий fps.
+            if auto.on or diag.enabled or orb_region is None:
+                full = cap.grab(region)
+                if full is None:
+                    time.sleep(0.02)
+                    continue
+                hp_frame, hp_d = full, hp_det        # measure() кропает орб сам — дёшево
+                if auto.on:
+                    lx = loot_region["left"] - region["left"]
+                    ly = loot_region["top"] - region["top"]
+                    loot_frame = full[ly:ly + loot_region["height"],
+                                      lx:lx + loot_region["width"]]
+                    loot_ctr = loot_center
+                else:
+                    loot_frame, loot_ctr = None, None
             else:
-                frame = cap.grab(orb_region)
-                hp_d, hp_frame = hp_det_crop, frame
-            if frame is None:
-                time.sleep(0.02)
-                continue
+                hp_frame, hp_d = cap.grab(orb_region), hp_det_crop
+                loot_frame, loot_ctr = None, None
+                if hp_frame is None:
+                    time.sleep(0.02)
+                    continue
 
-            # детекция лута — тяжёлая (полный кадр), только при включённом авто-подборе
-            if auto.on:
-                points, _mask = det.detect(frame)
-                in_radius = engine.targets_in_radius(points, frame.shape)
+            # детекция лута — только окно вокруг персонажа (радиус подбора)
+            if auto.on and loot_frame is not None:
+                points, _mask = det.detect(loot_frame)
+                in_radius = engine.targets_in_radius(points, loot_frame.shape, center=loot_ctr)
                 if foreground and in_radius and engine.ready():
                     vx.tap(pickup_mask, hold_ms)
                     engine.mark_pressed()
@@ -231,9 +257,9 @@ def main():
                 if manual_shot.is_set():
                     manual_shot.clear()
                     diag.manual(hp_frame, hp_d, hm, foreground)
-                    # если автоподбор вкл (кадр полный) — заодно снимок лут-детекции
-                    if auto.on and frame is not None:
-                        dump_loot(diag.n, frame, det, engine, foreground)
+                    # если автоподбор вкл — заодно снимок лут-детекции (по ROI вокруг персонажа)
+                    if auto.on and loot_frame is not None:
+                        dump_loot(diag.n, loot_frame, det, engine, foreground, loot_ctr)
                 if foreground:
                     # дебаунс. None (орб не распознан/мерцание) НЕ сбрасывает стрик —
                     # иначе на низком HP мерцание роняет счётчик и фляга не жмётся.

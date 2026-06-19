@@ -80,16 +80,17 @@ def dump_event(tag, n, frame, det, m, foreground):
     log.info("       файлы: %s_{full,crop,mask,vis}.png", os.path.basename(base))
 
 
-def dump_loot(n, frame, det, engine, foreground):
+def dump_loot(n, frame, det, engine, foreground, center=None):
     """Снимок лут-детекции: что детектор принял за лут (для отладки ложных целей).
-    Сохраняет full/mask/vis (точки обведены, радиус подбора — жёлтый круг)."""
+    Сохраняет full/mask/vis (точки обведены, радиус подбора — жёлтый круг).
+    center — центр персонажа в координатах кадра (для ROI-кропа)."""
     os.makedirs(EVT_DIR, exist_ok=True)
     ts = datetime.now().strftime("%H%M%S_%f")[:-3]
     base = os.path.join(EVT_DIR, f"{ts}_{n:04d}_loot")
 
     points, mask = det.detect(frame)
-    cx, cy = engine.center(frame.shape)
-    in_r = engine.targets_in_radius(points, frame.shape)
+    cx, cy = center if center is not None else engine.center(frame.shape)
+    in_r = engine.targets_in_radius(points, frame.shape, center=center)
     in_set = {(p[0], p[1]) for p in in_r}
 
     vis = frame.copy()
