@@ -7,6 +7,7 @@ venv/
 
 # Runtime / debug
 bot.log
+hp_diag.log
 _debug/
 _help_preview.png
 

@@ -24,9 +24,9 @@ loot:
 hp:
   enabled: true
   orb:
-    cx: 0.0789
-    cy: 0.9035
-    r: 0.0847
+    cx: 0.0732
+    cy: 0.8712
+    r: 0.0799
   threshold: 0.88
   cooldown_ms: 500
   flask_button: left_trigger
@@ -37,6 +37,11 @@ hp:
   row_fill_frac: 0.35
   strip_frac: 0.2
   gap_tol_frac: 0.1
+  rune_frac: 0.38
+  bottom_trim_frac: 0.08
+  full_ratio: 0.78
+  valid_val: 45
+  confirm_frames: 1
   tripwire: true
 hotkeys:
   toggle: f8

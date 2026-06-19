@@ -26,6 +26,7 @@ from window import GameWindow
 from color_detector import ColorDetector
 from loot_engine import LootEngine
 from hp_detector import HPDetector
+from diag_dump import HPDiag
 from virtual_xbox import VirtualXbox360, XUSB
 from dualsense_bridge import DualSenseBridge
 
@@ -144,9 +145,13 @@ def main():
 
     # --- хоткеи ---
     auto = Toggle()
+    diag = HPDiag()  # диагностика потери HP (F7) — пишет улики в _debug/hp_events
+    manual_shot = threading.Event()
     stop = threading.Event()
     k_toggle = cfg["hotkeys"].get("toggle", "f8")
     k_quit = cfg["hotkeys"].get("quit", "f12")
+    k_diag = cfg["hotkeys"].get("diag", "f7")
+    k_shot = cfg["hotkeys"].get("snapshot", "f9")
 
     def on_press(key):
         name = getattr(key, "name", None)
@@ -157,10 +162,16 @@ def main():
         if name == k_toggle:
             state = auto.flip()
             log.info("Авто-подбор: %s", "ВКЛ" if state else "выкл")
+        if name == k_diag:
+            state = diag.toggle()
+            log.info("Диагностика HP: %s (улики → _debug/hp_events)",
+                     "ВКЛ — грабим полный кадр" if state else "выкл")
+        if name == k_shot:
+            manual_shot.set()
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
-    log.info("Готово. F8 — вкл/выкл авто-подбор, F12 — выход.")
+    log.info("Готово. F8 — авто-подбор, F7 — диагностика HP, F9 — ручной снимок, F12 — выход.")
 
     # --- главный цикл ---
     last_status = 0.0
@@ -177,7 +188,8 @@ def main():
 
             # F8 включён → грабим весь экран (нужен для детекции лута).
             # F8 выключен → грабим только зону орба → высокий fps, мгновенная фляга.
-            if auto.on or orb_region is None:
+            # Диагностика (F7) → принудительно полный кадр, чтобы улика содержала весь экран.
+            if auto.on or orb_region is None or diag.enabled:
                 frame = cap.grab(region)
                 hp_d, hp_frame = hp_det, frame
             else:
@@ -198,27 +210,43 @@ def main():
             else:
                 points, in_radius = [], []
 
-            # автофляска — независимо от F8, пока окно в фокусе
-            if hp_d and foreground:
+            # автофляска (в фокусе) + диагностика HP (всегда, чтобы поймать и «не в фокусе»)
+            if hp_d:
                 low, hm = hp_d.is_low(hp_frame)
                 hp_pct = hm["ratio"]
                 hp_v = hm["fill_v"]
-                # дебаунс: считаем подряд-низкие кадры, мерцание (1-2 кадра) отсеиваем
-                low_streak = low_streak + 1 if low else 0
-                if (low_streak >= hp_confirm
-                        and time.perf_counter() - last_flask >= hp_cooldown):
-                    bridge.suppress_triggers = True
-                    if flask_right:
-                        vx.tap_right_trigger(flask_hold)
+                # диагностика потери HP: снимает улики на переходах ratio=None (если F7 вкл)
+                diag.feed(hp_frame, hp_d, hm, foreground, time.perf_counter())
+                if manual_shot.is_set():
+                    manual_shot.clear()
+                    diag.manual(hp_frame, hp_d, hm, foreground)
+                if foreground:
+                    # дебаунс. None (орб не распознан/мерцание) НЕ сбрасывает стрик —
+                    # иначе на низком HP мерцание роняет счётчик и фляга не жмётся.
+                    if hm["ratio"] is None:
+                        pass                       # неизвестно — держим стрик как есть
+                    elif low:
+                        low_streak += 1
                     else:
-                        vx.tap_left_trigger(flask_hold)
-                    bridge.suppress_triggers = False
-                    last_flask = time.perf_counter()
-                    flasks += 1
-                    log.info("HP фляга (%s): HP=%s < %.0f%%",
-                             "R2" if flask_right else "L2",
-                             f"{hp_pct*100:.0f}%" if hp_pct is not None else "?",
-                             hp_threshold * 100)
+                        low_streak = 0
+                    # жмём только на реально низком кадре (low). None держит стрик,
+                    # но сам не стреляет; высокий — сбрасывает. Иначе залипание выстрелов.
+                    if (low and low_streak >= hp_confirm
+                            and time.perf_counter() - last_flask >= hp_cooldown):
+                        bridge.suppress_triggers = True
+                        if flask_right:
+                            vx.tap_right_trigger(flask_hold)
+                        else:
+                            vx.tap_left_trigger(flask_hold)
+                        bridge.suppress_triggers = False
+                        last_flask = time.perf_counter()
+                        flasks += 1
+                        log.info("HP фляга (%s): HP=%s < %.0f%%",
+                                 "R2" if flask_right else "L2",
+                                 f"{hp_pct*100:.0f}%" if hp_pct is not None else "?",
+                                 hp_threshold * 100)
+                else:
+                    low_streak = 0
             else:
                 low_streak = 0
 

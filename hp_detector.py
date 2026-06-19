@@ -45,6 +45,13 @@ class HPDetector:
         self.row_fill_frac = cfg.get("row_fill_frac", 0.35)
         self.strip_frac = cfg.get("strip_frac", 0.30)
         self.gap_tol_frac = cfg.get("gap_tol_frac", 0.10)
+        # центральная полоса с руной-механикой (доля радиуса) — исключаем из скана
+        self.rune_frac = cfg.get("rune_frac", 0.0)
+        # нижний обод орба + край панели задач — тёмные, подрезаем снизу (доля радиуса)
+        self.bottom_trim_frac = cfg.get("bottom_trim_frac", 0.05)
+        # сколько детектор читает при ПОЛНОМ HP (<1.0): верх орба — глянцевый блик,
+        # красным не детектится. real_hp = measured / full_ratio. 1.0 = без коррекции.
+        self.full_ratio = cfg.get("full_ratio", 1.0)
         self.tripwire = cfg.get("tripwire", True)
         self.threshold = cfg.get("threshold", 0.55)
         # мёртвая зона: чтение ниже = орб затемнён/перекрыт (меню), а не реальный HP
@@ -73,21 +80,33 @@ class HPDetector:
         mask = cv2.bitwise_or(m1, m2)
         V = hsv[:, :, 2]
         H, W = mask.shape
-        ccx = cx - x1  # центр орба в координатах кропа
-        sw = max(2, int(self.strip_frac * r))
-        sx1, sx2 = max(0, ccx - sw), min(W, ccx + sw)
-        strip = mask[:, sx1:sx2]
-        strip_len = max(1, sx2 - sx1)
+        ccx, ccy = cx - x1, cy - y1  # центр орба в координатах кропа
 
-        # доля красного по строкам
-        row_red = (strip > 0).sum(axis=1) / strip_len
-        filled = row_red > self.row_fill_frac
+        # маска круга орба + исключение центральной полосы с руной-механикой:
+        # символ по центру не красный и ломал бы скан узкой центральной полоски.
+        yy, xx = np.ogrid[:H, :W]
+        circle = (xx - ccx) ** 2 + (yy - ccy) ** 2 <= r * r
+        rune_half = int(self.rune_frac * r)
+        usable = (circle & (np.abs(xx - ccx) > rune_half)) if rune_half > 0 else circle
 
-        # высота «жидкости» снизу вверх с допуском разрывов
+        redpx = (mask > 0) & usable
+        row_usable = usable.sum(axis=1)              # ширина «рабочей» части орба в строке
+        row_red = redpx.sum(axis=1)
+        # доля красного в строке относительно ширины орба в этой строке (не всего кропа)
+        row_fill = np.divide(row_red, np.maximum(1, row_usable), dtype=float)
+        # строки со слишком узким сечением круга (самый верх/низ) ненадёжны — пропускаем
+        valid_row = row_usable >= max(3, int(0.12 * r))
+        filled = (row_fill > self.row_fill_frac) & valid_row
+
+        # высота «жидкости» снизу вверх. Нижний обод орба + край панели задач — тёмные,
+        # поэтому пропускаем нижние bottom_trim строк, чтобы они не оборвали скан.
+        bottom_trim = int(self.bottom_trim_frac * r)
         gap_tol = max(1, int(self.gap_tol_frac * r))
         height = 0
         gap = 0
-        for i in range(H - 1, -1, -1):
+        for i in range(H - 1 - bottom_trim, -1, -1):
+            if not valid_row[i]:
+                continue                              # узкое сечение круга — не считаем разрывом
             if filled[i]:
                 height = (H - 1 - i) + 1
                 gap = 0
@@ -107,41 +126,38 @@ class HPDetector:
             u = (y_s - r) / float(r)              # нормированная высота поверхности
             ratio = _area_ratio(u) if self.fill_mode == "area" else height / float(2 * r)
 
-        # яркость залитой части: реальный HP светится ярким красным,
-        # затемнённый орб в меню — тусклый. Считаем среднюю V красных пикселей полоски.
-        fill_v = 0.0
-        if height > 0:
-            sm = strip > 0
-            if sm.any():
-                fill_v = float(V[:, sx1:sx2][sm].mean())
+        # яркость залитой части (без руны): реальный HP — яркий красный, меню — тусклый
+        fill_v = float(V[redpx].mean()) if redpx.any() else 0.0
 
-        # мёртвая зона снизу (~7% «дно») и проверка яркости —
-        # затемнённый/перекрытый орб помечаем как неизвестно (фляга не жмётся)
+        # гейты валидности: затемнённый/перекрытый орб помечаем как неизвестно (не пьём)
         if ratio is not None and (ratio < self.min_valid_ratio or fill_v < self.valid_val):
             ratio = None
             surface_y = None
 
-        # tripwire: патч на линейной высоте порога
-        thr_y = int((cy + r) - self.threshold * 2 * r)
+        # коррекция под глянцевый верх орба: real_hp = measured / full_ratio
+        if ratio is not None and self.full_ratio > 0:
+            ratio = min(1.0, ratio / self.full_ratio)
+
+        # tripwire: доля красного на геом. высоте, соответствующей реальному порогу
+        thr_y = int((cy + r) - (self.threshold * self.full_ratio) * 2 * r)
         trip_below = None
         if self.tripwire:
-            ph = max(2, int(0.05 * r))
-            ty1, ty2 = max(0, thr_y - ph), min(fh, thr_y + ph)
-            tx1, tx2 = max(0, cx - sw), min(fw, cx + sw)
-            patch = frame_bgr[ty1:ty2, tx1:tx2]
-            if patch.size > 0:
-                pm = _red_mask(patch, self.sat_min, self.val_min)
-                trip_below = (pm > 0).mean() <= self.row_fill_frac
+            tr = thr_y - y1
+            ph = max(1, int(0.05 * r))
+            rows = [row_fill[i] for i in range(max(0, tr - ph), min(H, tr + ph + 1))
+                    if valid_row[i]]
+            if rows:
+                trip_below = (sum(rows) / len(rows)) <= self.row_fill_frac
 
         return {"ratio": ratio, "surface_y": surface_y, "thr_y": thr_y,
                 "trip_below": trip_below, "orb": (cx, cy, r), "fill_v": round(fill_v)}
 
     def is_low(self, frame_bgr):
-        """True если HP достоверно ниже порога. Когда орб не виден (ratio=None) —
-        НЕ пьём (иначе ложные фляги в меню/на карте)."""
+        """True если HP достоверно ниже порога. Решение — по уровню жидкости (ratio).
+        Когда орб не виден (ratio=None) — НЕ пьём (ложные фляги в меню/на карте).
+        trip_below считается в measure() для диагностики, но в решении не участвует:
+        у поверхности он шумит и давал ложные выстрелы выше порога."""
         m = self.measure(frame_bgr)
         if m["ratio"] is None:
             return False, m
-        below_fill = m["ratio"] < self.threshold
-        below_trip = bool(m["trip_below"])
-        return (below_fill or below_trip), m
+        return (m["ratio"] < self.threshold), m
