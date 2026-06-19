@@ -27,6 +27,7 @@ from color_detector import ColorDetector
 from loot_engine import LootEngine
 from hp_detector import HPDetector
 from diag_dump import HPDiag
+from overlay import Overlay, OverlayState
 from virtual_xbox import VirtualXbox360, XUSB
 from dualsense_bridge import DualSenseBridge
 
@@ -152,6 +153,13 @@ def main():
     k_quit = cfg["hotkeys"].get("quit", "f12")
     k_diag = cfg["hotkeys"].get("diag", "f7")
     k_shot = cfg["hotkeys"].get("snapshot", "f9")
+    k_overlay = cfg["hotkeys"].get("overlay", "f6")
+
+    # --- оверлей со статусами (поверх игры, click-through) ---
+    ov_state = OverlayState()
+    ov_state.flask_enabled = hp_det is not None
+    overlay = Overlay(ov_state, region)
+    overlay.start()
 
     def on_press(key):
         name = getattr(key, "name", None)
@@ -168,10 +176,13 @@ def main():
                      "ВКЛ — грабим полный кадр" if state else "выкл")
         if name == k_shot:
             manual_shot.set()
+        if name == k_overlay:
+            vis = overlay.toggle()
+            log.info("Оверлей: %s", "показан" if vis else "скрыт")
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
-    log.info("Готово. F8 — авто-подбор, F7 — диагностика HP, F9 — ручной снимок, F12 — выход.")
+    log.info("Готово. F8 — подбор, F7 — диагностика, F9 — снимок, F6 — оверлей, F12 — выход.")
 
     # --- главный цикл ---
     last_status = 0.0
@@ -250,10 +261,19 @@ def main():
             else:
                 low_streak = 0
 
+            # обновляем оверлей (дешёвые записи в общий state, читает поток tkinter)
+            ov_state.auto_loot = auto.on
+            ov_state.diag = diag.enabled
+            ov_state.hp_pct = hp_pct
+            ov_state.foreground = foreground
+            ov_state.flasks = flasks
+            ov_state.presses = presses
+
             iters += 1
             now = time.perf_counter()
             if now - last_status >= 1.0:
                 fps = iters / (now - last_status)
+                ov_state.fps = fps
                 log.info("targets=%d in_radius=%d auto=%s fg=%s presses=%d hp=%s v=%s flasks=%d fps=%.0f",
                          len(points), len(in_radius),
                          "ON" if auto.on else "off", foreground, presses,
@@ -266,6 +286,7 @@ def main():
         log.info("Прервано (Ctrl+C)")
     finally:
         listener.stop()
+        overlay.stop()
         bridge.stop()
         vx.stop()
     return 0

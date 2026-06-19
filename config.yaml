@@ -45,4 +45,7 @@ hp:
   tripwire: true
 hotkeys:
   toggle: f8
+  diag: f7
+  snapshot: f9
+  overlay: f6
   quit: f12
