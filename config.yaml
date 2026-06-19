@@ -9,9 +9,9 @@ vision:
   - 185
   extra_colors: []
   hue_tolerance: 8
-  sat_min: 120
+  sat_min: 200
   val_min: 120
-  min_blob_area: 120
+  min_blob_area: 200
   close_px: 3
 loot:
   pickup_radius_px: 250

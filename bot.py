@@ -26,7 +26,7 @@ from window import GameWindow
 from color_detector import ColorDetector
 from loot_engine import LootEngine
 from hp_detector import HPDetector
-from diag_dump import HPDiag
+from diag_dump import HPDiag, dump_loot
 from overlay import Overlay, OverlayState
 from virtual_xbox import VirtualXbox360, XUSB
 from dualsense_bridge import DualSenseBridge
@@ -231,6 +231,9 @@ def main():
                 if manual_shot.is_set():
                     manual_shot.clear()
                     diag.manual(hp_frame, hp_d, hm, foreground)
+                    # если автоподбор вкл (кадр полный) — заодно снимок лут-детекции
+                    if auto.on and frame is not None:
+                        dump_loot(diag.n, frame, det, engine, foreground)
                 if foreground:
                     # дебаунс. None (орб не распознан/мерцание) НЕ сбрасывает стрик —
                     # иначе на низком HP мерцание роняет счётчик и фляга не жмётся.

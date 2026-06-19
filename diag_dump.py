@@ -80,6 +80,38 @@ def dump_event(tag, n, frame, det, m, foreground):
     log.info("       файлы: %s_{full,crop,mask,vis}.png", os.path.basename(base))
 
 
+def dump_loot(n, frame, det, engine, foreground):
+    """Снимок лут-детекции: что детектор принял за лут (для отладки ложных целей).
+    Сохраняет full/mask/vis (точки обведены, радиус подбора — жёлтый круг)."""
+    os.makedirs(EVT_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%H%M%S_%f")[:-3]
+    base = os.path.join(EVT_DIR, f"{ts}_{n:04d}_loot")
+
+    points, mask = det.detect(frame)
+    cx, cy = engine.center(frame.shape)
+    in_r = engine.targets_in_radius(points, frame.shape)
+    in_set = {(p[0], p[1]) for p in in_r}
+
+    vis = frame.copy()
+    cv2.circle(vis, (cx, cy), engine.radius, (0, 220, 220), 2)        # радиус подбора
+    cv2.drawMarker(vis, (cx, cy), (0, 220, 220), cv2.MARKER_CROSS, 22, 2)
+    for (px, py, area) in points:
+        col = (0, 0, 255) if (px, py) in in_set else (255, 160, 0)    # красн=в радиусе, син=вне
+        cv2.circle(vis, (px, py), 16, col, 2)
+        cv2.putText(vis, str(int(area)), (px + 12, py), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+
+    cv2.imwrite(base + "_full.png", frame)
+    cv2.imwrite(base + "_mask.png", mask)
+    cv2.imwrite(base + "_vis.png", vis)
+
+    log.info("ЛУТ-СНИМОК[#%d] точек=%d в_радиусе=%d fg=%s цвета=%s", n, len(points), len(in_r),
+             foreground, det.colors)
+    for i, (px, py, area) in enumerate(points[:10]):
+        log.info("   точка %d: (%d,%d) area=%.0f %s", i, px, py, area,
+                 "В РАДИУСЕ" if (px, py) in in_set else "вне")
+    log.info("       файлы: %s_{full,mask,vis}.png", os.path.basename(base))
+
+
 class HPDiag:
     """Трекер переходов «есть HP ↔ потеряно» с дампом улик. Используют bot.py и hp_diag.py."""
 
