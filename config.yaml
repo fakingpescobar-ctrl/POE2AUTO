@@ -28,21 +28,31 @@ hp:
     cy: 0.8712
     r: 0.0799
   threshold: 0.88
-  cooldown_ms: 500
+  cooldown_ms: 333
   flask_button: left_trigger
   flask_hold_ms: 120
   fill_mode: linear
   red_sat_min: 24
   red_val_min: 52
-  row_fill_frac: 0.35
+  row_fill_frac: 0.28
   strip_frac: 0.2
   gap_tol_frac: 0.1
   rune_frac: 0.38
-  bottom_trim_frac: 0.08
+  bottom_trim_frac: 0.05
   full_ratio: 0.78
   valid_val: 45
+  fallback_red_frac_min: 0.04
   confirm_frames: 1
   tripwire: true
+hp_num:
+  # Чтение HP из цифр HUD (current/max) — основной источник, орб как fallback.
+  # Включается только когда откалиброваны все шаблоны (calibrate_hp_digits.py).
+  enabled: true
+  roi: {x1: 0.066, y1: 0.700, x2: 0.137, y2: 0.735}   # зона строки «Здоровье»
+  bin_thr: 130          # порог бинаризации (белый текст)
+  match_min: 0.55       # мин. совпадение с шаблоном глифа
+  min_glyph_h: 10       # мин. высота глифа (px) — отсев шума
+  max_hp: 1640          # стартовый max HP (только отсев мусора; дальше подстраивается сам при смене шмота)
 hotkeys:
   toggle: f8
   diag: f7

@@ -128,6 +128,10 @@ class HPDetector:
 
         # яркость залитой части (без руны): реальный HP — яркий красный, меню — тусклый
         fill_v = float(V[redpx].mean()) if redpx.any() else 0.0
+        # доля красного в рабочей части орба: реальная просадка под эффектом ещё имеет
+        # красную лужу (~0.08), а перекрытый меню/тёмный орб — почти ноль (~0.001).
+        # Нужна fallback'у в bot.py, чтобы не лить флягу в меню после низкого HP.
+        red_frac = float(redpx.sum() / max(1, int(usable.sum())))
 
         # гейты валидности: затемнённый/перекрытый орб помечаем как неизвестно (не пьём)
         if ratio is not None and (ratio < self.min_valid_ratio or fill_v < self.valid_val):
@@ -150,13 +154,14 @@ class HPDetector:
                 trip_below = (sum(rows) / len(rows)) <= self.row_fill_frac
 
         return {"ratio": ratio, "surface_y": surface_y, "thr_y": thr_y,
-                "trip_below": trip_below, "orb": (cx, cy, r), "fill_v": round(fill_v)}
+                "trip_below": trip_below, "orb": (cx, cy, r), "fill_v": round(fill_v),
+                "red_frac": round(red_frac, 4)}
 
     def is_low(self, frame_bgr):
         """True если HP достоверно ниже порога. Решение — по уровню жидкости (ratio).
-        Когда орб не виден (ratio=None) — НЕ пьём (ложные фляги в меню/на карте).
-        trip_below считается в measure() для диагностики, но в решении не участвует:
-        у поверхности он шумит и давал ложные выстрелы выше порога."""
+        Когда орб не виден (ratio=None) — здесь НЕ решаем (вернём False): подстраховку
+        на слепые кадры делает главный цикл с памятью последнего HP (см. bot.py),
+        чтобы fallback ПРОДОЛЖАЛ питьё при просадке, но не НАЧИНАЛ его с полного HP."""
         m = self.measure(frame_bgr)
         if m["ratio"] is None:
             return False, m

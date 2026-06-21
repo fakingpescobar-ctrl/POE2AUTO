@@ -26,6 +26,7 @@ from window import GameWindow
 from color_detector import ColorDetector
 from loot_engine import LootEngine
 from hp_detector import HPDetector
+from hp_ocr import HPNumReader
 from diag_dump import HPDiag, dump_loot
 from overlay import Overlay, OverlayState
 from virtual_xbox import VirtualXbox360, XUSB
@@ -116,6 +117,10 @@ def main():
     flask_hold = hp_cfg.get("flask_hold_ms", 120)
     hp_threshold = hp_cfg.get("threshold", 0.55)
     hp_confirm = hp_cfg.get("confirm_frames", 4)
+    hp_valid_val = hp_cfg.get("valid_val", 90)   # порог яркости «живого» орба для fallback
+    # мин. доля красного, чтобы fallback на слепой кадр сработал: отделяет реальную
+    # просадку под эффектом (красная лужа есть, ~0.08) от тёмного орба в меню (~0.001).
+    hp_fallback_red_min = hp_cfg.get("fallback_red_frac_min", 0.04)
     flask_right = hp_cfg.get("flask_button") == "right_trigger"
     # быстрый захват: когда F8 выкл, грабим только зону орба (а не весь экран) → высокий fps
     hp_det_crop = None
@@ -136,6 +141,40 @@ def main():
         crop_cfg = dict(hp_cfg)
         crop_cfg["orb"] = {"cx": (ocx - ox1) / sw, "cy": (ocy - oy1) / sh, "r": orp / sh}
         hp_det_crop = HPDetector(crop_cfg)
+
+    # --- чтение HP по цифрам HUD (основной источник; орб — fallback) ---
+    num_cfg = cfg.get("hp_num", {})
+    num_reader = None        # читает по полному кадру (auto/diag вкл)
+    num_reader_crop = None   # читает по быстрому кропу орба (auto выкл)
+    if num_cfg.get("enabled") and hp_det:
+        nr = HPNumReader(num_cfg)
+        if not nr.ready:
+            log.warning("hp_num включён, но цифры не откалиброваны "
+                        "(запусти calibrate_hp_digits.py) — работаю по орбу")
+        else:
+            num_reader = nr
+            # расширяем быстрый захват орба, чтобы в него попала строка цифр HP
+            nx1 = region["left"] + num_cfg["roi"]["x1"] * fw
+            ny1 = region["top"] + num_cfg["roi"]["y1"] * fh
+            nx2 = region["left"] + num_cfg["roi"]["x2"] * fw
+            ny2 = region["top"] + num_cfg["roi"]["y2"] * fh
+            gx1 = min(orb_region["left"], int(nx1))
+            gy1 = min(orb_region["top"], int(ny1))
+            gx2 = max(orb_region["left"] + orb_region["width"], int(nx2) + 1)
+            gy2 = max(orb_region["top"] + orb_region["height"], int(ny2) + 1)
+            orb_region = {"left": gx1, "top": gy1, "width": gx2 - gx1, "height": gy2 - gy1}
+            sw, sh = orb_region["width"], orb_region["height"]
+            # пересобираем орб-детектор кропа под расширенный регион
+            crop_cfg = dict(hp_cfg)
+            crop_cfg["orb"] = {"cx": (ocx - gx1) / sw, "cy": (ocy - gy1) / sh, "r": orp / sh}
+            hp_det_crop = HPDetector(crop_cfg)
+            # ридер цифр для быстрого пути: ROI в долях расширенного кропа
+            ncfg_crop = dict(num_cfg)
+            ncfg_crop["roi"] = {"x1": (nx1 - gx1) / sw, "y1": (ny1 - gy1) / sh,
+                                "x2": (nx2 - gx1) / sw, "y2": (ny2 - gy1) / sh}
+            num_reader_crop = HPNumReader(ncfg_crop)
+            log.info("Чтение HP по цифрам ВКЛ: ROI %s max_hp=%s",
+                     num_cfg["roi"], num_cfg.get("max_hp"))
 
     # быстрый захват лута: детектим не весь экран, а окно вокруг персонажа
     # (лут важен только в радиусе подбора) → в разы меньше пикселей, выше fps.
@@ -204,7 +243,9 @@ def main():
     flasks = 0
     hp_pct = None
     hp_v = None
+    hp_src = "-"             # чем прочитано HP: num (цифры) / orb / - (нет)
     low_streak = 0
+    last_good_ratio = None   # последнее достоверное HP — для fallback на слепые кадры
     iters = 0
     try:
         while not stop.is_set():
@@ -220,7 +261,7 @@ def main():
                 if full is None:
                     time.sleep(0.02)
                     continue
-                hp_frame, hp_d = full, hp_det        # measure() кропает орб сам — дёшево
+                hp_frame, hp_d, num_rd = full, hp_det, num_reader   # measure() кропает орб сам
                 if auto.on:
                     lx = loot_region["left"] - region["left"]
                     ly = loot_region["top"] - region["top"]
@@ -230,7 +271,7 @@ def main():
                 else:
                     loot_frame, loot_ctr = None, None
             else:
-                hp_frame, hp_d = cap.grab(orb_region), hp_det_crop
+                hp_frame, hp_d, num_rd = cap.grab(orb_region), hp_det_crop, num_reader_crop
                 loot_frame, loot_ctr = None, None
                 if hp_frame is None:
                     time.sleep(0.02)
@@ -250,7 +291,9 @@ def main():
             # автофляска (в фокусе) + диагностика HP (всегда, чтобы поймать и «не в фокусе»)
             if hp_d:
                 low, hm = hp_d.is_low(hp_frame)
-                hp_pct = hm["ratio"]
+                num = num_rd.read(hp_frame) if num_rd else None   # (cur,max,ratio) | None
+                hp_pct = num[2] if num is not None else hm["ratio"]
+                hp_src = "num" if num is not None else "orb"
                 hp_v = hm["fill_v"]
                 # диагностика потери HP: снимает улики на переходах ratio=None (если F7 вкл)
                 diag.feed(hp_frame, hp_d, hm, foreground, time.perf_counter())
@@ -261,17 +304,38 @@ def main():
                     if auto.on and loot_frame is not None:
                         dump_loot(diag.n, loot_frame, det, engine, foreground, loot_ctr)
                 if foreground:
-                    # дебаунс. None (орб не распознан/мерцание) НЕ сбрасывает стрик —
-                    # иначе на низком HP мерцание роняет счётчик и фляга не жмётся.
-                    if hm["ratio"] is None:
-                        pass                       # неизвестно — держим стрик как есть
-                    elif low:
+                    # источник HP по приоритету (low_now = True/False/None=неизвестно):
+                    #  • ЦИФРЫ HUD — точные, без неоднозначности None → решают первыми;
+                    #  • иначе уровень орба: ratio известен → low = ratio < порога;
+                    #  • иначе орб ослеп (ratio=None), но ЖИВОЙ (красная лужа: red_frac≥
+                    #    порога, fill_v≥valid_val), tripwire ниже порога, И последнее HP было
+                    #    < порога → ослеп ПОСРЕДИ просадки: держим питьё (fallback ПРОДОЛЖАЕТ);
+                    #  • иначе None → неизвестно (меню/перекрытие на полном HP) — НЕ пьём.
+                    if num is not None:
+                        last_good_ratio = num[2]
+                        low_now = num[2] < hp_threshold
+                    elif hm["ratio"] is not None:
+                        last_good_ratio = hm["ratio"]
+                        low_now = low
+                    elif (hm.get("trip_below")
+                          and hm.get("red_frac", 0) >= hp_fallback_red_min
+                          and hm.get("fill_v", 0) >= hp_valid_val
+                          and last_good_ratio is not None
+                          and last_good_ratio < hp_threshold):
+                        low_now = True
+                    else:
+                        low_now = None
+                    # дебаунс. None (неизвестно) НЕ сбрасывает стрик — иначе мерцание
+                    # роняет счётчик и фляга не жмётся; low растит, высокий сбрасывает.
+                    if low_now is True:
                         low_streak += 1
+                    elif low_now is None:
+                        pass                       # неизвестно — держим стрик как есть
                     else:
                         low_streak = 0
-                    # жмём только на реально низком кадре (low). None держит стрик,
-                    # но сам не стреляет; высокий — сбрасывает. Иначе залипание выстрелов.
-                    if (low and low_streak >= hp_confirm
+                    # жмём только на реально низком кадре. None держит стрик, но сам не
+                    # стреляет; высокий — сбрасывает. Иначе залипание выстрелов.
+                    if (low_now and low_streak >= hp_confirm
                             and time.perf_counter() - last_flask >= hp_cooldown):
                         bridge.suppress_triggers = True
                         if flask_right:
@@ -281,12 +345,13 @@ def main():
                         bridge.suppress_triggers = False
                         last_flask = time.perf_counter()
                         flasks += 1
-                        log.info("HP фляга (%s): HP=%s < %.0f%%",
+                        log.info("HP фляга (%s): HP=%s [%s] < %.0f%%",
                                  "R2" if flask_right else "L2",
                                  f"{hp_pct*100:.0f}%" if hp_pct is not None else "?",
-                                 hp_threshold * 100)
+                                 hp_src, hp_threshold * 100)
                 else:
                     low_streak = 0
+                    last_good_ratio = None     # вне фокуса забываем HP — иначе stale-low даст fallback при возврате
             else:
                 low_streak = 0
 
@@ -303,10 +368,10 @@ def main():
             if now - last_status >= 1.0:
                 fps = iters / (now - last_status)
                 ov_state.fps = fps
-                log.info("targets=%d in_radius=%d auto=%s fg=%s presses=%d hp=%s v=%s flasks=%d fps=%.0f",
+                log.info("targets=%d in_radius=%d auto=%s fg=%s presses=%d hp=%s(%s) v=%s flasks=%d fps=%.0f",
                          len(points), len(in_radius),
                          "ON" if auto.on else "off", foreground, presses,
-                         f"{hp_pct*100:.0f}%" if hp_pct is not None else "-", hp_v, flasks, fps)
+                         f"{hp_pct*100:.0f}%" if hp_pct is not None else "-", hp_src, hp_v, flasks, fps)
                 last_status = now
                 iters = 0
 
