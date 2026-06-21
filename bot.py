@@ -144,6 +144,9 @@ def main():
 
     # --- чтение HP по цифрам HUD (основной источник; орб — fallback) ---
     num_cfg = cfg.get("hp_num", {})
+    # сколько цифры могут не читаться, прежде чем считать это МЕНЮ (а не мельканием
+    # в бою). В пределах окна орб подстраховывает; дольше — HUD перекрыт → не пьём.
+    hp_num_grace = num_cfg.get("menu_grace_s", 0.5)
     num_reader = None        # читает по полному кадру (auto/diag вкл)
     num_reader_crop = None   # читает по быстрому кропу орба (auto выкл)
     if num_cfg.get("enabled") and hp_det:
@@ -246,6 +249,7 @@ def main():
     hp_src = "-"             # чем прочитано HP: num (цифры) / orb / - (нет)
     low_streak = 0
     last_good_ratio = None   # последнее достоверное HP — для fallback на слепые кадры
+    num_blind_since = None   # когда цифры перестали читаться (для детекта меню)
     iters = 0
     try:
         while not stop.is_set():
@@ -311,20 +315,36 @@ def main():
                     #    порога, fill_v≥valid_val), tripwire ниже порога, И последнее HP было
                     #    < порога → ослеп ПОСРЕДИ просадки: держим питьё (fallback ПРОДОЛЖАЕТ);
                     #  • иначе None → неизвестно (меню/перекрытие на полном HP) — НЕ пьём.
+                    # выбор источника: цифры → (кратко нет цифр) орб → (долго нет = меню) стоп
+                    use_orb = False
                     if num is not None:
+                        num_blind_since = None
                         last_good_ratio = num[2]
                         low_now = num[2] < hp_threshold
-                    elif hm["ratio"] is not None:
-                        last_good_ratio = hm["ratio"]
-                        low_now = low
-                    elif (hm.get("trip_below")
-                          and hm.get("red_frac", 0) >= hp_fallback_red_min
-                          and hm.get("fill_v", 0) >= hp_valid_val
-                          and last_good_ratio is not None
-                          and last_good_ratio < hp_threshold):
-                        low_now = True
+                    elif num_rd is None:
+                        use_orb = True          # цифры выключены/не калиброваны → орб основной
                     else:
-                        low_now = None
+                        # цифры включены, но не читаются на этом кадре
+                        if num_blind_since is None:
+                            num_blind_since = time.perf_counter()
+                        if time.perf_counter() - num_blind_since <= hp_num_grace:
+                            use_orb = True      # короткое мелькание в бою → подстрахует орб
+                        else:
+                            low_now = None      # надолго пропали → меню/перекрыт HUD → не пьём
+
+                    if use_orb:
+                        # орб-логика (fallback): ratio → слепой орб посреди просадки
+                        if hm["ratio"] is not None:
+                            last_good_ratio = hm["ratio"]
+                            low_now = low
+                        elif (hm.get("trip_below")
+                              and hm.get("red_frac", 0) >= hp_fallback_red_min
+                              and hm.get("fill_v", 0) >= hp_valid_val
+                              and last_good_ratio is not None
+                              and last_good_ratio < hp_threshold):
+                            low_now = True
+                        else:
+                            low_now = None
                     # дебаунс. None (неизвестно) НЕ сбрасывает стрик — иначе мерцание
                     # роняет счётчик и фляга не жмётся; low растит, высокий сбрасывает.
                     if low_now is True:
@@ -352,6 +372,7 @@ def main():
                 else:
                     low_streak = 0
                     last_good_ratio = None     # вне фокуса забываем HP — иначе stale-low даст fallback при возврате
+                    num_blind_since = None
             else:
                 low_streak = 0
 
