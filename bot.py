@@ -319,6 +319,7 @@ def main():
     num_blind_since = None   # когда цифры перестали читаться (для детекта меню)
     last_locate = 0.0        # таймер фонового переиска HUD (пока не локализован)
     last_num_ok = time.perf_counter()  # когда цифры читались в последний раз (для самолечения ROI)
+    last_glitch_warn = 0.0   # throttle варнинга анти-глитча цифр
     r1_held = False          # держит ли бот сейчас R1 (авто-атака)
     last_bar_seen = 0.0      # когда последний раз видели полосу HP моба
     iters = 0
@@ -384,6 +385,19 @@ def main():
             if hp_d:
                 low, hm = hp_d.is_low(hp_frame)
                 num = num_rd.read(hp_frame) if num_rd else None   # (cur,max,ratio) | None
+                # анти-глитч цифр: эффекты/искры поверх ROI дают ложный низкий % при
+                # ПОЛНОМ HP (читает «0/1057» при полном орбе) → спам флягой. Орб ищет
+                # КРАСНОЕ и белым частицам не подвержен → надёжный арбитр: если цифры
+                # зовут пить, а орб уверенно полный (≥порога) — зануляем чтение, дальше
+                # отработает орб (полный → не пьём). На РЕАЛЬНОМ сливе орб тоже падает
+                # < порога (он читает текущий кадр, не отстаёт) → фляга идёт штатно.
+                if (num is not None and num[2] < hp_threshold
+                        and hm["ratio"] is not None and hm["ratio"] >= hp_threshold):
+                    if time.perf_counter() - last_glitch_warn > 3.0:
+                        log.warning("Цифры HP=%.0f%% при орбе %.0f%% (полный) — глитч цифр "
+                                    "(эффект поверх ROI?), игнор", num[2] * 100, hm["ratio"] * 100)
+                        last_glitch_warn = time.perf_counter()
+                    num = None
                 hp_pct = num[2] if num is not None else hm["ratio"]
                 hp_src = "num" if num is not None else "orb"
                 if num is not None:               # «захват ✓» в оверлее = ЖИВОЕ значение, не снимок старта
