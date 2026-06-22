@@ -133,6 +133,7 @@ def main():
     # можно было ПЕРЕСОБРАТЬ на лету после авто-локализации HUD (другое разрешение/UI).
     hpg = {"hp_det": None, "hp_det_crop": None, "orb_region": None,
            "num_reader": None, "num_reader_crop": None}
+    loc_info = {"text": ""}   # что зацепила авто-локализация (для оверлея), напр. "1371/1371"
 
     def rebuild_hp_geometry():
         """(Пере)собрать всё, что зависит от геометрии орба (hp_cfg['orb']) и ROI цифр
@@ -203,6 +204,7 @@ def main():
         ffh, ffw = frame.shape[:2]
         num_cfg["roi"] = found["roi"]
         hp_cfg["orb"] = derive_orb(found["text_bbox"], ffw, ffh)
+        loc_info["text"] = f"{found['cur']}/{found['max']}"
         rebuild_hp_geometry()
         log.info("Авто-локализация HUD (%s): HP=%d/%d ROI=%s орб=%s",
                  reason, found["cur"], found["max"],
@@ -433,6 +435,11 @@ def main():
             ov_state.foreground = foreground
             ov_state.flasks = flasks
             ov_state.presses = presses
+            if hp_enabled and num_cfg.get("enabled") and num_cfg.get("auto_locate"):
+                ov_state.locate_state = "ok" if located else "search"
+                ov_state.locate_info = loc_info["text"]
+            else:
+                ov_state.locate_state = "off"
 
             iters += 1
             now = time.perf_counter()

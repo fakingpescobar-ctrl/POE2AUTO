@@ -52,6 +52,8 @@ class OverlayState:
         self.presses = 0
         self.fps = 0.0
         self.foreground = True
+        self.locate_state = "off"   # авто-локализация HUD: "off" | "search" | "ok"
+        self.locate_info = ""       # что зацепили, напр. "1371/1371"
 
 
 def _hp_color(pct):
@@ -143,6 +145,7 @@ class Overlay:
         # строки-статусы
         self._rows["loot"] = self._status_row(pad, "Авто-подбор", "F8")
         self._rows["flask"] = self._status_row(pad, "Авто-фляска", "")
+        self._rows["locate"] = self._status_row(pad, "Калибровка HUD", "")
         self._rows["diag"] = self._status_row(pad, "Диагностика", "F7")
 
         tk.Frame(pad, bg="#2a2a34", height=1).pack(fill="x", pady=(8, 6))
@@ -212,6 +215,14 @@ class Overlay:
         else:
             hp = "—" if s.hp_pct is None else f"{s.hp_pct*100:.0f}%"
             self._set(self._rows["flask"], True, hp, _hp_color(s.hp_pct))
+
+        if s.locate_state == "ok":
+            self._set(self._rows["locate"], True,
+                      f"захват ✓ {s.locate_info}".rstrip(), C_ON)
+        elif s.locate_state == "search":
+            self._set(self._rows["locate"], True, "поиск…", C_ACCENT)
+        else:
+            self._set(self._rows["locate"], False, "—", C_DIM)
 
         self._set(self._rows["diag"], s.diag, "ON" if s.diag else "OFF",
                   C_WARN if s.diag else C_OFF)   # диаг подсвечиваем как «внимание» (тормозит)
