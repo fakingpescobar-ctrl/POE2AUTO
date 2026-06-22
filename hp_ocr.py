@@ -38,12 +38,24 @@ def norm_glyph(glyph_bin):
     return cv2.resize(glyph_bin, (GLYPH_W, GLYPH_H), interpolation=cv2.INTER_NEAREST)
 
 
+def trim(crop):
+    """Обрезать пустые (чёрные) строки/столбцы по краям бинарного глифа."""
+    if crop.size == 0:
+        return crop
+    ys = np.where(crop.any(axis=1))[0]
+    xs = np.where(crop.any(axis=0))[0]
+    if len(xs) == 0 or len(ys) == 0:
+        return crop[:0, :0]
+    return crop[ys[0]:ys[-1] + 1, xs[0]:xs[-1] + 1]
+
+
 def segment(binary, min_h=10, max_h_frac=1.0, min_w=2):
     """Бинарь ROI → список (x, glyph_bin), глифы слева направо.
 
     Каждая связная белая компонента = глиф (цифра или '/'). Слишком мелкие
-    (шум) и слишком высокие (рамки/артефакты) отсекаем. Возвращаем нормированные
-    кропы глифов, отсортированные по X.
+    (шум) и слишком высокие (рамки/артефакты) отсекаем. Возвращаем СЫРЫЕ
+    (ненормированные) кропы — разрез слипшихся цифр и нормировку делает уже
+    вызывающий код, которому нужны исходные ширины блобов.
     """
     h = binary.shape[0]
     n, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
@@ -55,7 +67,7 @@ def segment(binary, min_h=10, max_h_frac=1.0, min_w=2):
         if area < 0.10 * w * hh:                # почти пустой бокс — шум
             continue
         crop = binary[y:y + hh, x:x + w]
-        glyphs.append((x, norm_glyph(crop)))
+        glyphs.append((x, crop))
     glyphs.sort(key=lambda g: g[0])
     return glyphs
 
@@ -107,6 +119,47 @@ class HPNumReader:
         надёжно — бот остаётся на детекции по орбу."""
         return "/" in self.tpls and sum(c.isdigit() for c in self.tpls) == 10
 
+    def _best(self, glyph_norm):
+        """Нормированный глиф → (символ, лучший score) по всем шаблонам."""
+        best_ch, best_sc = None, -1.0
+        for ch, t in self.tpls.items():
+            s = float(cv2.matchTemplate(glyph_norm, t, cv2.TM_CCOEFF_NORMED)[0, 0])
+            if s > best_sc:
+                best_ch, best_sc = ch, s
+        return best_ch, best_sc
+
+    def _read_glyph(self, crop, depth=0):
+        """Сырой блоб → распознанные символы (1+).
+
+        Слипшиеся цифры (хвост «7» липнет к «1» в «371», «11» и т.п.) дают один
+        блоб, который не матчится ни на один шаблон. Если глиф распознан плохо
+        ИЛИ подозрительно широк для одной цифры — пробуем разрезать его по
+        «долине» вертикальной проекции и принимаем разрез, ТОЛЬКО если обе
+        половины распознались увереннее, чем целый блоб. Это разрезает реальные
+        слипания, но не трогает цельные «0»/«8» (их половинки матчатся плохо).
+        """
+        crop = trim(crop)
+        if crop.size == 0 or crop.shape[1] < 2:
+            return "?"
+        ch, sc = self._best(norm_glyph(crop))
+        h, w = crop.shape[:2]
+        if depth < 3 and (sc < self.match_min or w >= 0.8 * h):
+            lo, hi = max(2, int(w * 0.2)), min(w - 2, int(w * 0.8))
+            best_cut, best_min = None, sc            # принимаем только то, что лучше целого
+            for c in range(lo, hi):
+                l, r = trim(crop[:, :c]), trim(crop[:, c:])
+                if l.shape[1] < 2 or r.shape[1] < 2:
+                    continue
+                _, lsc = self._best(norm_glyph(l))
+                _, rsc = self._best(norm_glyph(r))
+                m = min(lsc, rsc)
+                if m > best_min:
+                    best_min, best_cut = m, c
+            if best_cut is not None and best_min >= self.match_min:
+                return (self._read_glyph(crop[:, :best_cut], depth + 1)
+                        + self._read_glyph(crop[:, best_cut:], depth + 1))
+        return ch if sc >= self.match_min else "?"
+
     def read_string_crop(self, roi_bgr):
         """Готовый кроп ROI → строка распознанных символов."""
         if roi_bgr.size == 0:
@@ -114,9 +167,8 @@ class HPNumReader:
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
         binary = binarize(gray, self.bin_thr)
         out = []
-        for _x, g in segment(binary, self.min_glyph_h):
-            ch = classify(g, self.tpls, self.match_min)
-            out.append(ch if ch is not None else "?")
+        for _x, crop in segment(binary, self.min_glyph_h):
+            out.append(self._read_glyph(crop))
         return "".join(out)
 
     def read_string(self, frame_bgr):

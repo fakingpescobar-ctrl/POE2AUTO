@@ -81,7 +81,7 @@ def capture_candidates(cap, region, roi, thr, min_h, match_min, missing_label,
             crop = frame[y1:y2, x1:x2]
             binary = binarize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), thr)
             glyphs = segment(binary, min_h)
-            s = "".join((classify(g, tpls, match_min) or "?") for _x, g in glyphs)
+            s = "".join((classify(norm_glyph(g), tpls, match_min) or "?") for _x, g in glyphs)
 
             now = time.time()
             if now - last_print >= 1.0:
@@ -136,7 +136,7 @@ def manual_calibrate(cap, region, roi, thr, min_h):
                   f"Кадр кривой (цифры касаются/шум/перекрытие) — переснять на другом HP.")
             continue
         for (_x, g), ch in zip(glyphs, chars):
-            save_glyph("slash" if ch == "/" else ch, g)
+            save_glyph("slash" if ch == "/" else ch, norm_glyph(g))
         print("  ✓ сохранил:", "".join(chars))
         if set(LABELS) <= collected():
             print("\n*** ВСЕ глифы 0-9 и '/' собраны! Калибровка завершена. ***")
