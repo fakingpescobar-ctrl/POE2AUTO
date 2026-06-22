@@ -350,6 +350,8 @@ def main():
                 num = num_rd.read(hp_frame) if num_rd else None   # (cur,max,ratio) | None
                 hp_pct = num[2] if num is not None else hm["ratio"]
                 hp_src = "num" if num is not None else "orb"
+                if num is not None:               # «захват ✓» в оверлее = ЖИВОЕ значение, не снимок старта
+                    loc_info["text"] = f"{num[0]}/{num[1]}"
                 hp_v = hm["fill_v"]
                 # диагностика потери HP: снимает улики на переходах ratio=None (если F7 вкл)
                 diag.feed(hp_frame, hp_d, hm, foreground, time.perf_counter())
