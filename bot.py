@@ -28,6 +28,7 @@ from loot_engine import LootEngine
 from hp_detector import HPDetector
 from hp_ocr import HPNumReader
 from hp_locate import find_digits_roi, derive_orb
+from mob_bar import MobBarDetector
 from diag_dump import HPDiag, dump_loot
 from overlay import Overlay, OverlayState
 from virtual_xbox import VirtualXbox360, XUSB
@@ -250,8 +251,19 @@ def main():
     else:
         log.info("Автофляска выкл (запусти calibrate_hp.bat)")
 
+    # --- авто-атака: держим R1, пока вверху видна полоса HP моба ---
+    atk_cfg = cfg.get("auto_attack", {})
+    atk_enabled = bool(atk_cfg.get("enabled"))
+    mob_det = MobBarDetector(atk_cfg) if atk_enabled else None
+    atk_btn = XUSB.get(atk_cfg.get("button", "right_bumper"), XUSB["right_bumper"])
+    atk_grace = atk_cfg.get("release_grace_s", 0.35)
+    if atk_enabled:
+        log.info("Авто-атака ВКЛ (F10): кнопка=%s ROI полосы=%s",
+                 atk_cfg.get("button", "right_bumper"), atk_cfg.get("roi"))
+
     # --- хоткеи ---
     auto = Toggle()
+    attack = Toggle()  # авто-атака (F10) — держит R1 на полосе HP моба
     diag = HPDiag()  # диагностика потери HP (F7) — пишет улики в _debug/hp_events
     manual_shot = threading.Event()
     stop = threading.Event()
@@ -260,6 +272,7 @@ def main():
     k_diag = cfg["hotkeys"].get("diag", "f7")
     k_shot = cfg["hotkeys"].get("snapshot", "f9")
     k_overlay = cfg["hotkeys"].get("overlay", "f6")
+    k_attack = cfg["hotkeys"].get("attack", "f10")
 
     # --- оверлей со статусами (поверх игры, click-through) ---
     ov_state = OverlayState()
@@ -285,10 +298,13 @@ def main():
         if name == k_overlay:
             vis = overlay.toggle()
             log.info("Оверлей: %s", "показан" if vis else "скрыт")
+        if name == k_attack and mob_det is not None:
+            state = attack.flip()
+            log.info("Авто-атака: %s", "ВКЛ" if state else "выкл")
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
-    log.info("Готово. F8 — подбор, F7 — диагностика, F9 — снимок, F6 — оверлей, F12 — выход.")
+    log.info("Готово. F8 — подбор, F10 — авто-атака, F7 — диагностика, F9 — снимок, F6 — оверлей, F12 — выход.")
 
     # --- главный цикл ---
     last_status = 0.0
@@ -302,6 +318,8 @@ def main():
     last_good_ratio = None   # последнее достоверное HP — для fallback на слепые кадры
     num_blind_since = None   # когда цифры перестали читаться (для детекта меню)
     last_locate = 0.0        # таймер фонового переиска HUD (пока не локализован)
+    r1_held = False          # держит ли бот сейчас R1 (авто-атака)
+    last_bar_seen = 0.0      # когда последний раз видели полосу HP моба
     iters = 0
     try:
         while not stop.is_set():
@@ -312,7 +330,8 @@ def main():
             #   персонажа (лут). Один грабь принципиально: dxcam на второй вызов подряд
             #   отдаёт устаревший кадр (None→last), что ломало детекцию лута.
             # F8 выкл → грабим только кроп орба → высокий fps.
-            if auto.on or diag.enabled or hpg["orb_region"] is None:
+            # F8/F10/F7 → нужен полный кадр (лут / полоса моба вверху / диагностика).
+            if auto.on or attack.on or diag.enabled or hpg["orb_region"] is None:
                 full = cap.grab(region)
                 if full is None:
                     time.sleep(0.02)
@@ -327,11 +346,27 @@ def main():
                 else:
                     loot_frame, loot_ctr = None, None
             else:
+                full = None
                 hp_frame, hp_d, num_rd = cap.grab(hpg["orb_region"]), hpg["hp_det_crop"], hpg["num_reader_crop"]
                 loot_frame, loot_ctr = None, None
                 if hp_frame is None:
                     time.sleep(0.02)
                     continue
+
+            # авто-атака: пока вверху видна полоса HP моба — держим R1 (в фокусе).
+            # press каждый кадр идемпотентен и переподтверждает удержание; отпускаем
+            # с грейсом (сглаживание мерцания / добив почти мёртвого моба).
+            if mob_det is not None and attack.on and foreground and full is not None:
+                if mob_det.present(full):
+                    last_bar_seen = time.perf_counter()
+                    vx.press(atk_btn)
+                    r1_held = True
+                elif r1_held and time.perf_counter() - last_bar_seen > atk_grace:
+                    vx.release(atk_btn)
+                    r1_held = False
+            elif r1_held:                       # авто-атака выкл / вне фокуса → отпустить
+                vx.release(atk_btn)
+                r1_held = False
 
             # детекция лута — только окно вокруг персонажа (радиус подбора)
             if auto.on and loot_frame is not None:
@@ -432,6 +467,9 @@ def main():
 
             # обновляем оверлей (дешёвые записи в общий state, читает поток tkinter)
             ov_state.auto_loot = auto.on
+            ov_state.attack_enabled = mob_det is not None
+            ov_state.attack_on = attack.on
+            ov_state.attacking = r1_held
             ov_state.diag = diag.enabled
             ov_state.hp_pct = hp_pct
             ov_state.foreground = foreground

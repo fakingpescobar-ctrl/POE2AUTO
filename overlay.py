@@ -45,6 +45,9 @@ class OverlayState:
     """Снимок состояния бота для отрисовки. Бот пишет поля напрямую."""
     def __init__(self):
         self.auto_loot = False
+        self.attack_enabled = False  # авто-атака доступна (включена в конфиге)
+        self.attack_on = False       # авто-атака включена (F10)
+        self.attacking = False       # прямо сейчас держим R1 (виден моб)
         self.flask_enabled = False
         self.diag = False
         self.hp_pct = None          # 0..1 или None
@@ -144,6 +147,7 @@ class Overlay:
 
         # строки-статусы
         self._rows["loot"] = self._status_row(pad, "Авто-подбор", "F8")
+        self._rows["attack"] = self._status_row(pad, "Авто-атака", "F10")
         self._rows["flask"] = self._status_row(pad, "Авто-фляска", "")
         self._rows["locate"] = self._status_row(pad, "Калибровка HUD", "")
         self._rows["diag"] = self._status_row(pad, "Диагностика", "F7")
@@ -209,6 +213,14 @@ class Overlay:
             return
         s = self.state
         self._set(self._rows["loot"], s.auto_loot, "ON" if s.auto_loot else "OFF")
+
+        if not s.attack_enabled:
+            self._set(self._rows["attack"], False, "—", C_DIM)
+        elif s.attacking:
+            self._set(self._rows["attack"], True, "АТАКА ⚔", C_WARN)   # держим R1: цель видна
+        else:
+            self._set(self._rows["attack"], s.attack_on,
+                      "ждёт" if s.attack_on else "OFF", C_ON if s.attack_on else C_OFF)
 
         if not s.flask_enabled:
             self._set(self._rows["flask"], False, "—", C_DIM)
