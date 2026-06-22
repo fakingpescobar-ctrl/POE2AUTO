@@ -410,8 +410,18 @@ def main():
                     use_orb = False
                     if num is not None:
                         num_blind_since = None
-                        last_good_ratio = num[2]
-                        low_now = num[2] < hp_threshold
+                        # страховка от мисрида цифр (обрезанный ROI читает «043/1043»=4%):
+                        # если цифры зовут пить, а орб явно полный — НЕ верим цифрам,
+                        # этот кадр не пьём и форсим перелокализацию ROI.
+                        if (num[2] < hp_threshold and hm["ratio"] is not None
+                                and hm["ratio"] >= hp_threshold):
+                            log.warning("Цифры HP=%.0f%% против орба %.0f%% — мисрид (обрезка ROI?), "
+                                        "перелокализую", num[2] * 100, hm["ratio"] * 100)
+                            located = False
+                            low_now = None
+                        else:
+                            last_good_ratio = num[2]
+                            low_now = num[2] < hp_threshold
                     elif num_rd is None:
                         use_orb = True          # цифры выключены/не калиброваны → орб основной
                     else:
