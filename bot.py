@@ -327,6 +327,7 @@ def main():
     last_locate = 0.0        # таймер фонового переиска HUD (пока не локализован)
     last_num_ok = time.perf_counter()  # когда цифры читались в последний раз (для самолечения ROI)
     num_low_since = None     # когда цифры впервые ушли < порога подряд (анти-глитч)
+    last_clip_warn = 0.0     # throttle варнинга обрезки ROI
     r1_held = False          # держит ли бот сейчас R1 (авто-атака)
     last_bar_seen = 0.0      # когда последний раз видели полосу HP моба
     iters = 0
@@ -418,21 +419,34 @@ def main():
                     use_orb = False
                     if num is not None:
                         num_blind_since = None
-                        last_good_ratio = num[2]
-                        if num[2] < hp_threshold:
+                        orb_full = hm["ratio"] is not None and hm["ratio"] >= hp_threshold
+                        if orb_full and num[2] < 0.25:
+                            # цифры ЭКСТРЕМ-низкие (<25%) при ПОЛНОМ орбе — физически
+                            # невозможно (на реальном <25% орб пуст). Значит ROI обрезает
+                            # ведущую цифру (current стал 4-значным на полном HP → «070/1070»
+                            # =7%). Не пьём и форсим перелокализацию (якорь по жизни не даст
+                            # уехать на Щит) — она пересоберёт ROI под полное число. Реальную
+                            # умеренную просадку (30-88%) это НЕ трогает: там low_now ниже.
+                            if time.perf_counter() - last_clip_warn > 3.0:
+                                log.warning("Цифры HP=%.0f%% при орбе %.0f%% — обрезка ROI "
+                                            "(число выросло), перелокализую", num[2] * 100,
+                                            hm["ratio"] * 100)
+                                last_clip_warn = time.perf_counter()
+                            located = False
+                            low_now = None
+                            num_low_since = None
+                        elif num[2] < hp_threshold:
+                            last_good_ratio = num[2]
                             if num_low_since is None:
                                 num_low_since = time.perf_counter()
-                            # анти-глитч (мягкий): эффекты/искры иногда дают ложный низкий
-                            # % на 1-2 кадра. Если орб уверенно полный (не согласен), ждём
-                            # СТАБИЛЬНОСТИ цифр (короткий грейс) — транзиентную вспышку
-                            # отфильтрует, а реальную просадку (цифры держатся низкими)
-                            # выпьет. Орб согласен/слеп — пьём сразу. НЕ доверяем орбу как
-                            # вето: он у этого перса завышает (74%→98%), стабильные низкие
-                            # цифры важнее.
-                            orb_full = hm["ratio"] is not None and hm["ratio"] >= hp_threshold
+                            # мягкий анти-глитч: умеренно ниже порога при НЕсогласном орбе
+                            # (орб у перса завышает 74%→98%) → ждём стабильности цифр
+                            # короткий грейс (отфильтрует transient-вспышку), потом пьём.
+                            # Орб согласен/слеп → сразу. Орбу как вето НЕ доверяем.
                             low_now = not (orb_full and
                                            time.perf_counter() - num_low_since < num_low_grace)
                         else:
+                            last_good_ratio = num[2]
                             num_low_since = None
                             low_now = False
                     elif num_rd is None:
