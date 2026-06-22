@@ -135,6 +135,7 @@ def main():
     hpg = {"hp_det": None, "hp_det_crop": None, "orb_region": None,
            "num_reader": None, "num_reader_crop": None}
     loc_info = {"text": ""}   # что зацепила авто-локализация (для оверлея), напр. "1371/1371"
+    hud_anchor = {"y": None}  # доля Y известной строки ЖИЗНИ — чтобы переиск не уехал на Щит
 
     def rebuild_hp_geometry():
         """(Пере)собрать всё, что зависит от геометрии орба (hp_cfg['orb']) и ROI цифр
@@ -199,10 +200,13 @@ def main():
         frame = cap.grab(region)
         if frame is None:
             return False
-        found = find_digits_roi(frame, probe)
+        ffh, ffw = frame.shape[:2]
+        # переиск держим у известной строки жизни (anchor), чтобы не залочиться на Щит,
+        # когда строка жизни временно зашумлена эффектом
+        found = find_digits_roi(frame, probe, prefer_y=hud_anchor["y"])
         if not found:
             return False
-        ffh, ffw = frame.shape[:2]
+        hud_anchor["y"] = found["text_bbox"][1] / ffh
         num_cfg["roi"] = found["roi"]
         hp_cfg["orb"] = derive_orb(found["text_bbox"], ffw, ffh)
         loc_info["text"] = f"{found['cur']}/{found['max']}"

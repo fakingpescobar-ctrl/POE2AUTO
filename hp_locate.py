@@ -56,11 +56,14 @@ def _group_lines(comps, y_tol):
     return lines
 
 
-def find_digits_roi(frame_bgr, reader, region=(0.0, 0.55, 0.42, 0.99),
+def find_digits_roi(frame_bgr, reader, prefer_y=None, region=(0.0, 0.55, 0.42, 0.99),
                     min_h_frac=0.010, max_h_frac=0.060, pad_frac=0.30):
     """Найти ROI строки здоровья. Возвращает dict(roi, text_bbox, cur, max) или None.
 
     region — нижне-левая зона поиска (доли кадра), исключает ману справа.
+    prefer_y — доля кадра по Y уже известной строки жизни. Если задана, берём строку
+    РЯДОМ с ней (а не «просто верхнюю») — иначе при зашумлённой строке жизни верхней
+    ресурсной может стать «Щит»/«Барьер», и бот залочится на него вместо HP.
     """
     fh, fw = frame_bgr.shape[:2]
     rx1, ry1 = int(region[0] * fw), int(region[1] * fh)
@@ -94,10 +97,16 @@ def find_digits_roi(frame_bgr, reader, region=(0.0, 0.55, 0.42, 0.99),
         return None
 
     # в нижне-левом углу PoE2 ресурсы стоят стопкой (жизнь / энергощит / барьер —
-    # барьер новая механика); жизнь ВСЕГДА верхняя. Берём только верхнюю ресурсную
-    # строку и НЕ подставляем нижние (ES/барьер) как HP. Если она в этом кадре не
-    # читается чисто — None (переищем позже).
-    resource.sort(key=lambda t: t[0])
+    # барьер новая механика); жизнь ВСЕГДА верхняя.
+    if prefer_y is not None:
+        # уже знаем, где жизнь — берём строку рядом с ней (Щит/Барьер на другой высоте
+        # не перепутаются). Нет строки рядом — None (не лочимся на чужой ресурс).
+        target = prefer_y * fh
+        resource.sort(key=lambda t: abs(t[0] - target))
+        if abs(resource[0][0] - target) > 1.0 * med_h:
+            return None
+    else:
+        resource.sort(key=lambda t: t[0])      # первый раз — верхняя (жизнь)
     _, s, char_comp, boxes = resource[0]
     best = None
     for m in re.finditer(r"\d+/\d+", s):
