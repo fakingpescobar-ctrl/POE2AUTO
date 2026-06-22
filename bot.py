@@ -124,6 +124,9 @@ def main():
     # мин. доля красного, чтобы fallback на слепой кадр сработал: отделяет реальную
     # просадку под эффектом (красная лужа есть, ~0.08) от тёмного орба в меню (~0.001).
     hp_fallback_red_min = hp_cfg.get("fallback_red_frac_min", 0.04)
+    # сколько цифры должны держаться низкими при НЕсогласном (полном) орбе, прежде чем
+    # пить — фильтр транзиентных глитчей цифр от вспышек, не подавляя реальную просадку
+    num_low_grace = hp_cfg.get("num_low_grace_s", 0.35)
     flask_right = hp_cfg.get("flask_button") == "right_trigger"
     # сколько цифры могут не читаться, прежде чем считать это МЕНЮ (а не мельканием
     # в бою). В пределах окна орб подстраховывает; дольше — HUD перекрыт → не пьём.
@@ -323,7 +326,7 @@ def main():
     num_blind_since = None   # когда цифры перестали читаться (для детекта меню)
     last_locate = 0.0        # таймер фонового переиска HUD (пока не локализован)
     last_num_ok = time.perf_counter()  # когда цифры читались в последний раз (для самолечения ROI)
-    last_glitch_warn = 0.0   # throttle варнинга анти-глитча цифр
+    num_low_since = None     # когда цифры впервые ушли < порога подряд (анти-глитч)
     r1_held = False          # держит ли бот сейчас R1 (авто-атака)
     last_bar_seen = 0.0      # когда последний раз видели полосу HP моба
     iters = 0
@@ -389,19 +392,6 @@ def main():
             if hp_d:
                 low, hm = hp_d.is_low(hp_frame)
                 num = num_rd.read(hp_frame) if num_rd else None   # (cur,max,ratio) | None
-                # анти-глитч цифр: эффекты/искры поверх ROI дают ложный низкий % при
-                # ПОЛНОМ HP (читает «0/1057» при полном орбе) → спам флягой. Орб ищет
-                # КРАСНОЕ и белым частицам не подвержен → надёжный арбитр: если цифры
-                # зовут пить, а орб уверенно полный (≥порога) — зануляем чтение, дальше
-                # отработает орб (полный → не пьём). На РЕАЛЬНОМ сливе орб тоже падает
-                # < порога (он читает текущий кадр, не отстаёт) → фляга идёт штатно.
-                if (num is not None and num[2] < hp_threshold
-                        and hm["ratio"] is not None and hm["ratio"] >= hp_threshold):
-                    if time.perf_counter() - last_glitch_warn > 3.0:
-                        log.warning("Цифры HP=%.0f%% при орбе %.0f%% (полный) — глитч цифр "
-                                    "(эффект поверх ROI?), игнор", num[2] * 100, hm["ratio"] * 100)
-                        last_glitch_warn = time.perf_counter()
-                    num = None
                 hp_pct = num[2] if num is not None else hm["ratio"]
                 hp_src = "num" if num is not None else "orb"
                 if num is not None:               # «захват ✓» в оверлее = ЖИВОЕ значение, не снимок старта
@@ -429,7 +419,22 @@ def main():
                     if num is not None:
                         num_blind_since = None
                         last_good_ratio = num[2]
-                        low_now = num[2] < hp_threshold
+                        if num[2] < hp_threshold:
+                            if num_low_since is None:
+                                num_low_since = time.perf_counter()
+                            # анти-глитч (мягкий): эффекты/искры иногда дают ложный низкий
+                            # % на 1-2 кадра. Если орб уверенно полный (не согласен), ждём
+                            # СТАБИЛЬНОСТИ цифр (короткий грейс) — транзиентную вспышку
+                            # отфильтрует, а реальную просадку (цифры держатся низкими)
+                            # выпьет. Орб согласен/слеп — пьём сразу. НЕ доверяем орбу как
+                            # вето: он у этого перса завышает (74%→98%), стабильные низкие
+                            # цифры важнее.
+                            orb_full = hm["ratio"] is not None and hm["ratio"] >= hp_threshold
+                            low_now = not (orb_full and
+                                           time.perf_counter() - num_low_since < num_low_grace)
+                        else:
+                            num_low_since = None
+                            low_now = False
                     elif num_rd is None:
                         use_orb = True          # цифры выключены/не калиброваны → орб основной
                     else:
@@ -482,6 +487,7 @@ def main():
                     low_streak = 0
                     last_good_ratio = None     # вне фокуса забываем HP — иначе stale-low даст fallback при возврате
                     num_blind_since = None
+                    num_low_since = None
             else:
                 low_streak = 0
 
