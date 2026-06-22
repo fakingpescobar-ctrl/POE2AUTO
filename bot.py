@@ -27,6 +27,7 @@ from color_detector import ColorDetector
 from loot_engine import LootEngine
 from hp_detector import HPDetector
 from hp_ocr import HPNumReader
+from hp_locate import find_digits_roi, derive_orb
 from diag_dump import HPDiag, dump_loot
 from overlay import Overlay, OverlayState
 from virtual_xbox import VirtualXbox360, XUSB
@@ -112,7 +113,8 @@ def main():
 
     # --- автофляска HP ---
     hp_cfg = cfg["hp"]
-    hp_det = HPDetector(hp_cfg) if hp_cfg.get("enabled") else None
+    num_cfg = cfg.get("hp_num", {})
+    hp_enabled = bool(hp_cfg.get("enabled"))
     hp_cooldown = hp_cfg.get("cooldown_ms", 3000) / 1000.0
     flask_hold = hp_cfg.get("flask_hold_ms", 120)
     hp_threshold = hp_cfg.get("threshold", 0.55)
@@ -122,62 +124,106 @@ def main():
     # просадку под эффектом (красная лужа есть, ~0.08) от тёмного орба в меню (~0.001).
     hp_fallback_red_min = hp_cfg.get("fallback_red_frac_min", 0.04)
     flask_right = hp_cfg.get("flask_button") == "right_trigger"
-    # быстрый захват: когда F8 выкл, грабим только зону орба (а не весь экран) → высокий fps
-    hp_det_crop = None
-    orb_region = None
-    if hp_det:
-        fw, fh = region["width"], region["height"]
+    # сколько цифры могут не читаться, прежде чем считать это МЕНЮ (а не мельканием
+    # в бою). В пределах окна орб подстраховывает; дольше — HUD перекрыт → не пьём.
+    hp_num_grace = num_cfg.get("menu_grace_s", 0.5)
+    fw, fh = region["width"], region["height"]
+
+    # Геометрия HP (орб + ROI цифр) и зависимые объекты живут в одном холдере, чтобы их
+    # можно было ПЕРЕСОБРАТЬ на лету после авто-локализации HUD (другое разрешение/UI).
+    hpg = {"hp_det": None, "hp_det_crop": None, "orb_region": None,
+           "num_reader": None, "num_reader_crop": None}
+
+    def rebuild_hp_geometry():
+        """(Пере)собрать всё, что зависит от геометрии орба (hp_cfg['orb']) и ROI цифр
+        (num_cfg['roi']). Берёт ТЕКУЩИЕ значения из cfg — зовём на старте и после
+        успешной авто-локализации. Когда F8 выкл — грабим только зону орба (а не весь
+        экран) → высокий fps, поэтому считаем компактный orb_region."""
+        if not hp_enabled:
+            return
+        hp_det = HPDetector(hp_cfg)
         ocx = region["left"] + hp_cfg["orb"]["cx"] * fw
         ocy = region["top"] + hp_cfg["orb"]["cy"] * fh
         orp = hp_cfg["orb"]["r"] * fh
         half = orp * 1.25  # запас вокруг орба
         rl, rt = region["left"], region["top"]
-        ox1 = max(rl, ocx - half)
-        oy1 = max(rt, ocy - half)
-        ox2 = min(rl + fw, ocx + half)
-        oy2 = min(rt + fh, ocy + half)
+        ox1, oy1 = max(rl, ocx - half), max(rt, ocy - half)
+        ox2, oy2 = min(rl + fw, ocx + half), min(rt + fh, ocy + half)
         sw, sh = ox2 - ox1, oy2 - oy1
         orb_region = {"left": int(ox1), "top": int(oy1), "width": int(sw), "height": int(sh)}
         crop_cfg = dict(hp_cfg)
         crop_cfg["orb"] = {"cx": (ocx - ox1) / sw, "cy": (ocy - oy1) / sh, "r": orp / sh}
         hp_det_crop = HPDetector(crop_cfg)
 
-    # --- чтение HP по цифрам HUD (основной источник; орб — fallback) ---
-    num_cfg = cfg.get("hp_num", {})
-    # сколько цифры могут не читаться, прежде чем считать это МЕНЮ (а не мельканием
-    # в бою). В пределах окна орб подстраховывает; дольше — HUD перекрыт → не пьём.
-    hp_num_grace = num_cfg.get("menu_grace_s", 0.5)
-    num_reader = None        # читает по полному кадру (auto/diag вкл)
-    num_reader_crop = None   # читает по быстрому кропу орба (auto выкл)
-    if num_cfg.get("enabled") and hp_det:
-        nr = HPNumReader(num_cfg)
-        if not nr.ready:
-            log.warning("hp_num включён, но цифры не откалиброваны "
-                        "(запусти calibrate_hp_digits.py) — работаю по орбу")
-        else:
-            num_reader = nr
-            # расширяем быстрый захват орба, чтобы в него попала строка цифр HP
-            nx1 = region["left"] + num_cfg["roi"]["x1"] * fw
-            ny1 = region["top"] + num_cfg["roi"]["y1"] * fh
-            nx2 = region["left"] + num_cfg["roi"]["x2"] * fw
-            ny2 = region["top"] + num_cfg["roi"]["y2"] * fh
-            gx1 = min(orb_region["left"], int(nx1))
-            gy1 = min(orb_region["top"], int(ny1))
-            gx2 = max(orb_region["left"] + orb_region["width"], int(nx2) + 1)
-            gy2 = max(orb_region["top"] + orb_region["height"], int(ny2) + 1)
-            orb_region = {"left": gx1, "top": gy1, "width": gx2 - gx1, "height": gy2 - gy1}
-            sw, sh = orb_region["width"], orb_region["height"]
-            # пересобираем орб-детектор кропа под расширенный регион
-            crop_cfg = dict(hp_cfg)
-            crop_cfg["orb"] = {"cx": (ocx - gx1) / sw, "cy": (ocy - gy1) / sh, "r": orp / sh}
-            hp_det_crop = HPDetector(crop_cfg)
-            # ридер цифр для быстрого пути: ROI в долях расширенного кропа
-            ncfg_crop = dict(num_cfg)
-            ncfg_crop["roi"] = {"x1": (nx1 - gx1) / sw, "y1": (ny1 - gy1) / sh,
-                                "x2": (nx2 - gx1) / sw, "y2": (ny2 - gy1) / sh}
-            num_reader_crop = HPNumReader(ncfg_crop)
-            log.info("Чтение HP по цифрам ВКЛ: ROI %s max_hp=%s",
-                     num_cfg["roi"], num_cfg.get("max_hp"))
+        num_reader = None        # читает по полному кадру (auto/diag вкл)
+        num_reader_crop = None   # читает по быстрому кропу орба (auto выкл)
+        if num_cfg.get("enabled"):
+            nr = HPNumReader(num_cfg)
+            if not nr.ready:
+                log.warning("hp_num включён, но цифры не откалиброваны "
+                            "(запусти calibrate_hp_digits.py) — работаю по орбу")
+            else:
+                num_reader = nr
+                # расширяем быстрый захват орба, чтобы в него попала строка цифр HP
+                nx1 = region["left"] + num_cfg["roi"]["x1"] * fw
+                ny1 = region["top"] + num_cfg["roi"]["y1"] * fh
+                nx2 = region["left"] + num_cfg["roi"]["x2"] * fw
+                ny2 = region["top"] + num_cfg["roi"]["y2"] * fh
+                gx1 = min(orb_region["left"], int(nx1))
+                gy1 = min(orb_region["top"], int(ny1))
+                gx2 = max(orb_region["left"] + orb_region["width"], int(nx2) + 1)
+                gy2 = max(orb_region["top"] + orb_region["height"], int(ny2) + 1)
+                orb_region = {"left": gx1, "top": gy1, "width": gx2 - gx1, "height": gy2 - gy1}
+                sw, sh = orb_region["width"], orb_region["height"]
+                crop_cfg = dict(hp_cfg)
+                crop_cfg["orb"] = {"cx": (ocx - gx1) / sw, "cy": (ocy - gy1) / sh, "r": orp / sh}
+                hp_det_crop = HPDetector(crop_cfg)
+                ncfg_crop = dict(num_cfg)
+                ncfg_crop["roi"] = {"x1": (nx1 - gx1) / sw, "y1": (ny1 - gy1) / sh,
+                                    "x2": (nx2 - gx1) / sw, "y2": (ny2 - gy1) / sh}
+                num_reader_crop = HPNumReader(ncfg_crop)
+        hpg.update(hp_det=hp_det, hp_det_crop=hp_det_crop, orb_region=orb_region,
+                   num_reader=num_reader, num_reader_crop=num_reader_crop)
+
+    def try_locate_hud(reason):
+        """Найти строку HP на свежем кадре, переписать cfg['hp_num']['roi'] и
+        cfg['hp']['orb'] (орб выводится от рамки цифр) и пересобрать геометрию.
+        True — нашли. Делает портабельным к смене разрешения/UI Scale."""
+        if not (hp_enabled and num_cfg.get("enabled") and num_cfg.get("auto_locate")):
+            return False
+        probe = HPNumReader(num_cfg)
+        if not probe.ready:
+            return False
+        frame = cap.grab(region)
+        if frame is None:
+            return False
+        found = find_digits_roi(frame, probe)
+        if not found:
+            return False
+        ffh, ffw = frame.shape[:2]
+        num_cfg["roi"] = found["roi"]
+        hp_cfg["orb"] = derive_orb(found["text_bbox"], ffw, ffh)
+        rebuild_hp_geometry()
+        log.info("Авто-локализация HUD (%s): HP=%d/%d ROI=%s орб=%s",
+                 reason, found["cur"], found["max"],
+                 {k: round(v, 4) for k, v in num_cfg["roi"].items()},
+                 {k: round(v, 4) for k, v in hp_cfg["orb"].items()})
+        return True
+
+    # старт: пробуем авто-локализацию (HUD может быть не виден сразу — несколько попыток);
+    # не вышло → работаем по ROI из конфига и продолжаем искать в главном цикле.
+    located = False
+    if hp_enabled and num_cfg.get("enabled") and num_cfg.get("auto_locate"):
+        for _ in range(20):                       # ~до 2с попыток на старте
+            if try_locate_hud("старт"):
+                located = True
+                break
+            time.sleep(0.1)
+        if not located:
+            log.info("Авто-локализация HUD на старте не удалась — работаю по ROI из "
+                     "конфига, продолжу искать в фоне")
+    if not located:
+        rebuild_hp_geometry()
 
     # быстрый захват лута: детектим не весь экран, а окно вокруг персонажа
     # (лут важен только в радиусе подбора) → в разы меньше пикселей, выше fps.
@@ -192,10 +238,13 @@ def main():
     loot_center = (lccx - ll, lccy - lt)        # центр персонажа в координатах ROI
     log.info("Захват лута: ROI %s, центр персонажа в кропе %s", loot_region, loot_center)
 
-    if hp_det:
+    if hpg["hp_det"]:
         log.info("Автофляска ВКЛ: порог=%.0f%% кулдаун=%dмс подтв=%d кадра кнопка=%s | быстрый захват орба %s",
                  hp_threshold * 100, hp_cfg.get("cooldown_ms", 3000), hp_confirm,
-                 "R2" if flask_right else "L2", orb_region)
+                 "R2" if flask_right else "L2", hpg["orb_region"])
+        if hpg["num_reader"]:
+            log.info("Чтение HP по цифрам ВКЛ: ROI %s max_hp=%s",
+                     {k: round(v, 4) for k, v in num_cfg["roi"].items()}, num_cfg.get("max_hp"))
     else:
         log.info("Автофляска выкл (запусти calibrate_hp.bat)")
 
@@ -212,7 +261,7 @@ def main():
 
     # --- оверлей со статусами (поверх игры, click-through) ---
     ov_state = OverlayState()
-    ov_state.flask_enabled = hp_det is not None
+    ov_state.flask_enabled = hpg["hp_det"] is not None
     overlay = Overlay(ov_state, region)
     overlay.start()
 
@@ -250,6 +299,7 @@ def main():
     low_streak = 0
     last_good_ratio = None   # последнее достоверное HP — для fallback на слепые кадры
     num_blind_since = None   # когда цифры перестали читаться (для детекта меню)
+    last_locate = 0.0        # таймер фонового переиска HUD (пока не локализован)
     iters = 0
     try:
         while not stop.is_set():
@@ -260,12 +310,12 @@ def main():
             #   персонажа (лут). Один грабь принципиально: dxcam на второй вызов подряд
             #   отдаёт устаревший кадр (None→last), что ломало детекцию лута.
             # F8 выкл → грабим только кроп орба → высокий fps.
-            if auto.on or diag.enabled or orb_region is None:
+            if auto.on or diag.enabled or hpg["orb_region"] is None:
                 full = cap.grab(region)
                 if full is None:
                     time.sleep(0.02)
                     continue
-                hp_frame, hp_d, num_rd = full, hp_det, num_reader   # measure() кропает орб сам
+                hp_frame, hp_d, num_rd = full, hpg["hp_det"], hpg["num_reader"]   # measure() кропает орб сам
                 if auto.on:
                     lx = loot_region["left"] - region["left"]
                     ly = loot_region["top"] - region["top"]
@@ -275,7 +325,7 @@ def main():
                 else:
                     loot_frame, loot_ctr = None, None
             else:
-                hp_frame, hp_d, num_rd = cap.grab(orb_region), hp_det_crop, num_reader_crop
+                hp_frame, hp_d, num_rd = cap.grab(hpg["orb_region"]), hpg["hp_det_crop"], hpg["num_reader_crop"]
                 loot_frame, loot_ctr = None, None
                 if hp_frame is None:
                     time.sleep(0.02)
@@ -386,6 +436,12 @@ def main():
 
             iters += 1
             now = time.perf_counter()
+            # фоновый переиск HUD: пока не локализован (стартовая попытка не нашла —
+            # игра грузилась/меню), пробуем раз в 3с на свежем кадре, потом фиксируем.
+            if (not located and hp_enabled and num_cfg.get("enabled")
+                    and num_cfg.get("auto_locate") and now - last_locate >= 3.0):
+                last_locate = now
+                located = try_locate_hud("фон")
             if now - last_status >= 1.0:
                 fps = iters / (now - last_status)
                 ov_state.fps = fps
