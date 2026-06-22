@@ -1,10 +1,11 @@
 """Детект полосы HP моба (рара/уника) вверху по центру экрана — для авто-атаки.
 
 Когда наводишься/в бою с монстром, PoE2 рисует вверху по центру его HP-бар:
-красная полоса на тёмной подложке + имя. Ловим её по сигнатуре «длинный
-НЕПРЕРЫВНЫЙ горизонтальный красный отрезок» в ROI верх-центра — у факелов/лавы
-и иконки рарника такого ровного длинного отрезка нет. Бар виден (даже частично)
-= моб жив → бот держит R1 (авто-атака). Бар пропал = цели нет → отпускает.
+красная полоса на тёмной подложке + имя. Ловим её как красную связную компоненту
+ФОРМЫ ПОЛОСЫ — тонкий широкий сплошной прямоугольник (w ≫ h, высокий fill).
+Красные пятна сцены (камень/лава/факелы в красно-оранжевой локации) — это почти
+квадратные бесформенные блобы (aspect ≈ 1, большая высота) и отсекаются формой.
+Бар виден (даже частично) = моб жив → бот держит R1. Бар пропал = цели нет → отпускает.
 """
 import cv2
 import numpy as np
@@ -13,14 +14,16 @@ import numpy as np
 class MobBarDetector:
     def __init__(self, cfg):
         self.roi = cfg.get("roi", {"x1": 0.36, "y1": 0.02, "x2": 0.64, "y2": 0.12})
-        self.sat_min = cfg.get("red_sat_min", 120)
+        self.sat_min = cfg.get("red_sat_min", 150)
         self.val_min = cfg.get("red_val_min", 90)
-        # мин. длина непрерывного красного отрезка (доля ширины кадра), чтобы
-        # считать это полосой HP, а не бликом/факелом/иконкой
-        self.min_run_frac = cfg.get("min_run_frac", 0.018)
+        # признаки ПОЛОСЫ (а не пятна сцены): длинная, тонкая, сплошная
+        self.min_w_frac = cfg.get("min_run_frac", 0.018)   # мин. ширина (доля кадра)
+        self.max_h_frac = cfg.get("max_h_frac", 0.030)     # макс. высота (доля кадра)
+        self.min_aspect = cfg.get("min_aspect", 3.0)       # w/h — полоса вытянута
+        self.min_fill = cfg.get("min_fill", 0.45)          # area/(w*h) — полоса сплошная
 
     def present(self, frame_bgr):
-        """True, если в ROI есть горизонтальная красная полоса (моб жив)."""
+        """True, если в ROI есть красная компонента ФОРМЫ полосы HP (моб жив)."""
         fh, fw = frame_bgr.shape[:2]
         x1, y1 = int(self.roi["x1"] * fw), int(self.roi["y1"] * fh)
         x2, y2 = int(self.roi["x2"] * fw), int(self.roi["y2"] * fh)
@@ -31,8 +34,13 @@ class MobBarDetector:
         mask = cv2.bitwise_or(
             cv2.inRange(hsv, (0, self.sat_min, self.val_min), (10, 255, 255)),
             cv2.inRange(hsv, (170, self.sat_min, self.val_min), (179, 255, 255)))
-        need = max(1, int(self.min_run_frac * fw))
-        # горизонтальная эрозия линией длины need: пиксель выживает, только если
-        # слева-направо подряд идёт >= need красных → значит есть длинный отрезок
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (need, 1))
-        return bool(cv2.erode(mask, kernel).any())
+        min_w = max(8, int(self.min_w_frac * fw))
+        max_h = max(4, int(self.max_h_frac * fh))
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        for i in range(1, n):
+            x, y, w, h, area = (int(v) for v in stats[i])
+            if (w >= min_w and h <= max_h
+                    and w / max(1, h) >= self.min_aspect
+                    and area / max(1, w * h) >= self.min_fill):
+                return True
+        return False
