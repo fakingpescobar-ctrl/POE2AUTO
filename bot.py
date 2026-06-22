@@ -138,7 +138,7 @@ def main():
     hpg = {"hp_det": None, "hp_det_crop": None, "orb_region": None,
            "num_reader": None, "num_reader_crop": None}
     loc_info = {"text": ""}   # что зацепила авто-локализация (для оверлея), напр. "1371/1371"
-    hud_anchor = {"y": None}  # доля Y известной строки ЖИЗНИ — чтобы переиск не уехал на Щит
+    hud_anchor = {"max": 0}   # установленный max ЖИЗНИ — чтобы переиск не уехал на Щит/ES (меньший пул)
 
     def rebuild_hp_geometry():
         """(Пере)собрать всё, что зависит от геометрии орба (hp_cfg['orb']) и ROI цифр
@@ -204,12 +204,16 @@ def main():
         if frame is None:
             return False
         ffh, ffw = frame.shape[:2]
-        # переиск держим у известной строки жизни (anchor), чтобы не залочиться на Щит,
-        # когда строка жизни временно зашумлена эффектом
-        found = find_digits_roi(frame, probe, prefer_y=hud_anchor["y"])
+        found = find_digits_roi(frame, probe)   # верхняя ресурсная строка (жизнь)
         if not found:
             return False
-        hud_anchor["y"] = found["text_bbox"][1] / ffh
+        # защита от лока на МЕНЬШИЙ пул (Щит/ES): жизнь — крупнейший пул. Когда строка
+        # жизни зашумлена эффектом и не распозналась, верхней становится Щит — его max
+        # сильно меньше (251 ≪ 1084). Отклоняем, держим геометрию жизни; когда жизнь
+        # снова читается — переиск её подхватит (само-восстановление, без застревания).
+        if hud_anchor["max"] and found["max"] < 0.5 * hud_anchor["max"]:
+            return False
+        hud_anchor["max"] = found["max"]
         num_cfg["roi"] = found["roi"]
         hp_cfg["orb"] = derive_orb(found["text_bbox"], ffw, ffh)
         loc_info["text"] = f"{found['cur']}/{found['max']}"
