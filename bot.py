@@ -318,6 +318,7 @@ def main():
     last_good_ratio = None   # последнее достоверное HP — для fallback на слепые кадры
     num_blind_since = None   # когда цифры перестали читаться (для детекта меню)
     last_locate = 0.0        # таймер фонового переиска HUD (пока не локализован)
+    last_num_ok = time.perf_counter()  # когда цифры читались в последний раз (для самолечения ROI)
     r1_held = False          # держит ли бот сейчас R1 (авто-атака)
     last_bar_seen = 0.0      # когда последний раз видели полосу HP моба
     iters = 0
@@ -387,6 +388,7 @@ def main():
                 hp_src = "num" if num is not None else "orb"
                 if num is not None:               # «захват ✓» в оверлее = ЖИВОЕ значение, не снимок старта
                     loc_info["text"] = f"{num[0]}/{num[1]}"
+                    last_num_ok = time.perf_counter()
                 hp_v = hm["fill_v"]
                 # диагностика потери HP: снимает улики на переходах ratio=None (если F7 вкл)
                 diag.feed(hp_frame, hp_d, hm, foreground, time.perf_counter())
@@ -483,6 +485,15 @@ def main():
 
             iters += 1
             now = time.perf_counter()
+            # самолечение: если цифры залокализованы, но перестали читаться ≥3с в фокусе
+            # (число выросло шире ROI после левел-апа, HUD сместился) — сбрасываем
+            # фиксацию, чтобы переиск ниже нашёл строку заново с актуальным ROI.
+            if (located and hp_enabled and num_cfg.get("enabled") and num_cfg.get("auto_locate")
+                    and hpg["num_reader"] is not None and foreground
+                    and now - last_num_ok >= 3.0):
+                log.info("Цифры HP не читаются ≥3с — перелокализую HUD (число выросло/HUD сместился)")
+                located = False
+                last_num_ok = now            # не зацикливать сброс, пока переиск не отработает
             # фоновый переиск HUD: пока не локализован (стартовая попытка не нашла —
             # игра грузилась/меню), пробуем раз в 3с на свежем кадре, потом фиксируем.
             if (not located and hp_enabled and num_cfg.get("enabled")
