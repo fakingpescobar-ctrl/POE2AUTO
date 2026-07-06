@@ -29,6 +29,7 @@ from hp_detector import HPDetector
 from hp_ocr import HPNumReader
 from hp_locate import find_digits_roi, derive_orb
 from mob_bar import MobBarDetector
+from zone_detector import ZoneDetector
 from diag_dump import HPDiag, dump_loot, dump_attack_trigger
 from overlay import Overlay, OverlayState
 from virtual_xbox import VirtualXbox360, XUSB
@@ -266,6 +267,10 @@ def main():
     atk_cfg = cfg.get("auto_attack", {})
     atk_enabled = bool(atk_cfg.get("enabled"))
     mob_det = MobBarDetector(atk_cfg) if atk_enabled else None
+    # в убежище хостильных мобов физически не бывает — статичный декор (факелы,
+    # алтари) иногда проходит фильтр формы полосы и даёт ложную атаку. Категорически
+    # глушим детектор, пока на экране виден заголовок панели заданий «Убежище».
+    zone_det = ZoneDetector(atk_cfg.get("zone", {})) if atk_enabled else None
     atk_btn = XUSB.get(atk_cfg.get("button", "right_bumper"), XUSB["right_bumper"])
     atk_grace = atk_cfg.get("release_grace_s", 0.35)
     if atk_enabled:
@@ -373,7 +378,11 @@ def main():
             # press каждый кадр идемпотентен и переподтверждает удержание; отпускаем
             # с грейсом (сглаживание мерцания / добив почти мёртвого моба).
             if mob_det is not None and attack.on and foreground and full is not None:
-                if mob_det.present(full):
+                if zone_det is not None and zone_det.in_hideout(full):
+                    if r1_held and time.perf_counter() - last_bar_seen > atk_grace:
+                        vx.release(atk_btn)
+                        r1_held = False
+                elif mob_det.present(full):
                     if not r1_held and time.perf_counter() - last_atk_dump > 1.5:
                         atk_dump_n += 1
                         last_atk_dump = time.perf_counter()
