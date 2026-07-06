@@ -21,6 +21,7 @@ class MobBarDetector:
         self.max_h_frac = cfg.get("max_h_frac", 0.030)     # макс. высота (доля кадра)
         self.min_aspect = cfg.get("min_aspect", 3.0)       # w/h — полоса вытянута
         self.min_fill = cfg.get("min_fill", 0.45)          # area/(w*h) — полоса сплошная
+        self.edge_margin_px = cfg.get("edge_margin_px", 2)  # компонента у самого края ROI = обрезанный артефакт декора, не бар
 
         # диагностика последнего вызова present() — для дампа улик при ложном срабатывании
         self.last_roi_px = None    # (x1, y1, x2, y2) в координатах кадра
@@ -44,9 +45,16 @@ class MobBarDetector:
         self.last_mask = mask
         min_w = max(8, int(self.min_w_frac * fw))
         max_h = max(4, int(self.max_h_frac * fh))
+        roi_w = sub.shape[1]
+        margin = self.edge_margin_px
         n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         for i in range(1, n):
             x, y, w, h, area = (int(v) for v in stats[i])
+            # компонента, упирающаяся в левый/правый край ROI — обрезанный кусок
+            # декора сцены (факел/жаровня), а не настоящий бар (тот весь помещается
+            # в ROI, т.к. рисуется по центру над мобом)
+            if x <= margin or (x + w) >= (roi_w - margin):
+                continue
             if (w >= min_w and h <= max_h
                     and w / max(1, h) >= self.min_aspect
                     and area / max(1, w * h) >= self.min_fill):
