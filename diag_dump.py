@@ -113,6 +113,38 @@ def dump_loot(n, frame, det, engine, foreground, center=None):
     log.info("       файлы: %s_{full,mask,vis}.png", os.path.basename(base))
 
 
+ATK_DIR = os.path.join(os.path.dirname(__file__), "_debug", "attack_events")
+
+
+def dump_attack_trigger(n, frame, mob_det, foreground):
+    """Снимок улики в момент, когда авто-атака НАЖАЛА R1 (передний фронт детекта полосы).
+    Сохраняет full/roi_mask/vis — по ним видно, что детектор принял за HP-бар моба."""
+    os.makedirs(ATK_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%H%M%S_%f")[:-3]
+    base = os.path.join(ATK_DIR, f"{ts}_{n:04d}_attack")
+
+    x1, y1, x2, y2 = mob_det.last_roi_px
+    vis = frame.copy()
+    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 220, 220), 1)
+    m = mob_det.last_match
+    if m:
+        bx1, by1 = x1 + m["x"], y1 + m["y"]
+        bx2, by2 = bx1 + m["w"], by1 + m["h"]
+        cv2.rectangle(vis, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
+
+    cv2.imwrite(base + "_full.png", frame)
+    if mob_det.last_mask is not None:
+        cv2.imwrite(base + "_mask.png", mob_det.last_mask)
+    cv2.imwrite(base + "_vis.png", vis)
+
+    if m:
+        log.info("АТАКА-ТРИГГЕР[#%d] bbox=(%d,%d,%d,%d) area=%.0f aspect=%.2f fill=%.2f fg=%s",
+                  n, m["x"], m["y"], m["w"], m["h"], m["area"], m["aspect"], m["fill"], foreground)
+    else:
+        log.info("АТАКА-ТРИГГЕР[#%d] (нет match-данных) fg=%s", n, foreground)
+    log.info("       файлы: %s_{full,mask,vis}.png", os.path.basename(base))
+
+
 class HPDiag:
     """Трекер переходов «есть HP ↔ потеряно» с дампом улик. Используют bot.py и hp_diag.py."""
 

@@ -22,18 +22,26 @@ class MobBarDetector:
         self.min_aspect = cfg.get("min_aspect", 3.0)       # w/h — полоса вытянута
         self.min_fill = cfg.get("min_fill", 0.45)          # area/(w*h) — полоса сплошная
 
+        # диагностика последнего вызова present() — для дампа улик при ложном срабатывании
+        self.last_roi_px = None    # (x1, y1, x2, y2) в координатах кадра
+        self.last_mask = None      # маска красного внутри ROI
+        self.last_match = None     # dict с bbox/aspect/fill компоненты, что дала True
+
     def present(self, frame_bgr):
         """True, если в ROI есть красная компонента ФОРМЫ полосы HP (моб жив)."""
         fh, fw = frame_bgr.shape[:2]
         x1, y1 = int(self.roi["x1"] * fw), int(self.roi["y1"] * fh)
         x2, y2 = int(self.roi["x2"] * fw), int(self.roi["y2"] * fh)
+        self.last_roi_px = (x1, y1, x2, y2)
         sub = frame_bgr[y1:y2, x1:x2]
         if sub.size == 0:
+            self.last_mask, self.last_match = None, None
             return False
         hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
         mask = cv2.bitwise_or(
             cv2.inRange(hsv, (0, self.sat_min, self.val_min), (10, 255, 255)),
             cv2.inRange(hsv, (170, self.sat_min, self.val_min), (179, 255, 255)))
+        self.last_mask = mask
         min_w = max(8, int(self.min_w_frac * fw))
         max_h = max(4, int(self.max_h_frac * fh))
         n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -42,5 +50,8 @@ class MobBarDetector:
             if (w >= min_w and h <= max_h
                     and w / max(1, h) >= self.min_aspect
                     and area / max(1, w * h) >= self.min_fill):
+                self.last_match = {"x": x, "y": y, "w": w, "h": h, "area": area,
+                                    "aspect": w / max(1, h), "fill": area / max(1, w * h)}
                 return True
+        self.last_match = None
         return False

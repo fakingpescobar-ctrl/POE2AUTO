@@ -29,7 +29,7 @@ from hp_detector import HPDetector
 from hp_ocr import HPNumReader
 from hp_locate import find_digits_roi, derive_orb
 from mob_bar import MobBarDetector
-from diag_dump import HPDiag, dump_loot
+from diag_dump import HPDiag, dump_loot, dump_attack_trigger
 from overlay import Overlay, OverlayState
 from virtual_xbox import VirtualXbox360, XUSB
 from dualsense_bridge import DualSenseBridge
@@ -334,6 +334,8 @@ def main():
     last_clip_warn = 0.0     # throttle варнинга обрезки ROI
     r1_held = False          # держит ли бот сейчас R1 (авто-атака)
     last_bar_seen = 0.0      # когда последний раз видели полосу HP моба
+    atk_dump_n = 0           # счётчик улик ложных срабатываний авто-атаки
+    last_atk_dump = 0.0
     iters = 0
     try:
         while not stop.is_set():
@@ -372,6 +374,10 @@ def main():
             # с грейсом (сглаживание мерцания / добив почти мёртвого моба).
             if mob_det is not None and attack.on and foreground and full is not None:
                 if mob_det.present(full):
+                    if not r1_held and time.perf_counter() - last_atk_dump > 1.5:
+                        atk_dump_n += 1
+                        last_atk_dump = time.perf_counter()
+                        dump_attack_trigger(atk_dump_n, full, mob_det, foreground)
                     last_bar_seen = time.perf_counter()
                     vx.press(atk_btn)
                     r1_held = True
