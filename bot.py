@@ -54,8 +54,8 @@ log = logging.getLogger("poe2auto.bot")
 
 class Toggle:
     """Потокобезопасный флаг авто-режима."""
-    def __init__(self):
-        self._on = False
+    def __init__(self, default=False):
+        self._on = default
         self._lock = threading.Lock()
 
     def flip(self):
@@ -254,8 +254,9 @@ def main():
     log.info("Захват лута: ROI %s, центр персонажа в кропе %s", loot_region, loot_center)
 
     if hpg["hp_det"]:
-        log.info("Автофляска ВКЛ: порог=%.0f%% кулдаун=%dмс подтв=%d кадра кнопка=%s | быстрый захват орба %s",
-                 hp_threshold * 100, hp_cfg.get("cooldown_ms", 3000), hp_confirm,
+        log.info("Автофляска ВКЛ (%s): порог=%.0f%% кулдаун=%dмс подтв=%d кадра кнопка=%s | быстрый захват орба %s",
+                 cfg["hotkeys"].get("flask", "f3").upper(), hp_threshold * 100,
+                 hp_cfg.get("cooldown_ms", 3000), hp_confirm,
                  "R2" if flask_right else "L2", hpg["orb_region"])
         if hpg["num_reader"]:
             log.info("Чтение HP по цифрам ВКЛ: ROI %s max_hp=%s",
@@ -274,12 +275,16 @@ def main():
     atk_btn = XUSB.get(atk_cfg.get("button", "right_bumper"), XUSB["right_bumper"])
     atk_grace = atk_cfg.get("release_grace_s", 0.35)
     if atk_enabled:
-        log.info("Авто-атака ВКЛ (F10): кнопка=%s ROI полосы=%s",
+        log.info("Авто-атака ВКЛ (%s): кнопка=%s ROI полосы=%s",
+                 cfg["hotkeys"].get("attack", "f10").upper(),
                  atk_cfg.get("button", "right_bumper"), atk_cfg.get("roi"))
 
     # --- хоткеи ---
     auto = Toggle()
-    attack = Toggle()  # авто-атака (F10) — держит R1 на полосе HP моба
+    attack = Toggle()  # авто-атака (хоткей attack в config.yaml) — держит R1 на полосе HP моба
+    # авто-фляска (хоткей flask в config.yaml) — ВКЛ по умолчанию (прежнее поведение без
+    # тумблера — бот пил всегда, пока hp_cfg["enabled"]); F3 даёт выключить руками.
+    flask = Toggle(default=True)
     diag = HPDiag()  # диагностика потери HP (F7) — пишет улики в _debug/hp_events
     manual_shot = threading.Event()
     stop = threading.Event()
@@ -289,11 +294,12 @@ def main():
     k_shot = cfg["hotkeys"].get("snapshot", "f9")
     k_overlay = cfg["hotkeys"].get("overlay", "f6")
     k_attack = cfg["hotkeys"].get("attack", "f10")
+    k_flask = cfg["hotkeys"].get("flask", "f3")
 
     # --- оверлей со статусами (поверх игры, click-through) ---
     ov_state = OverlayState()
     ov_state.flask_enabled = hpg["hp_det"] is not None
-    overlay = Overlay(ov_state, region)
+    overlay = Overlay(ov_state, region, cfg["hotkeys"])
     overlay.start()
 
     def on_press(key):
@@ -317,10 +323,16 @@ def main():
         if name == k_attack and mob_det is not None:
             state = attack.flip()
             log.info("Авто-атака: %s", "ВКЛ" if state else "выкл")
+        if name == k_flask and hpg["hp_det"] is not None:
+            state = flask.flip()
+            log.info("Авто-фляска: %s", "ВКЛ" if state else "выкл")
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
-    log.info("Готово. F8 — подбор, F10 — авто-атака, F7 — диагностика, F9 — снимок, F6 — оверлей, F12 — выход.")
+    log.info("Готово. %s — подбор, %s — авто-атака, %s — авто-фляска, %s — диагностика, "
+             "%s — снимок, %s — оверлей, %s — выход.",
+             k_toggle.upper(), k_attack.upper(), k_flask.upper(), k_diag.upper(),
+             k_shot.upper(), k_overlay.upper(), k_quit.upper())
 
     # --- главный цикл ---
     last_status = 0.0
@@ -351,7 +363,7 @@ def main():
             #   персонажа (лут). Один грабь принципиально: dxcam на второй вызов подряд
             #   отдаёт устаревший кадр (None→last), что ломало детекцию лута.
             # F8 выкл → грабим только кроп орба → высокий fps.
-            # F8/F10/F7 → нужен полный кадр (лут / полоса моба вверху / диагностика).
+            # F8/атака/F7 → нужен полный кадр (лут / полоса моба вверху / диагностика).
             if auto.on or attack.on or diag.enabled or hpg["orb_region"] is None:
                 full = cap.grab(region)
                 if full is None:
@@ -502,7 +514,10 @@ def main():
                         low_streak = 0
                     # жмём только на реально низком кадре. None держит стрик, но сам не
                     # стреляет; высокий — сбрасывает. Иначе залипание выстрелов.
-                    if (low_now and low_streak >= hp_confirm
+                    # flask.on (F3) — ручной общий выключатель автопития, независимый от
+                    # источника чтения HP; стрик всё равно считаем, чтобы порог не «прыгал»
+                    # при включении посреди боя.
+                    if (flask.on and low_now and low_streak >= hp_confirm
                             and time.perf_counter() - last_flask >= hp_cooldown):
                         bridge.suppress_triggers = True
                         if flask_right:
@@ -529,6 +544,7 @@ def main():
             ov_state.attack_enabled = mob_det is not None
             ov_state.attack_on = attack.on
             ov_state.attacking = r1_held
+            ov_state.flask_on = flask.on
             ov_state.diag = diag.enabled
             ov_state.hp_pct = hp_pct
             ov_state.foreground = foreground

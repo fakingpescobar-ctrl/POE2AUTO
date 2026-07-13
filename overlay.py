@@ -46,9 +46,10 @@ class OverlayState:
     def __init__(self):
         self.auto_loot = False
         self.attack_enabled = False  # авто-атака доступна (включена в конфиге)
-        self.attack_on = False       # авто-атака включена (F10)
+        self.attack_on = False       # авто-атака включена (хоткей attack в config.yaml)
         self.attacking = False       # прямо сейчас держим R1 (виден моб)
         self.flask_enabled = False
+        self.flask_on = True         # авто-фляска включена (хоткей flask в config.yaml, F3)
         self.diag = False
         self.hp_pct = None          # 0..1 или None
         self.flasks = 0
@@ -72,9 +73,10 @@ def _hp_color(pct):
 class Overlay:
     """Оверлей в отдельном потоке. start()/stop()/toggle()."""
 
-    def __init__(self, state, region=None):
+    def __init__(self, state, region=None, hotkeys=None):
         self.state = state
         self.region = region or {"left": 0, "top": 0, "width": 1920, "height": 1080}
+        self.hotkeys = hotkeys or {}
         self._thread = None
         self._root = None
         self._visible = True
@@ -145,12 +147,20 @@ class Overlay:
 
         tk.Frame(pad, bg="#2a2a34", height=1).pack(fill="x", pady=(8, 6))
 
-        # строки-статусы
-        self._rows["loot"] = self._status_row(pad, "Авто-подбор", "F8")
-        self._rows["attack"] = self._status_row(pad, "Авто-атака", "F10")
-        self._rows["flask"] = self._status_row(pad, "Авто-фляска", "")
+        # строки-статусы (метки хоткеев — из конфига, с дефолтами на случай отсутствия)
+        hk = self.hotkeys
+        k_toggle = hk.get("toggle", "f8").upper()
+        k_attack = hk.get("attack", "f10").upper()
+        k_diag = hk.get("diag", "f7").upper()
+        k_shot = hk.get("snapshot", "f9").upper()
+        k_overlay = hk.get("overlay", "f6").upper()
+        k_quit = hk.get("quit", "f12").upper()
+        k_flask = hk.get("flask", "f3").upper()
+        self._rows["loot"] = self._status_row(pad, "Авто-подбор", k_toggle)
+        self._rows["attack"] = self._status_row(pad, "Авто-атака", k_attack)
+        self._rows["flask"] = self._status_row(pad, "Авто-фляска", k_flask)
         self._rows["locate"] = self._status_row(pad, "Калибровка HUD", "")
-        self._rows["diag"] = self._status_row(pad, "Диагностика", "F7")
+        self._rows["diag"] = self._status_row(pad, "Диагностика", k_diag)
 
         tk.Frame(pad, bg="#2a2a34", height=1).pack(fill="x", pady=(8, 6))
 
@@ -158,7 +168,8 @@ class Overlay:
                                        font=("Consolas", 9), anchor="w", justify="left")
         self._rows["stats"].pack(fill="x")
 
-        tk.Label(pad, text="F8 лут · F7 диаг · F9 снимок · F6 скрыть · F12 выход",
+        tk.Label(pad, text=f"{k_toggle} лут · {k_attack} атака · {k_flask} фляга · {k_diag} диаг · "
+                            f"{k_shot} снимок · {k_overlay} скрыть · {k_quit} выход",
                  bg=C_PANEL, fg=C_DIM, font=("Segoe UI", 8)).pack(fill="x", pady=(8, 0))
 
         # click-through + не воровать фокус
@@ -224,6 +235,8 @@ class Overlay:
 
         if not s.flask_enabled:
             self._set(self._rows["flask"], False, "—", C_DIM)
+        elif not s.flask_on:
+            self._set(self._rows["flask"], False, "OFF", C_OFF)
         else:
             hp = "—" if s.hp_pct is None else f"{s.hp_pct*100:.0f}%"
             self._set(self._rows["flask"], True, hp, _hp_color(s.hp_pct))
