@@ -581,6 +581,7 @@ def main():
                     atk_state = f"{'ON' if attack.on else 'off'}/{'R1' if r1_held else '-'}"
                     if attack.on and mob_det.last_match:
                         atk_state += ("+boot" if mob_det.last_match.get("bootstrap")
+                                      else "+narrow" if mob_det.last_match.get("narrow")
                                       else "+lowhp" if mob_det.last_match.get("low_hp_lock")
                                       else "")
                 log.info("targets=%d in_radius=%d auto=%s fg=%s presses=%d hp=%s(%s) v=%s flasks=%d atk=%s fps=%.0f",

@@ -47,6 +47,18 @@ aspect был тоже 1.94. Устойчивость во времени фил
 auto_attack.bootstrap_enabled по умолчанию false, пока не найдётся более
 надёжный признак (например, проверка на текст названия моба рядом с
 полосой — у декора такого текста не бывает).
+
+«NARROW»-уровень (2026-07-16, толпа мобов): при куче мобов рядом бар каждого
+отдельного моба узкий (не один большой бар цели, а много мелких по толпе) —
+все ушли ниже min_run_frac. НО их форма очень вытянута (aspect 8.8-11.0 в
+живых замерах) — далеко от квадратистого декора (aspect 1.6-1.9, тот же
+разбор, что и у бутстрапа выше). Разрыв большой, поэтому в отличие от
+бутстрапа этот уровень включён по умолчанию и без задержки на устойчивость —
+чистая проверка по форме, как строгий уровень, только либеральнее по ширине
+и строже по aspect. Пользователь на момент ввода подтвердил, что FPS/HW-
+оверлей (потенциальный источник путаницы, ради которого раньше подняли
+min_run_frac до 256px) сейчас выключен — если он у тебя обычно включён и он
+широкий вытянутый плашкой (не квадратный бейдж), последи за kind=narrow.
 """
 import time
 
@@ -85,6 +97,13 @@ class MobBarDetector:
         self.bootstrap_confirm_s = cfg.get("bootstrap_confirm_s", 0.25)
         self.bootstrap_move_tol_px = cfg.get("bootstrap_move_tol_px", 6)
 
+        # «narrow»: узкие бары толпы мобов — та же ширина, что у бутстрапа, но
+        # БЕЗ задержки на устойчивость (форма сама по себе надёжно отличима от
+        # декора — см. docstring модуля)
+        self.narrow_enabled = cfg.get("narrow_enabled", True)
+        self.narrow_min_w_frac = cfg.get("narrow_min_w_frac", 0.02)
+        self.narrow_min_aspect = cfg.get("narrow_min_aspect", 6.0)
+
         # диагностика последнего вызова present() — для дампа улик при ложном срабатывании
         self.last_roi_px = None    # (x1, y1, x2, y2) в координатах кадра
         self.last_mask = None      # маска красного внутри ROI
@@ -114,6 +133,7 @@ class MobBarDetector:
         self.last_mask = mask
         min_w = max(8, int(self.min_w_frac * fw))
         min_w_boot = max(6, int(self.bootstrap_min_w_frac * fw))
+        min_w_narrow = max(6, int(self.narrow_min_w_frac * fw))
         max_h = max(4, int(self.max_h_frac * fh))
         roi_w = sub.shape[1]
         margin = self.edge_margin_px
@@ -134,6 +154,16 @@ class MobBarDetector:
                     and fill >= self.min_fill):
                 self.last_match = {"x": x, "y": y, "w": w, "h": h, "area": area,
                                     "aspect": aspect, "fill": fill}
+                self._lock = (x, y, w, h)
+                self._lock_ts = now
+                self._confirmed_ts = now
+                self._boot_box = None
+                return True
+            if (self.narrow_enabled and w >= min_w_narrow and h <= max_h
+                    and aspect >= self.narrow_min_aspect
+                    and fill >= self.min_fill):
+                self.last_match = {"x": x, "y": y, "w": w, "h": h, "area": area,
+                                    "aspect": aspect, "fill": fill, "narrow": True}
                 self._lock = (x, y, w, h)
                 self._lock_ts = now
                 self._confirmed_ts = now

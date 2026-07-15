@@ -139,6 +139,7 @@ def dump_attack_trigger(n, frame, mob_det, foreground):
 
     if m:
         kind = ("bootstrap" if m.get("bootstrap") else
+                 "narrow" if m.get("narrow") else
                  "low_hp_lock" if m.get("low_hp_lock") else "strict")
         log.info("АТАКА-ТРИГГЕР[#%d] bbox=(%d,%d,%d,%d) area=%.0f aspect=%.2f fill=%.2f kind=%s fg=%s",
                   n, m["x"], m["y"], m["w"], m["h"], m["area"], m["aspect"], m["fill"], kind, foreground)
