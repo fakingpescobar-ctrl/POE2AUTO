@@ -68,7 +68,7 @@ class MobBarDetector:
         # Подтверждается не с первого кадра, а только если рамка держится на
         # месте bootstrap_confirm_s секунд подряд (см. docstring модуля).
         self.bootstrap_min_w_frac = cfg.get("bootstrap_min_w_frac", 0.02)
-        self.bootstrap_min_aspect = cfg.get("bootstrap_min_aspect", 1.5)
+        self.bootstrap_min_aspect = cfg.get("bootstrap_min_aspect", 1.8)
         self.bootstrap_confirm_s = cfg.get("bootstrap_confirm_s", 0.25)
         self.bootstrap_move_tol_px = cfg.get("bootstrap_move_tol_px", 6)
 
