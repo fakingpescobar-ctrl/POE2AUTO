@@ -576,10 +576,17 @@ def main():
             if now - last_status >= 1.0:
                 fps = iters / (now - last_status)
                 ov_state.fps = fps
-                log.info("targets=%d in_radius=%d auto=%s fg=%s presses=%d hp=%s(%s) v=%s flasks=%d fps=%.0f",
+                atk_state = "-"
+                if mob_det is not None:
+                    atk_state = f"{'ON' if attack.on else 'off'}/{'R1' if r1_held else '-'}"
+                    if attack.on and mob_det.last_match:
+                        atk_state += ("+boot" if mob_det.last_match.get("bootstrap")
+                                      else "+lowhp" if mob_det.last_match.get("low_hp_lock")
+                                      else "")
+                log.info("targets=%d in_radius=%d auto=%s fg=%s presses=%d hp=%s(%s) v=%s flasks=%d atk=%s fps=%.0f",
                          len(points), len(in_radius),
                          "ON" if auto.on else "off", foreground, presses,
-                         f"{hp_pct*100:.0f}%" if hp_pct is not None else "-", hp_src, hp_v, flasks, fps)
+                         f"{hp_pct*100:.0f}%" if hp_pct is not None else "-", hp_src, hp_v, flasks, atk_state, fps)
                 last_status = now
                 iters = 0
 

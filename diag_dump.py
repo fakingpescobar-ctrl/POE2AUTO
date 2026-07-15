@@ -138,8 +138,10 @@ def dump_attack_trigger(n, frame, mob_det, foreground):
     cv2.imwrite(base + "_vis.png", vis)
 
     if m:
-        log.info("АТАКА-ТРИГГЕР[#%d] bbox=(%d,%d,%d,%d) area=%.0f aspect=%.2f fill=%.2f fg=%s",
-                  n, m["x"], m["y"], m["w"], m["h"], m["area"], m["aspect"], m["fill"], foreground)
+        kind = ("bootstrap" if m.get("bootstrap") else
+                 "low_hp_lock" if m.get("low_hp_lock") else "strict")
+        log.info("АТАКА-ТРИГГЕР[#%d] bbox=(%d,%d,%d,%d) area=%.0f aspect=%.2f fill=%.2f kind=%s fg=%s",
+                  n, m["x"], m["y"], m["w"], m["h"], m["area"], m["aspect"], m["fill"], kind, foreground)
     else:
         log.info("АТАКА-ТРИГГЕР[#%d] (нет match-данных) fg=%s", n, foreground)
     log.info("       файлы: %s_{full,mask,vis}.png", os.path.basename(base))
