@@ -35,6 +35,18 @@
 времени последнего РЕАЛЬНОГО (strict/bootstrap) подтверждения — low_hp_lock
 теперь может продлеваться только пока не прошло больше low_hp_hard_cap_s с
 последнего такого подтверждения, а не от самого себя.
+
+БУТСТРАП ОТКЛЮЧЁН ПО УМОЛЧАНИЮ (2026-07-16, сразу после введения): в той же
+живой сессии, в лавовой/скальной локации, поймал ДВА разных декора (плитка
+пола, скала на закате) с aspect 1.62 и 1.94 — а у настоящего Shiverdrool
+aspect был тоже 1.94. Устойчивость во времени фильтрует только МЕЛЬКАЮЩИЙ
+шум (VFX-вспышки), а не статичный декор сцены — а такой декор, оказывается,
+не отличить от бара по одной лишь форме (aspect/fill/ширина): они физически
+совпадают в этой локации. Держать включённым — значит регулярно ложно
+атаковать пустоту в скальных/лавовых зонах. Код рабочий, но
+auto_attack.bootstrap_enabled по умолчанию false, пока не найдётся более
+надёжный признак (например, проверка на текст названия моба рядом с
+полосой — у декора такого текста не бывает).
 """
 import time
 
@@ -67,6 +79,7 @@ class MobBarDetector:
         # форма (тонкая, сплошная), но ширина/aspect слабее строгих порогов.
         # Подтверждается не с первого кадра, а только если рамка держится на
         # месте bootstrap_confirm_s секунд подряд (см. docstring модуля).
+        self.bootstrap_enabled = cfg.get("bootstrap_enabled", False)
         self.bootstrap_min_w_frac = cfg.get("bootstrap_min_w_frac", 0.02)
         self.bootstrap_min_aspect = cfg.get("bootstrap_min_aspect", 1.8)
         self.bootstrap_confirm_s = cfg.get("bootstrap_confirm_s", 0.25)
@@ -126,7 +139,7 @@ class MobBarDetector:
                 self._confirmed_ts = now
                 self._boot_box = None
                 return True
-            if (w >= min_w_boot and h <= max_h
+            if (self.bootstrap_enabled and w >= min_w_boot and h <= max_h
                     and aspect >= self.bootstrap_min_aspect
                     and fill >= self.min_fill):
                 boot_candidate = (x, y, w, h, area, aspect, fill)
