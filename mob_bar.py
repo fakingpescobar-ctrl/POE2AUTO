@@ -25,6 +25,16 @@
 узкий кандидат подтверждается, только если держит примерно одну и ту же рамку
 несколько кадров подряд — случайный шум/блик так не делает, а настоящий (пусть
 и подраненный) бар моба — держит.
+
+ОБРАТНАЯ проблема, найдена в том же сеансе сразу после фикса: «добивание»
+(low_hp_lock) держало R1 20+ секунд НА ПУСТОЙ ЗЕМЛЕ — в локации оказалась
+рыжая листва/подстилка, которая почти всегда даёт ≥low_hp_min_px(6) красных
+пикселей где-то внутри старой рамки бара. У low_hp_lock_timeout_s окно
+СКОЛЬЗЯЩЕЕ (сбрасывается на каждом попадании шума), поэтому оно продлевало
+само себя бесконечно, хотя моб давно пропал. Фикс: держим ОТДЕЛЬНУЮ метку
+времени последнего РЕАЛЬНОГО (strict/bootstrap) подтверждения — low_hp_lock
+теперь может продлеваться только пока не прошло больше low_hp_hard_cap_s с
+последнего такого подтверждения, а не от самого себя.
 """
 import time
 
@@ -48,6 +58,10 @@ class MobBarDetector:
         # столько красных пикселей
         self.low_hp_lock_timeout_s = cfg.get("low_hp_lock_timeout_s", 2.5)
         self.low_hp_min_px = cfg.get("low_hp_min_px", 12)
+        # жёсткий потолок с последнего РЕАЛЬНОГО (strict/bootstrap) подтверждения —
+        # low_hp_lock не может продлевать себя от собственных шумовых попаданий
+        # бесконечно (см. docstring модуля, инцидент с рыжей листвой)
+        self.low_hp_hard_cap_s = cfg.get("low_hp_hard_cap_s", 6.0)
 
         # «бутстрап» под моба, который бот впервые видит УЖЕ подраненным — та же
         # форма (тонкая, сплошная), но ширина/aspect слабее строгих порогов.
@@ -64,7 +78,8 @@ class MobBarDetector:
         self.last_match = None     # dict с bbox/aspect/fill компоненты, что дала True
 
         self._lock = None      # (x, y, w, h) рамки последнего уверенного матча, координаты ROI-local
-        self._lock_ts = 0.0    # когда рамка последний раз подтверждалась (строго или добиванием)
+        self._lock_ts = 0.0    # когда рамка последний раз подтверждалась (строго, бутстрапом или добиванием)
+        self._confirmed_ts = 0.0  # когда рамка последний раз подтверждалась РЕАЛЬНО (strict/bootstrap)
 
         self._boot_box = None   # (x, y, w, h) текущего бутстрап-кандидата
         self._boot_since = 0.0  # когда кандидат впервые появился на этом месте
@@ -108,6 +123,7 @@ class MobBarDetector:
                                     "aspect": aspect, "fill": fill}
                 self._lock = (x, y, w, h)
                 self._lock_ts = now
+                self._confirmed_ts = now
                 self._boot_box = None
                 return True
             if (w >= min_w_boot and h <= max_h
@@ -118,7 +134,8 @@ class MobBarDetector:
         # строгая форма не нашлась — проверяем «добивание» по запомненной рамке:
         # бар тает справа налево, остаток красного всегда у ЛЕВОГО края рамки,
         # значит он лежит внутри уже подтверждённого (x, y, w, h)
-        if self._lock is not None and now - self._lock_ts <= self.low_hp_lock_timeout_s:
+        if (self._lock is not None and now - self._lock_ts <= self.low_hp_lock_timeout_s
+                and now - self._confirmed_ts <= self.low_hp_hard_cap_s):
             lx, ly, lw, lh = self._lock
             band = mask[max(0, ly - 2):ly + lh + 2, max(0, lx):lx + lw]
             red_px = int(cv2.countNonZero(band)) if band.size else 0
@@ -146,6 +163,7 @@ class MobBarDetector:
                                     "aspect": aspect, "fill": fill, "bootstrap": True}
                 self._lock = (x, y, w, h)
                 self._lock_ts = now
+                self._confirmed_ts = now
                 return True
         else:
             self._boot_box = None
