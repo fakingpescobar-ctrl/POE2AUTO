@@ -1,5 +1,6 @@
 """Захват региона экрана: dxcam (DirectX) с фолбэком на mss. Возвращает BGR-кадр."""
 import logging
+import time
 
 import numpy as np
 
@@ -12,6 +13,8 @@ class ScreenCapture:
         self._dxcam = None
         self._mss = None
         self._last = None
+        self._last_none_time = 0.0
+        self._none_streak = 0
         self._init_backend()
 
     def _init_backend(self):
@@ -43,7 +46,15 @@ class ScreenCapture:
                 self._init_mss()
                 return self.grab(region)
             if frame is None:
+                now = time.perf_counter()
+                self._none_streak += 1
+                # debounce: не логируем каждое None, только каждые 2с
+                if self._none_streak == 1 or now - self._last_none_time > 2.0:
+                    _log.debug("dxcam вернул None (streak=%d)", self._none_streak)
+                    self._last_none_time = now
+                # dxcam внутренне восстанавливается — просто возвращаем последний кадр
                 return self._last
+            self._none_streak = 0
             self._last = frame
             return frame
 

@@ -10,11 +10,12 @@
 реального кадра в убежище. Матчим через cv2.matchTemplate (быстро,
 детерминированно, без OCR/ML — тот же принцип, что и hp_ocr.py).
 """
+import logging
 import os
 
 import cv2
 
-_log_name = "autoloot.zone"
+_log = logging.getLogger("autoloot.zone")
 
 TPL_PATH = os.path.join(os.path.dirname(__file__), "zone_templates", "hideout_label.png")
 
@@ -25,6 +26,8 @@ class ZoneDetector:
         self.roi = cfg.get("roi", {"x1": 0.90, "y1": 0.24, "x2": 1.0, "y2": 0.32})
         self.match_min = cfg.get("match_min", 0.85)
         self._template = cv2.imread(TPL_PATH, cv2.IMREAD_GRAYSCALE)
+        if self._template is None:
+            _log.warning("Zone template not found: %s — zone detection disabled", TPL_PATH)
         self.last_score = 0.0
 
     def in_hideout(self, frame_bgr):

@@ -107,6 +107,9 @@ class HPNumReader:
         self.bin_thr = cfg.get("bin_thr", 130)
         self.match_min = cfg.get("match_min", 0.55)
         self.min_glyph_h = cfg.get("min_glyph_h", 10)
+        # Новые параметры для разрезания слипшихся цифр
+        self.max_depth = cfg.get("max_depth", 2)
+        self.split_threshold = cfg.get("split_threshold", 0.6)
         # ожидаемый max HP — только для отсева мусора. Подстраивается сам: на полном
         # HP (current==max) запоминаем истинный максимум, поэтому смена шмота (другой
         # max) не ломает чтение — планка переезжает автоматически. 0 = не проверять.
@@ -143,7 +146,8 @@ class HPNumReader:
             return "?"
         ch, sc = self._best(norm_glyph(crop))
         h, w = crop.shape[:2]
-        if depth < 3 and (sc < self.match_min or w >= 0.8 * h):
+        # Используем конфигурируемые параметры вместо хардкода
+        if depth < self.max_depth and (sc < self.match_min or w >= self.split_threshold * h):
             lo, hi = max(2, int(w * 0.2)), min(w - 2, int(w * 0.8))
             best_cut, best_min = None, sc            # принимаем только то, что лучше целого
             for c in range(lo, hi):

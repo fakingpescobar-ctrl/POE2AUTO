@@ -4,12 +4,18 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
 
 # Runtime / debug
-bot.log
-hp_diag.log
+*.log
+*.log.*
 _debug/
 _help_preview.png
+bot_console.log
+bot_stderr.log
+
+# Project artifacts (не относятся к боту)
+graphify-out/
 
 # OS
 Thumbs.db

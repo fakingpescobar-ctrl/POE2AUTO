@@ -58,6 +58,12 @@ class OverlayState:
         self.foreground = True
         self.locate_state = "off"   # авто-локализация HUD: "off" | "search" | "ok"
         self.locate_info = ""       # что зацепили, напр. "1371/1371"
+        self.notification = ""      # краткое сообщение (появляется и исчезает)
+        self.notification_until = 0.0  # когда скрыть (time.time())
+        # debug info (показывается при diag=True)
+        self.debug_hp = ""          # "num=1200/1371 orb=0.88 src=num streak=0"
+        self.debug_mob = ""         # "mob=CV dark=no match=strict(45,12,8.2,0.7)"
+        self.debug_zone = ""        # "zone=ok range=15.0"
 
 
 def _hp_color(pct):
@@ -150,7 +156,7 @@ class Overlay:
         # строки-статусы (метки хоткеев — из конфига, с дефолтами на случай отсутствия)
         hk = self.hotkeys
         k_toggle = hk.get("toggle", "f8").upper()
-        k_attack = hk.get("attack", "f10").upper()
+        k_attack = hk.get("attack", "f2").upper()
         k_diag = hk.get("diag", "f7").upper()
         k_shot = hk.get("snapshot", "f9").upper()
         k_overlay = hk.get("overlay", "f6").upper()
@@ -167,6 +173,17 @@ class Overlay:
         self._rows["stats"] = tk.Label(pad, text="", bg=C_PANEL, fg=C_DIM,
                                        font=("Consolas", 9), anchor="w", justify="left")
         self._rows["stats"].pack(fill="x")
+
+        self._rows["notif"] = tk.Label(pad, text="", bg=C_PANEL, fg=C_WARN,
+                                       font=("Segoe UI Semibold", 9), anchor="w")
+        self._rows["notif"].pack(fill="x")
+
+        self._rows["debug_hp"] = tk.Label(pad, text="", bg=C_PANEL, fg=C_DIM,
+                                          font=("Consolas", 8), anchor="w", justify="left")
+        self._rows["debug_mob"] = tk.Label(pad, text="", bg=C_PANEL, fg=C_DIM,
+                                           font=("Consolas", 8), anchor="w", justify="left")
+        self._rows["debug_zone"] = tk.Label(pad, text="", bg=C_PANEL, fg=C_DIM,
+                                            font=("Consolas", 8), anchor="w", justify="left")
 
         tk.Label(pad, text=f"{k_toggle} лут · {k_attack} атака · {k_flask} фляга · {k_diag} диаг · "
                             f"{k_shot} снимок · {k_overlay} скрыть · {k_quit} выход",
@@ -255,6 +272,27 @@ class Overlay:
         self._rows["focus"].config(fg=C_ON if s.foreground else C_OFF)
         self._rows["stats"].config(
             text=f"фляг:{s.flasks}  подбор:{s.presses}  fps:{s.fps:.0f}")
+
+        import time as _time
+        if s.notification and _time.time() < s.notification_until:
+            self._rows["notif"].config(text=s.notification, fg=C_WARN)
+        else:
+            self._rows["notif"].config(text="")
+
+        if s.diag and (s.debug_hp or s.debug_mob):
+            self._rows["debug_hp"].config(text=s.debug_hp, fg=C_ACCENT)
+            self._rows["debug_mob"].config(text=s.debug_mob, fg=C_ACCENT)
+            self._rows["debug_zone"].config(text=s.debug_zone, fg=C_ACCENT)
+        else:
+            self._rows["debug_hp"].config(text="")
+            self._rows["debug_mob"].config(text="")
+            self._rows["debug_zone"].config(text="")
+
+        # скрывать оверлей когда игра не в фокусе (если пользователь не скрыл вручную)
+        if self._visible and not s.foreground:
+            self._root.withdraw()
+        elif self._visible and s.foreground:
+            self._root.deiconify()
 
         try:
             self._root.after(150, self._tick)

@@ -94,7 +94,7 @@ def dump_loot(n, frame, det, engine, foreground, center=None):
     in_set = {(p[0], p[1]) for p in in_r}
 
     vis = frame.copy()
-    cv2.circle(vis, (cx, cy), engine.radius, (0, 220, 220), 2)        # радиус подбора
+    cv2.circle(vis, (cx, cy), engine.radius_px, (0, 220, 220), 2)        # радиус подбора
     cv2.drawMarker(vis, (cx, cy), (0, 220, 220), cv2.MARKER_CROSS, 22, 2)
     for (px, py, area) in points:
         col = (0, 0, 255) if (px, py) in in_set else (255, 160, 0)    # красн=в радиусе, син=вне
@@ -122,6 +122,8 @@ def dump_attack_trigger(n, frame, mob_det, foreground):
     os.makedirs(ATK_DIR, exist_ok=True)
     ts = datetime.now().strftime("%H%M%S_%f")[:-3]
     base = os.path.join(ATK_DIR, f"{ts}_{n:04d}_attack")
+
+    log.info("DUMP_ATTACK frame.shape=%s frame.dtype=%s", frame.shape, frame.dtype)
 
     x1, y1, x2, y2 = mob_det.last_roi_px
     vis = frame.copy()

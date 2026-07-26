@@ -138,9 +138,14 @@ class HPDetector:
             ratio = None
             surface_y = None
 
-        # коррекция под глянцевый верх орба: real_hp = measured / full_ratio
+        # коррекция под глянцевый верх орба: full_ratio — макс. измеренное при 100% HP.
+        # Если измеренное > full_ratio — капаем в 1.0 (орб ярче ожидаемого, HP=100%).
+        # Иначе делим на full_ratio (нормальный случай: блеск снижает измерение).
         if ratio is not None and self.full_ratio > 0:
-            ratio = min(1.0, ratio / self.full_ratio)
+            if ratio > self.full_ratio:
+                ratio = 1.0
+            else:
+                ratio = ratio / self.full_ratio
 
         # tripwire: доля красного на геом. высоте, соответствующей реальному порогу
         thr_y = int((cy + r) - (self.threshold * self.full_ratio) * 2 * r)

@@ -76,8 +76,8 @@ class VirtualXbox360:
             try:
                 self._pad.reset()
                 self._pad.update()
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("Ошибка reset при остановке: %s", e)
             self._pad = None
         self.enabled = False
         _log.info("Виртуальный Xbox 360 остановлен")
@@ -88,8 +88,8 @@ class VirtualXbox360:
                 if self._pad:
                     try:
                         self._pad.update()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log.warning("Heartbeat update failed: %s", e)
             self._hb_stop.wait(1.0 / _HEARTBEAT_HZ)
 
     # --- низкоуровневые потокобезопасные операции ---

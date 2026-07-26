@@ -56,15 +56,9 @@ def _group_lines(comps, y_tol):
     return lines
 
 
-def find_digits_roi(frame_bgr, reader, prefer_y=None, region=(0.0, 0.55, 0.42, 0.99),
-                    min_h_frac=0.010, max_h_frac=0.060, pad_frac=0.30):
-    """Найти ROI строки здоровья. Возвращает dict(roi, text_bbox, cur, max) или None.
-
-    region — нижне-левая зона поиска (доли кадра), исключает ману справа.
-    prefer_y — доля кадра по Y уже известной строки жизни. Если задана, берём строку
-    РЯДОМ с ней (а не «просто верхнюю») — иначе при зашумлённой строке жизни верхней
-    ресурсной может стать «Щит»/«Барьер», и бот залочится на него вместо HP.
-    """
+def _find_in_region(frame_bgr, reader, prefer_y, region,
+                    min_h_frac, max_h_frac, pad_frac):
+    """Поиск строки HP в заданном region. Возвращает dict или None."""
     fh, fw = frame_bgr.shape[:2]
     rx1, ry1 = int(region[0] * fw), int(region[1] * fh)
     rx2, ry2 = int(region[2] * fw), int(region[3] * fh)
@@ -78,13 +72,12 @@ def find_digits_roi(frame_bgr, reader, prefer_y=None, region=(0.0, 0.55, 0.42, 0
         return None
     med_h = float(np.median([c[3] for c in comps]))
 
-    # читаем каждую строку; «ресурсная» = есть '/' и ≥2 цифр (жизнь/энергощит/барьер)
     resource = []
     for ln in _group_lines(comps, y_tol=0.5 * med_h):
         items = sorted(ln["items"], key=lambda c: c[0])
         chars, char_comp, boxes = [], [], []
         for idx, (x, y, w, h) in enumerate(items):
-            frag = reader._read_glyph(binary[y:y + h, x:x + w])  # 1+ символов (со сплитом)
+            frag = reader._read_glyph(binary[y:y + h, x:x + w])
             boxes.append((x + rx1, y + ry1, x + w + rx1, y + h + ry1))
             for ch in frag:
                 chars.append(ch)
@@ -96,22 +89,18 @@ def find_digits_roi(frame_bgr, reader, prefer_y=None, region=(0.0, 0.55, 0.42, 0
     if not resource:
         return None
 
-    # в нижне-левом углу PoE2 ресурсы стоят стопкой (жизнь / энергощит / барьер —
-    # барьер новая механика); жизнь ВСЕГДА верхняя.
     if prefer_y is not None:
-        # уже знаем, где жизнь — берём строку рядом с ней (Щит/Барьер на другой высоте
-        # не перепутаются). Нет строки рядом — None (не лочимся на чужой ресурс).
         target = prefer_y * fh
         resource.sort(key=lambda t: abs(t[0] - target))
         if abs(resource[0][0] - target) > 1.0 * med_h:
             return None
     else:
-        resource.sort(key=lambda t: t[0])      # первый раз — верхняя (жизнь)
+        resource.sort(key=lambda t: t[0])
     _, s, char_comp, boxes = resource[0]
     best = None
     for m in re.finditer(r"\d+/\d+", s):
         cur, mx = (int(v) for v in m.group().split("/"))
-        if mx < 10 or cur > mx:                    # неправдоподобно — не HP
+        if mx < 10 or cur > mx:
             continue
         used = sorted(set(char_comp[m.start():m.end()]))
         best = {"cur": cur, "max": mx, "text_bbox": (
@@ -123,20 +112,34 @@ def find_digits_roi(frame_bgr, reader, prefer_y=None, region=(0.0, 0.55, 0.42, 0
         return None
     bx1, by1, bx2, by2 = best["text_bbox"]
     th = by2 - by1
-    # СКРОМНЫЙ запас: большой запас цепляет соседний мусор (остатки метки «Здоровье»
-    # слева, артефакты справа) → самопроверка не сходится и рантайм-чтение ломается о
-    # лишние глифы. Рост числа (обрезка при левел-апе) ловят другие защиты: анти-глитч
-    # по орбу (мисрид низкого % при полном орбе) и самолечение по «нет чтения».
     pad = int(pad_frac * th)
     px1, py1 = max(0, bx1 - pad), max(0, by1 - pad)
     px2, py2 = min(fw, bx2 + pad), min(fh, by2 + pad)
-    # самопроверка: ROI должен читаться основным ридером РОВНО как cur/max (без '?',
-    # без лишних глифов). Отсекает огрызки вроде «1/13» из подпорченного кадра — тогда
-    # вернём None и попробуем на следующем кадре (периодический переиск).
     if reader.read_string_crop(frame_bgr[py1:py2, px1:px2]) != f"{best['cur']}/{best['max']}":
         return None
     best["roi"] = {"x1": px1 / fw, "y1": py1 / fh, "x2": px2 / fw, "y2": py2 / fh}
     return best
+
+
+def find_digits_roi(frame_bgr, reader, prefer_y=None, region=(0.0, 0.55, 0.42, 0.99),
+                    min_h_frac=0.010, max_h_frac=0.060, pad_frac=0.30):
+    """Найти ROI строки здоровья. Возвращает dict(roi, text_bbox, cur, max) или None.
+
+    region — нижне-левая зона поиска (доли кадра), исключает ману справа.
+    Если в region не нашли — fallback на весь кадр (ловит смену разрешения/UI Scale).
+    prefer_y — доля кадра по Y уже известной строки жизни. Если задана, берём строку
+    РЯДОМ с ней (а не «просто верхнюю») — иначе при зашумлённой строке жизни верхней
+    ресурсной может стать «Щит»/«Барьер», и бот залочится на него вместо HP.
+    """
+    result = _find_in_region(frame_bgr, reader, prefer_y, region,
+                             min_h_frac, max_h_frac, pad_frac)
+    if result is not None:
+        return result
+    full = (0.0, 0.0, 1.0, 1.0)
+    if region == full:
+        return None
+    return _find_in_region(frame_bgr, reader, prefer_y, full,
+                           min_h_frac, max_h_frac, pad_frac)
 
 
 def derive_orb(text_bbox, fw, fh):

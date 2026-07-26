@@ -55,7 +55,18 @@ class DualSenseBridge:
         self._thread = None
         self._stop = threading.Event()
         # бот выставляет True, пока сам жмёт триггер (чтобы мост не перетирал)
-        self.suppress_triggers = False
+        self._suppress_triggers = False
+        self._suppress_lock = threading.Lock()
+
+    @property
+    def suppress_triggers(self):
+        with self._suppress_lock:
+            return self._suppress_triggers
+
+    @suppress_triggers.setter
+    def suppress_triggers(self, value):
+        with self._suppress_lock:
+            self._suppress_triggers = value
 
     def start(self):
         try:
@@ -90,11 +101,15 @@ class DualSenseBridge:
 
     def _loop(self):
         prev8 = prev9 = 0
+        consecutive_errors = 0
+        RECONNECT_THRESHOLD = 5  # подряд ошибок до попытки реконнекта
         while not self._stop.is_set():
             try:
                 report = self._dev.read(64, timeout_ms=200)
                 if not report or len(report) < 11:
                     continue
+
+                consecutive_errors = 0
 
                 # --- стики (центр 128 → -32767..32767, ось Y инвертирована) ---
                 lx = self._axis(report[1])
@@ -130,7 +145,39 @@ class DualSenseBridge:
 
                 prev8, prev9 = b8, b9
             except Exception as e:
-                _log.debug("Ошибка чтения HID: %s", e)
+                consecutive_errors += 1
+                if consecutive_errors == 1:
+                    _log.warning("DualSense: ошибка чтения HID — возможен обрыв соединения")
+                if consecutive_errors >= RECONNECT_THRESHOLD:
+                    if self._try_reconnect():
+                        consecutive_errors = 0
+                        prev8 = prev9 = 0
+                    else:
+                        _log.error("DualSense: реконнект не удался, повтор через 3с")
+                        self._stop.wait(3.0)
+
+    def _try_reconnect(self):
+        """Попытка закрыть и заново открыть DualSense по HID."""
+        _log.info("DualSense: попытка реконнекта...")
+        if self._dev:
+            try:
+                self._dev.close()
+            except Exception:
+                pass
+            self._dev = None
+        for attempt in range(3):
+            if self._stop.is_set():
+                return False
+            try:
+                self._dev = hid.device()
+                self._dev.open(DS_VID, DS_PID)
+                self._dev.write(_ACTIVATION)
+                _log.info("DualSense: реконнект успешен (попытка %d)", attempt + 1)
+                return True
+            except Exception as e:
+                _log.debug("Реконнект попытка %d: %s", attempt + 1, e)
+                self._stop.wait(1.0)
+        return False
 
     @staticmethod
     def _axis(v):

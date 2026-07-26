@@ -13,27 +13,34 @@
 Запуск (нужны права администратора для ViGEmBus):
     python bot.py
 """
+from __future__ import annotations
+
 import logging
+import logging.handlers
 import os
+import queue
 import threading
 import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from pynput import keyboard
 
-from config import load_config
+from config import load_config, save_config
 from screen import ScreenCapture
 from window import GameWindow
-from color_detector import ColorDetector
 from loot_engine import LootEngine
 from hp_detector import HPDetector
+from hp_engine import HPEngine, HPDecision
 from hp_ocr import HPNumReader
 from hp_locate import find_digits_roi, derive_orb
 from mob_bar import MobBarDetector
 from zone_detector import ZoneDetector
+from mem_detect import MemoryMobDetector
 from diag_dump import HPDiag, dump_loot, dump_attack_trigger
 from overlay import Overlay, OverlayState
 from virtual_xbox import VirtualXbox360, XUSB
 from dualsense_bridge import DualSenseBridge
+from utils import Toggle, build_detector
 
 LOG_PATH = os.path.join(os.path.dirname(__file__), "bot.log")
 
@@ -44,47 +51,139 @@ _root.setLevel(logging.INFO)
 _sh = logging.StreamHandler()
 _sh.setFormatter(_fmt)
 _root.addHandler(_sh)
-# файл (mode='w' — свежий лог на каждый запуск, для live-наблюдения)
-_fh = logging.FileHandler(LOG_PATH, mode="w", encoding="utf-8")
+# файл (ротация: 3 файла × 1 МБ — не теряем старые логи, но не засоряем диск)
+_fh = logging.handlers.RotatingFileHandler(
+    LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
 _fh.setFormatter(_fmt)
 _root.addHandler(_fh)
 
 log = logging.getLogger("poe2auto.bot")
 
 
-class Toggle:
-    """Потокобезопасный флаг авто-режима."""
-    def __init__(self, default=False):
-        self._on = default
-        self._lock = threading.Lock()
+class LootWorker(threading.Thread):
+    """Детект лута в отдельном потоке. Не блокирует главный цикл."""
 
-    def flip(self):
-        with self._lock:
-            self._on = not self._on
-            return self._on
+    def __init__(self, detector, engine, pickup_mask, hold_ms, vx, bridge):
+        super().__init__(daemon=True)
+        self._cfg_lock = threading.Lock()
+        self.detector = detector
+        self.engine = engine
+        self.pickup_mask = pickup_mask
+        self.hold_ms = hold_ms
+        self.vx = vx
+        self.bridge = bridge
+        self._frame_q: queue.Queue = queue.Queue(maxsize=1)
+        self._result: Optional[Tuple[list, list]] = None
+        self._result_lock = threading.Lock()
+        self._stop_event = threading.Event()
 
-    @property
-    def on(self):
-        with self._lock:
-            return self._on
+    def update_config(self, detector, engine):
+        """Обновить детектор и движок потокобезопасно."""
+        with self._cfg_lock:
+            self.detector = detector
+            self.engine = engine
+
+    def submit(self, loot_frame, loot_ctr, foreground):
+        """Отправить кадр на обработку (неблокирующе). Старый кадр отбрасывается."""
+        try:
+            self._frame_q.put_nowait((loot_frame, loot_ctr, foreground))
+        except queue.Full:
+            pass
+
+    def get_result(self) -> Optional[Tuple[list, list]]:
+        """Взять последний результат (неблокирующе). None = ещё не обработан."""
+        with self._result_lock:
+            r = self._result
+            self._result = None
+            return r
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                loot_frame, loot_ctr, foreground = self._frame_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            with self._cfg_lock:
+                detector = self.detector
+                engine = self.engine
+            points, _mask = detector.detect(loot_frame)
+            in_radius = engine.targets_in_radius(points, loot_frame.shape, center=loot_ctr)
+            with self._result_lock:
+                self._result = (points, in_radius)
 
 
-def build_detector(cfg):
-    v = cfg["vision"]
-    colors = [list(v["marker_rgb"])] + [list(c) for c in v.get("extra_colors", []) or []]
-    return ColorDetector(
-        colors,
-        hue_tol=v.get("hue_tolerance", 8),
-        sat_min=v.get("sat_min", 120),
-        val_min=v.get("val_min", 120),
-        min_blob_area=v.get("min_blob_area", 120),
-        close_px=v.get("close_px", 3),
-    )
+class AttackWorker(threading.Thread):
+    """Детект мобов в отдельном потоке. Поддерживает CV (MobBarDetector) и память (MemoryMobDetector)."""
+
+    def __init__(self, mob_det, zone_det=None, use_memory=False):
+        super().__init__(daemon=True)
+        self._cfg_lock = threading.Lock()
+        self.mob_det = mob_det
+        self.zone_det = zone_det
+        self.use_memory = use_memory
+        self._frame_q: queue.Queue = queue.Queue(maxsize=1)
+        self._result: Optional[Dict[str, Any]] = None
+        self._result_lock = threading.Lock()
+        self._stop_event = threading.Event()
+
+    def update_config(self, mob_det, zone_det, use_memory):
+        """Обновить конфигурацию потокобезопасно."""
+        with self._cfg_lock:
+            self.mob_det = mob_det
+            self.zone_det = zone_det
+            self.use_memory = use_memory
+
+    def submit(self, full_frame=None, foreground=True):
+        """Отправить кадр на обработку (неблокирующе). Для memory-детекта frame не нужен."""
+        try:
+            self._frame_q.put_nowait((full_frame, foreground))
+        except queue.Full:
+            pass
+
+    def get_result(self) -> Optional[Dict[str, Any]]:
+        """Взять последний результат (неблокирующе). None = ещё не обработан."""
+        with self._result_lock:
+            r = self._result
+            self._result = None
+            return r
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                full_frame, foreground = self._frame_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                with self._cfg_lock:
+                    mob_det = self.mob_det
+                    zone_det = self.zone_det
+                    use_memory = self.use_memory
+                mob_present = False
+                in_hideout = False
+                if use_memory and mob_det is not None:
+                    mob_det.update()
+                    in_hideout = mob_det.in_hideout()
+                    if not in_hideout:
+                        mob_present = mob_det.present()
+                elif mob_det is not None and foreground:
+                    in_hideout = zone_det is not None and zone_det.in_hideout(full_frame)
+                    if not in_hideout:
+                        mob_present = mob_det.present(full_frame)
+                with self._result_lock:
+                    self._result = {"mob_present": mob_present, "in_hideout": in_hideout}
+            except Exception as e:
+                log.error("AttackWorker error: %s", e, exc_info=True)
 
 
-def main():
-    cfg = load_config()
-    loot = cfg["loot"]
+def main() -> int:
+    cfg: Dict[str, Any] = load_config()
+    loot: Dict[str, Any] = cfg["loot"]
 
     # --- геймпад: виртуальный Xbox + мост DualSense ---
     vx = VirtualXbox360()
@@ -100,8 +199,7 @@ def main():
 
     # --- захват + детектор ---
     win = GameWindow(cfg["game"]["window_title"])
-    if win.find() and win.get_region():
-        region = win.get_region()
+    if win.find() and (region := win.get_region()):
         log.info("Окно PoE2 найдено: %s", region)
     else:
         region = GameWindow.primary_region()
@@ -109,19 +207,21 @@ def main():
                     "Гейт по фокусу отключён.", region)
     cap = ScreenCapture(cfg["capture"]["backend"])
     det = build_detector(cfg)
-    engine = LootEngine(loot["pickup_radius_px"], loot["center_offset_xy"], loot["cooldown_ms"])
+    engine = LootEngine(loot["pickup_radius_px"], loot["center_offset_xy"],
+                        loot["cooldown_ms"],
+                        priority_mode=loot.get("priority_mode", "size"))
     log.info("Детектор: цвета=%s радиус=%d кулдаун=%dмс",
-             det.colors, engine.radius, loot["cooldown_ms"])
+             det.colors, engine.radius_px, loot["cooldown_ms"])
 
     # --- автофляска HP ---
     hp_cfg = cfg["hp"]
     num_cfg = cfg.get("hp_num", {})
     hp_enabled = bool(hp_cfg.get("enabled"))
-    hp_cooldown = hp_cfg.get("cooldown_ms", 3000) / 1000.0
+    hp_cooldown = hp_cfg.get("cooldown_ms", 333) / 1000.0
     flask_hold = hp_cfg.get("flask_hold_ms", 120)
-    hp_threshold = hp_cfg.get("threshold", 0.55)
-    hp_confirm = hp_cfg.get("confirm_frames", 4)
-    hp_valid_val = hp_cfg.get("valid_val", 90)   # порог яркости «живого» орба для fallback
+    hp_threshold = hp_cfg.get("threshold", 0.88)
+    hp_confirm = hp_cfg.get("confirm_frames", 1)
+    hp_valid_val = hp_cfg.get("valid_val", 45)   # порог яркости «живого» орба для fallback
     # мин. доля красного, чтобы fallback на слепой кадр сработал: отделяет реальную
     # просадку под эффектом (красная лужа есть, ~0.08) от тёмного орба в меню (~0.001).
     hp_fallback_red_min = hp_cfg.get("fallback_red_frac_min", 0.04)
@@ -134,14 +234,24 @@ def main():
     hp_num_grace = num_cfg.get("menu_grace_s", 0.5)
     fw, fh = region["width"], region["height"]
 
+    # HP-движок: принимает решения (low/high/unknown/clip) по цифрам/орбу
+    hp_engine = HPEngine(
+        threshold=hp_threshold,
+        confirm_frames=hp_confirm,
+        num_low_grace_s=num_low_grace,
+        fallback_red_frac_min=hp_fallback_red_min,
+        valid_val=hp_valid_val,
+        menu_grace_s=hp_num_grace,
+    )
+
     # Геометрия HP (орб + ROI цифр) и зависимые объекты живут в одном холдере, чтобы их
     # можно было ПЕРЕСОБРАТЬ на лету после авто-локализации HUD (другое разрешение/UI).
-    hpg = {"hp_det": None, "hp_det_crop": None, "orb_region": None,
-           "num_reader": None, "num_reader_crop": None}
-    loc_info = {"text": ""}   # что зацепила авто-локализация (для оверлея), напр. "1371/1371"
-    hud_anchor = {"max": 0}   # установленный max ЖИЗНИ — чтобы переиск не уехал на Щит/ES (меньший пул)
+    hpg: Dict[str, Any] = {"hp_det": None, "hp_det_crop": None, "orb_region": None,
+                           "num_reader": None, "num_reader_crop": None}
+    loc_info: Dict[str, str] = {"text": ""}
+    hud_anchor: Dict[str, float] = {"max": 0}
 
-    def rebuild_hp_geometry():
+    def rebuild_hp_geometry() -> None:
         """(Пере)собрать всё, что зависит от геометрии орба (hp_cfg['orb']) и ROI цифр
         (num_cfg['roi']). Берёт ТЕКУЩИЕ значения из cfg — зовём на старте и после
         успешной авто-локализации. Когда F8 выкл — грабим только зону орба (а не весь
@@ -192,7 +302,7 @@ def main():
         hpg.update(hp_det=hp_det, hp_det_crop=hp_det_crop, orb_region=orb_region,
                    num_reader=num_reader, num_reader_crop=num_reader_crop)
 
-    def try_locate_hud(reason):
+    def try_locate_hud(reason: str) -> bool:
         """Найти строку HP на свежем кадре, переписать cfg['hp_num']['roi'] и
         cfg['hp']['orb'] (орб выводится от рамки цифр) и пересобрать геометрию.
         True — нашли. Делает портабельным к смене разрешения/UI Scale."""
@@ -253,6 +363,10 @@ def main():
     loot_center = (lccx - ll, lccy - lt)        # центр персонажа в координатах ROI
     log.info("Захват лута: ROI %s, центр персонажа в кропе %s", loot_region, loot_center)
 
+    # лут-детект в отдельном потоке — не блокирует FPS в бою
+    loot_worker = LootWorker(det, engine, pickup_mask, hold_ms, vx, bridge)
+    loot_worker.start()
+
     if hpg["hp_det"]:
         log.info("Автофляска ВКЛ (%s): порог=%.0f%% кулдаун=%dмс подтв=%d кадра кнопка=%s | быстрый захват орба %s",
                  cfg["hotkeys"].get("flask", "f3").upper(), hp_threshold * 100,
@@ -264,20 +378,53 @@ def main():
     else:
         log.info("Автофляска выкл (запусти calibrate_hp.bat)")
 
-    # --- авто-атака: держим R1, пока вверху видна полоса HP моба ---
+    # --- авто-атака: держим R1, пока в радиусе есть живой моб ---
     atk_cfg = cfg.get("auto_attack", {})
     atk_enabled = bool(atk_cfg.get("enabled"))
-    mob_det = MobBarDetector(atk_cfg) if atk_enabled else None
-    # в убежище хостильных мобов физически не бывает — статичный декор (факелы,
-    # алтари) иногда проходит фильтр формы полосы и даёт ложную атаку. Категорически
-    # глушим детектор, пока на экране виден заголовок панели заданий «Убежище».
-    zone_det = ZoneDetector(atk_cfg.get("zone", {})) if atk_enabled else None
+    use_memory = atk_cfg.get("use_memory", True)  # по умолчанию memory detection
+
+    if use_memory and atk_enabled:
+        # Memory-based: чтение памяти PoE2 (PROCESS_VM_READ)
+        mob_det = MemoryMobDetector({"attack_range": atk_cfg.get("attack_range", 15.0)})
+        if not mob_det.connect():
+            log.warning("Memory detection: не удалось подключиться к PoE2 — "
+                        "откат на CV-детект")
+            mob_det = None
+            use_memory = False
+            _atk_fallback_reason = "Memory → CV: нет подключения"
+        elif not mob_det.available:
+            log.warning("Memory detection: подключён, но AOB scan не нашёл "
+                        "игровые структуры (оффсеты устарели?) — откат на CV-детект")
+            mob_det.disconnect()
+            mob_det = None
+            use_memory = False
+            _atk_fallback_reason = "Memory → CV: AOB scan failed"
+        else:
+            _atk_fallback_reason = ""
+    else:
+        mob_det = None
+        use_memory = False
+        _atk_fallback_reason = ""
+
+    if not use_memory and atk_enabled:
+        # CV-based fallback: детект полосы HP моба по цвету
+        mob_det = MobBarDetector(atk_cfg)
+
+    zone_det = None  # memory detector делает in_hideout() сам
+    if not use_memory and atk_enabled:
+        zone_det = ZoneDetector(atk_cfg.get("zone", {}))
+
     atk_btn = XUSB.get(atk_cfg.get("button", "right_bumper"), XUSB["right_bumper"])
-    atk_grace = atk_cfg.get("release_grace_s", 0.35)
+    atk_grace = atk_cfg.get("release_grace_s", 0.6)
+
+    # attack-детект в отдельном потоке
+    attack_worker = AttackWorker(mob_det, zone_det, use_memory=use_memory)
     if atk_enabled:
-        log.info("Авто-атака ВКЛ (%s): кнопка=%s ROI полосы=%s",
-                 cfg["hotkeys"].get("attack", "f10").upper(),
-                 atk_cfg.get("button", "right_bumper"), atk_cfg.get("roi"))
+        attack_worker.start()
+        mode = "MEMORY" if use_memory else "CV"
+        log.info("Авто-атака ВКЛ (%s): кнопка=%s режим=%s",
+                 cfg["hotkeys"].get("attack", "f2").upper(),
+                 atk_cfg.get("button", "right_bumper"), mode)
 
     # --- хоткеи ---
     auto = Toggle()
@@ -295,14 +442,86 @@ def main():
     k_overlay = cfg["hotkeys"].get("overlay", "f6")
     k_attack = cfg["hotkeys"].get("attack", "f10")
     k_flask = cfg["hotkeys"].get("flask", "f3")
+    k_reload = "f5"
+
+    def reload_cfg() -> None:
+        """Hot-reload: перечитать config.yaml и применить безопасные параметры на лету."""
+        nonlocal cfg, loot, det, engine, hp_cfg, hp_threshold, hp_cooldown
+        nonlocal flask_hold, flask_right, hp_confirm
+        nonlocal mob_det, atk_cfg, atk_enabled, atk_btn, atk_grace
+        nonlocal use_memory, zone_det, hp_engine, num_cfg
+        try:
+            new_cfg = load_config()
+        except Exception as e:
+            log.error("Ошибка чтения config.yaml: %s", e)
+            return
+        cfg = new_cfg
+        loot = cfg["loot"]
+        # лут: детектор цвета + радиус/кулдаун
+        det = build_detector(cfg)
+        engine = LootEngine(loot["pickup_radius_px"], loot["center_offset_xy"],
+                            loot["cooldown_ms"],
+                            priority_mode=loot.get("priority_mode", "size"))
+        # HP: пороги, кулдаун, кнопка + пересбор геометрии
+        hp_cfg = cfg["hp"]
+        num_cfg = cfg.get("hp_num", {})
+        hp_threshold = hp_cfg.get("threshold", 0.88)
+        hp_cooldown = hp_cfg.get("cooldown_ms", 333) / 1000.0
+        flask_hold = hp_cfg.get("flask_hold_ms", 120)
+        flask_right = hp_cfg.get("flask_button") == "right_trigger"
+        hp_confirm = hp_cfg.get("confirm_frames", 1)
+        hp_engine = HPEngine(
+            threshold=hp_threshold,
+            confirm_frames=hp_confirm,
+            num_low_grace_s=hp_cfg.get("num_low_grace_s", 0.35),
+            fallback_red_frac_min=hp_cfg.get("fallback_red_frac_min", 0.04),
+            valid_val=hp_cfg.get("valid_val", 45),
+            menu_grace_s=num_cfg.get("menu_grace_s", 0.5),
+        )
+        rebuild_hp_geometry()
+        # авто-атака: пороги (с disconnect старого детектора при смене режима)
+        atk_cfg = cfg.get("auto_attack", {})
+        atk_enabled = bool(atk_cfg.get("enabled"))
+        use_memory = atk_cfg.get("use_memory", True)
+        old_mob_det = mob_det
+        if use_memory and atk_enabled:
+            if mob_det is None or not isinstance(mob_det, MemoryMobDetector):
+                mob_det = MemoryMobDetector({"attack_range": atk_cfg.get("attack_range", 15.0)})
+                mob_det.connect()
+            else:
+                mob_det.attack_range = atk_cfg.get("attack_range", 15.0)
+                mob_det.attack_range_sq = mob_det.attack_range ** 2
+        elif atk_enabled:
+            mob_det = MobBarDetector(atk_cfg)
+        else:
+            mob_det = None
+        # закрыть handle старого memory-детектора если режим сменился
+        if old_mob_det is not None and isinstance(old_mob_det, MemoryMobDetector):
+            if old_mob_det is not mob_det:
+                try:
+                    old_mob_det.disconnect()
+                except Exception:
+                    pass
+        zone_det = None if use_memory else (ZoneDetector(atk_cfg.get("zone", {})) if atk_enabled else None)
+        atk_btn = XUSB.get(atk_cfg.get("button", "right_bumper"), XUSB["right_bumper"])
+        atk_grace = atk_cfg.get("release_grace_s", 0.6)
+        # обновить лут-воркер новыми детектором/движком
+        loot_worker.update_config(det, engine)
+        # обновить attack-воркер новыми детекторами
+        attack_worker.update_config(mob_det, zone_det, use_memory)
+        log.info("Config перезагружен (F5): детектор=%s порог=%.0f%% кулдаун=%dмс",
+                 det.colors, hp_threshold * 100, loot["cooldown_ms"])
 
     # --- оверлей со статусами (поверх игры, click-through) ---
     ov_state = OverlayState()
     ov_state.flask_enabled = hpg["hp_det"] is not None
     overlay = Overlay(ov_state, region, cfg["hotkeys"])
     overlay.start()
+    if _atk_fallback_reason:
+        ov_state.notification = _atk_fallback_reason
+        ov_state.notification_until = time.time() + 5.0
 
-    def on_press(key):
+    def on_press(key) -> Optional[bool]:
         name = getattr(key, "name", None)
         if name == k_quit:
             log.info("Выход (F12)")
@@ -326,97 +545,105 @@ def main():
         if name == k_flask and hpg["hp_det"] is not None:
             state = flask.flip()
             log.info("Авто-фляска: %s", "ВКЛ" if state else "выкл")
+        if name == k_reload:
+            reload_cfg()
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     log.info("Готово. %s — подбор, %s — авто-атака, %s — авто-фляска, %s — диагностика, "
-             "%s — снимок, %s — оверлей, %s — выход.",
+             "%s — снимок, %s — оверлей, %s — перезагрузка, %s — выход.",
              k_toggle.upper(), k_attack.upper(), k_flask.upper(), k_diag.upper(),
-             k_shot.upper(), k_overlay.upper(), k_quit.upper())
+             k_shot.upper(), k_overlay.upper(), k_reload.upper(), k_quit.upper())
 
     # --- главный цикл ---
     last_status = 0.0
     last_flask = 0.0
     presses = 0
     flasks = 0
-    hp_pct = None
-    hp_v = None
-    hp_src = "-"             # чем прочитано HP: num (цифры) / orb / - (нет)
-    low_streak = 0
-    last_good_ratio = None   # последнее достоверное HP — для fallback на слепые кадры
-    num_blind_since = None   # когда цифры перестали читаться (для детекта меню)
     last_locate = 0.0        # таймер фонового переиска HUD (пока не локализован)
     last_num_ok = time.perf_counter()  # когда цифры читались в последний раз (для самолечения ROI)
-    num_low_since = None     # когда цифры впервые ушли < порога подряд (анти-глитч)
-    last_clip_warn = 0.0     # throttle варнинга обрезки ROI
     r1_held = False          # держит ли бот сейчас R1 (авто-атака)
     last_bar_seen = 0.0      # когда последний раз видели полосу HP моба
     atk_dump_n = 0           # счётчик улик ложных срабатываний авто-атаки
     last_atk_dump = 0.0
+    last_mem_retry = 0.0     # когда последний раз пробовали memory detection
     iters = 0
     try:
         while not stop.is_set():
             foreground = win.is_foreground() if win.hwnd else True
 
-            # --- захват ---
-            # F8/F7 → ОДИН полный грабь, из него вырезаем зону орба (HP) и ROI вокруг
-            #   персонажа (лут). Один грабь принципиально: dxcam на второй вызов подряд
-            #   отдаёт устаревший кадр (None→last), что ломало детекцию лута.
-            # F8 выкл → грабим только кроп орба → высокий fps.
-            # F8/атака/F7 → нужен полный кадр (лут / полоса моба вверху / диагностика).
-            if auto.on or attack.on or diag.enabled or hpg["orb_region"] is None:
-                full = cap.grab(region)
-                if full is None:
-                    time.sleep(0.02)
-                    continue
-                hp_frame, hp_d, num_rd = full, hpg["hp_det"], hpg["num_reader"]   # measure() кропает орб сам
-                if auto.on:
-                    lx = loot_region["left"] - region["left"]
-                    ly = loot_region["top"] - region["top"]
-                    loot_frame = full[ly:ly + loot_region["height"],
-                                      lx:lx + loot_region["width"]]
-                    loot_ctr = loot_center
-                else:
-                    loot_frame, loot_ctr = None, None
-            else:
-                full = None
-                hp_frame, hp_d, num_rd = cap.grab(hpg["orb_region"]), hpg["hp_det_crop"], hpg["num_reader_crop"]
-                loot_frame, loot_ctr = None, None
-                if hp_frame is None:
-                    time.sleep(0.02)
-                    continue
+            # --- ОДИН захват полного кадра — все зоны вырезаем из него ---
+            # dxcam перезаписывает буфер при каждом grab(), поэтому несколько
+            # grab() с разными регионами в одном кадре ломают детекцию.
+            full = cap.grab(region)
+            if full is None:
+                time.sleep(0.02)
+                continue
+            full = full.copy()
 
-            # авто-атака: пока вверху видна полоса HP моба — держим R1 (в фокусе).
-            # press каждый кадр идемпотентен и переподтверждает удержание; отпускаем
-            # с грейсом (сглаживание мерцания / добив почти мёртвого моба).
-            if mob_det is not None and attack.on and foreground and full is not None:
-                if zone_det is not None and zone_det.in_hideout(full):
-                    if r1_held and time.perf_counter() - last_bar_seen > atk_grace:
-                        vx.release(atk_btn)
-                        r1_held = False
-                elif mob_det.present(full):
-                    if not r1_held and time.perf_counter() - last_atk_dump > 1.5:
-                        atk_dump_n += 1
-                        last_atk_dump = time.perf_counter()
-                        dump_attack_trigger(atk_dump_n, full, mob_det, foreground)
-                    last_bar_seen = time.perf_counter()
-                    vx.press(atk_btn)
-                    r1_held = True
-                elif r1_held and time.perf_counter() - last_bar_seen > atk_grace:
-                    vx.release(atk_btn)
-                    r1_held = False
+            # HP: кроп орба из полного кадра
+            hp_frame = None
+            hp_d, num_rd = hpg["hp_det_crop"], hpg["num_reader_crop"]
+            if hpg["orb_region"]:
+                orb = hpg["orb_region"]
+                ox, oy = orb["left"] - region["left"], orb["top"] - region["top"]
+                hp_frame = full[oy:oy + orb["height"], ox:ox + orb["width"]]
+            if hp_frame is None and hp_enabled:
+                time.sleep(0.02)
+                continue
+
+            # Лут: кроп вокруг персонажа из полного кадра
+            loot_frame, loot_ctr = None, None
+            if auto.on:
+                lx = loot_region["left"] - region["left"]
+                ly = loot_region["top"] - region["top"]
+                loot_frame = full[ly:ly + loot_region["height"],
+                                  lx:lx + loot_region["width"]]
+                loot_ctr = loot_center
+
+            # авто-атака — в отдельном потоке
+            if mob_det is not None and attack.on and foreground:
+                try:
+                    if use_memory:
+                        attack_worker.submit(foreground=foreground)
+                    else:
+                        attack_worker.submit(full, foreground)
+                    atk_result = attack_worker.get_result()
+                    if atk_result is not None:
+                        if atk_result["in_hideout"]:
+                            if r1_held and time.perf_counter() - last_bar_seen > atk_grace:
+                                vx.release(atk_btn)
+                                r1_held = False
+                        elif atk_result["mob_present"]:
+                            if not r1_held and time.perf_counter() - last_atk_dump > 10.0:
+                                atk_dump_n += 1
+                                last_atk_dump = time.perf_counter()
+                                dump_frame = full
+                                dump_attack_trigger(atk_dump_n, dump_frame, mob_det, foreground)
+                            last_bar_seen = time.perf_counter()
+                            vx.press(atk_btn)
+                            r1_held = True
+                        elif r1_held and time.perf_counter() - last_bar_seen > atk_grace:
+                            vx.release(atk_btn)
+                            r1_held = False
+                except Exception as e:
+                    log.debug("Attack worker error: %s", e)
             elif r1_held:                       # авто-атака выкл / вне фокуса → отпустить
                 vx.release(atk_btn)
                 r1_held = False
 
-            # детекция лута — только окно вокруг персонажа (радиус подбора)
+            # детекция лута — в отдельном потоке (не блокирует FPS)
             if auto.on and loot_frame is not None:
-                points, _mask = det.detect(loot_frame)
-                in_radius = engine.targets_in_radius(points, loot_frame.shape, center=loot_ctr)
-                if foreground and in_radius and engine.ready():
-                    vx.tap(pickup_mask, hold_ms)
-                    engine.mark_pressed()
-                    presses += 1
+                loot_worker.submit(loot_frame, loot_ctr, foreground)
+                result = loot_worker.get_result()
+                if result is not None:
+                    points, in_radius = result
+                    if foreground and in_radius and engine.ready():
+                        vx.tap(pickup_mask, hold_ms)
+                        engine.mark_pressed()
+                        presses += 1
+                else:
+                    points, in_radius = [], []
             else:
                 points, in_radius = [], []
 
@@ -424,12 +651,9 @@ def main():
             if hp_d:
                 low, hm = hp_d.is_low(hp_frame)
                 num = num_rd.read(hp_frame) if num_rd else None   # (cur,max,ratio) | None
-                hp_pct = num[2] if num is not None else hm["ratio"]
-                hp_src = "num" if num is not None else "orb"
-                if num is not None:               # «захват ✓» в оверлее = ЖИВОЕ значение, не снимок старта
+                if num is not None:
                     loc_info["text"] = f"{num[0]}/{num[1]}"
                     last_num_ok = time.perf_counter()
-                hp_v = hm["fill_v"]
                 # диагностика потери HP: снимает улики на переходах ratio=None (если F7 вкл)
                 diag.feed(hp_frame, hp_d, hm, foreground, time.perf_counter())
                 if manual_shot.is_set():
@@ -438,106 +662,29 @@ def main():
                     # если автоподбор вкл — заодно снимок лут-детекции (по ROI вокруг персонажа)
                     if auto.on and loot_frame is not None:
                         dump_loot(diag.n, loot_frame, det, engine, foreground, loot_ctr)
-                if foreground:
-                    # источник HP по приоритету (low_now = True/False/None=неизвестно):
-                    #  • ЦИФРЫ HUD — точные, без неоднозначности None → решают первыми;
-                    #  • иначе уровень орба: ratio известен → low = ratio < порога;
-                    #  • иначе орб ослеп (ratio=None), но ЖИВОЙ (красная лужа: red_frac≥
-                    #    порога, fill_v≥valid_val), tripwire ниже порога, И последнее HP было
-                    #    < порога → ослеп ПОСРЕДИ просадки: держим питьё (fallback ПРОДОЛЖАЕТ);
-                    #  • иначе None → неизвестно (меню/перекрытие на полном HP) — НЕ пьём.
-                    # выбор источника: цифры → (кратко нет цифр) орб → (долго нет = меню) стоп
-                    use_orb = False
-                    if num is not None:
-                        num_blind_since = None
-                        orb_full = hm["ratio"] is not None and hm["ratio"] >= hp_threshold
-                        if orb_full and num[2] < 0.25:
-                            # цифры ЭКСТРЕМ-низкие (<25%) при ПОЛНОМ орбе — физически
-                            # невозможно (на реальном <25% орб пуст). Значит ROI обрезает
-                            # ведущую цифру (current стал 4-значным на полном HP → «070/1070»
-                            # =7%). Не пьём и форсим перелокализацию (якорь по жизни не даст
-                            # уехать на Щит) — она пересоберёт ROI под полное число. Реальную
-                            # умеренную просадку (30-88%) это НЕ трогает: там low_now ниже.
-                            if time.perf_counter() - last_clip_warn > 3.0:
-                                log.warning("Цифры HP=%.0f%% при орбе %.0f%% — обрезка ROI "
-                                            "(число выросло), перелокализую", num[2] * 100,
-                                            hm["ratio"] * 100)
-                                last_clip_warn = time.perf_counter()
-                            located = False
-                            low_now = None
-                            num_low_since = None
-                        elif num[2] < hp_threshold:
-                            last_good_ratio = num[2]
-                            if num_low_since is None:
-                                num_low_since = time.perf_counter()
-                            # мягкий анти-глитч: умеренно ниже порога при НЕсогласном орбе
-                            # (орб у перса завышает 74%→98%) → ждём стабильности цифр
-                            # короткий грейс (отфильтрует transient-вспышку), потом пьём.
-                            # Орб согласен/слеп → сразу. Орбу как вето НЕ доверяем.
-                            low_now = not (orb_full and
-                                           time.perf_counter() - num_low_since < num_low_grace)
-                        else:
-                            last_good_ratio = num[2]
-                            num_low_since = None
-                            low_now = False
-                    elif num_rd is None:
-                        use_orb = True          # цифры выключены/не калиброваны → орб основной
-                    else:
-                        # цифры включены, но не читаются на этом кадре
-                        if num_blind_since is None:
-                            num_blind_since = time.perf_counter()
-                        if time.perf_counter() - num_blind_since <= hp_num_grace:
-                            use_orb = True      # короткое мелькание в бою → подстрахует орб
-                        else:
-                            low_now = None      # надолго пропали → меню/перекрыт HUD → не пьём
-
-                    if use_orb:
-                        # орб-логика (fallback): ratio → слепой орб посреди просадки
-                        if hm["ratio"] is not None:
-                            last_good_ratio = hm["ratio"]
-                            low_now = low
-                        elif (hm.get("trip_below")
-                              and hm.get("red_frac", 0) >= hp_fallback_red_min
-                              and hm.get("fill_v", 0) >= hp_valid_val
-                              and last_good_ratio is not None
-                              and last_good_ratio < hp_threshold):
-                            low_now = True
-                        else:
-                            low_now = None
-                    # дебаунс. None (неизвестно) НЕ сбрасывает стрик — иначе мерцание
-                    # роняет счётчик и фляга не жмётся; low растит, высокий сбрасывает.
-                    if low_now is True:
-                        low_streak += 1
-                    elif low_now is None:
-                        pass                       # неизвестно — держим стрик как есть
-                    else:
-                        low_streak = 0
-                    # жмём только на реально низком кадре. None держит стрик, но сам не
-                    # стреляет; высокий — сбрасывает. Иначе залипание выстрелов.
-                    # flask.on (F3) — ручной общий выключатель автопития, независимый от
-                    # источника чтения HP; стрик всё равно считаем, чтобы порог не «прыгал»
-                    # при включении посреди боя.
-                    if (flask.on and low_now and low_streak >= hp_confirm
-                            and time.perf_counter() - last_flask >= hp_cooldown):
-                        bridge.suppress_triggers = True
+                # HP-решение через движок
+                hp_engine.decide(num, hm, low, foreground)
+                if hp_engine.need_relocate:
+                    log.warning("Цифры HP=%.0f%% при орбе — обрезка ROI, перелокализую",
+                                (num[2] * 100) if num else 0)
+                    located = False
+                # жмём флягу по решению движка
+                if (flask.on and hp_engine.decision == HPDecision.LOW
+                        and time.perf_counter() - last_flask >= hp_cooldown):
+                    bridge.suppress_triggers = True
+                    def _do_flask():
                         if flask_right:
                             vx.tap_right_trigger(flask_hold)
                         else:
                             vx.tap_left_trigger(flask_hold)
                         bridge.suppress_triggers = False
-                        last_flask = time.perf_counter()
-                        flasks += 1
-                        log.info("HP фляга (%s): HP=%s [%s] < %.0f%%",
-                                 "R2" if flask_right else "L2",
-                                 f"{hp_pct*100:.0f}%" if hp_pct is not None else "?",
-                                 hp_src, hp_threshold * 100)
-                else:
-                    low_streak = 0
-                    last_good_ratio = None     # вне фокуса забываем HP — иначе stale-low даст fallback при возврате
-                    num_blind_since = None
-                    num_low_since = None
-            else:
-                low_streak = 0
+                    threading.Thread(target=_do_flask, daemon=True).start()
+                    last_flask = time.perf_counter()
+                    flasks += 1
+                    log.info("HP фляга (%s): HP=%s [%s] < %.0f%%",
+                             "R2" if flask_right else "L2",
+                             f"{hp_engine.hp_pct*100:.0f}%" if hp_engine.hp_pct is not None else "?",
+                             hp_engine.hp_src, hp_engine.threshold * 100)
 
             # обновляем оверлей (дешёвые записи в общий state, читает поток tkinter)
             ov_state.auto_loot = auto.on
@@ -546,7 +693,7 @@ def main():
             ov_state.attacking = r1_held
             ov_state.flask_on = flask.on
             ov_state.diag = diag.enabled
-            ov_state.hp_pct = hp_pct
+            ov_state.hp_pct = hp_engine.hp_pct
             ov_state.foreground = foreground
             ov_state.flasks = flasks
             ov_state.presses = presses
@@ -584,10 +731,25 @@ def main():
                                       else "+narrow" if mob_det.last_match.get("narrow")
                                       else "+lowhp" if mob_det.last_match.get("low_hp_lock")
                                       else "")
-                log.info("targets=%d in_radius=%d auto=%s fg=%s presses=%d hp=%s(%s) v=%s flasks=%d atk=%s fps=%.0f",
+                log.info("targets=%d in_radius=%d auto=%s fg=%s presses=%d hp=%s(%s) streak=%d flasks=%d atk=%s fps=%.0f",
                          len(points), len(in_radius),
                          "ON" if auto.on else "off", foreground, presses,
-                         f"{hp_pct*100:.0f}%" if hp_pct is not None else "-", hp_src, hp_v, flasks, atk_state, fps)
+                         f"{hp_engine.hp_pct*100:.0f}%" if hp_engine.hp_pct is not None else "-",
+                         hp_engine.hp_src, hp_engine.low_streak,
+                         flasks, atk_state, fps)
+                # debug overlay info
+                if diag.enabled:
+                    hp_pct_s = f"{hp_engine.hp_pct*100:.0f}%" if hp_engine.hp_pct is not None else "-"
+                    ov_state.debug_hp = f"HP={hp_pct_s} src={hp_engine.hp_src} streak={hp_engine.low_streak}"
+                    if mob_det is not None and hasattr(mob_det, 'last_match') and mob_det.last_match:
+                        m = mob_det.last_match
+                        kind = "boot" if m.get("bootstrap") else "narrow" if m.get("narrow") else "lowhp" if m.get("low_hp_lock") else "strict"
+                        ov_state.debug_mob = f"mob=CV kind={kind} x={m.get('x',0)} w={m.get('w',0)} aspect={m.get('aspect',0):.1f}"
+                    elif use_memory and mob_det is not None:
+                        ov_state.debug_mob = f"mob=MEM hostile={mob_det.stats.get('hostile_in_range',0)} total={mob_det.stats.get('total_entities',0)}"
+                    else:
+                        ov_state.debug_mob = "mob=—"
+                    ov_state.debug_zone = f"range={atk_cfg.get('attack_range',15):.0f} dark={'on' if (mob_det and hasattr(mob_det, '_is_dark_zone') and mob_det._is_dark_zone(full)) else '—'}"
                 last_status = now
                 iters = 0
 
@@ -595,6 +757,12 @@ def main():
     except KeyboardInterrupt:
         log.info("Прервано (Ctrl+C)")
     finally:
+        attack_worker.stop()
+        attack_worker.join(timeout=1.0)
+        if use_memory and mob_det is not None and isinstance(mob_det, MemoryMobDetector):
+            mob_det.disconnect()
+        loot_worker.stop()
+        loot_worker.join(timeout=1.0)
         listener.stop()
         overlay.stop()
         bridge.stop()

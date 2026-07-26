@@ -14,6 +14,7 @@
     python hp_diag.py
 """
 import logging
+import logging.handlers
 import os
 import threading
 import time
@@ -34,7 +35,8 @@ _root.setLevel(logging.INFO)
 _sh = logging.StreamHandler()
 _sh.setFormatter(_fmt)
 _root.addHandler(_sh)
-_fh = logging.FileHandler(LOG_PATH, mode="w", encoding="utf-8")
+_fh = logging.handlers.RotatingFileHandler(
+    LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
 _fh.setFormatter(_fmt)
 _root.addHandler(_fh)
 log = logging.getLogger("poe2auto.hpdiag")
