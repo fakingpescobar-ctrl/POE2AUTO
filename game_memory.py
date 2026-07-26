@@ -424,3 +424,101 @@ class GameMemory:
         self._base = best_base
         self._size = best_size
         return True
+
+    def read_camera_matrix(self, in_game_state: int) -> Optional[list]:
+        """Прочитать матрицу WorldToScreen (4x4 float, 16 значений).
+        Camera находится по адресу InGameState + 0x368.
+        Матрица по Camera + 0x1A0 (64 байта).
+        """
+        import game_offsets as off
+        cam_ptr = self.read_pointer(in_game_state + off.InGameState.CAMERA)
+        if not cam_ptr:
+            return None
+        data = self.read_bytes(cam_ptr + off.Camera.WORLD_TO_SCREEN_MATRIX, 64)
+        if data is None:
+            return None
+        import struct
+        return list(struct.unpack("<16f", data))
+
+    def world_to_screen(self, world_x: float, world_y: float, world_z: float,
+                        matrix: list, screen_w: int, screen_h: int) -> Optional[tuple]:
+        """Проецировать мировые координаты в экранные через матрицу WorldToScreen.
+        Возвращает (screen_x, screen_y) или None если за экраном.
+        """
+        if not matrix or len(matrix) < 16:
+            return None
+
+        # Row-major 4x4 matrix: screen = world * M
+        # M[0..3] = row0, M[4..7] = row1, M[8..11] = row2, M[12..15] = row3
+        x = world_x * matrix[0] + world_y * matrix[4] + world_z * matrix[8] + matrix[12]
+        y = world_x * matrix[1] + world_y * matrix[5] + world_z * matrix[9] + matrix[13]
+        w = world_x * matrix[3] + world_y * matrix[7] + world_z * matrix[11] + matrix[15]
+
+        if w < 0.001:
+            return None
+
+        sx = (x / w) * 0.5 * screen_w + screen_w * 0.5
+        sy = (1.0 - (y / w) * 0.5) * screen_h  # Y инвертирован
+
+        if sx < 0 or sx > screen_w or sy < 0 or sy > screen_h:
+            return None
+
+        return (int(sx), int(sy))
+
+    def read_terrain_walkable(self, area_instance: int) -> Optional[tuple]:
+        """Прочитать walkable grid (nibble-packed, 2 cells/byte).
+        Возвращает (width, height, walkable_bytes) или None.
+        walkable_bytes — плоский массив 0/1 по одному на клетку.
+        """
+        import game_offsets as off
+        terrain = area_instance + off.AreaInstance.TERRAIN_METADATA
+
+        # StdVector: first/last pointers
+        first = self.read_pointer(terrain + off.Terrain.GRID_WALKABLE_DATA)
+        last = self.read_pointer(terrain + off.Terrain.GRID_WALKABLE_DATA + 8)
+        if not first or not last:
+            return None
+
+        bytes_per_row = self.read_int(terrain + off.Terrain.BYTES_PER_ROW)
+        if not bytes_per_row or bytes_per_row <= 0 or bytes_per_row > 65536:
+            return None
+
+        total_bytes = last - first
+        if total_bytes <= 0 or total_bytes > 64 * 1024 * 1024:
+            return None
+
+        raw = self.read_bytes(first, total_bytes)
+        if raw is None:
+            return None
+
+        rows = total_bytes // bytes_per_row
+        width = bytes_per_row * 2  # 2 nibbles per byte
+
+        # Unpack nibbles → flat 0/1 array
+        walk = bytearray(width * rows)
+        for y in range(rows):
+            row_base = y * bytes_per_row
+            for x in range(width):
+                byte_val = raw[row_base + (x >> 1)]
+                nibble = (byte_val & 0x0F) if (x & 1) == 0 else (byte_val >> 4)
+                walk[y * width + x] = 1 if nibble != 0 else 0
+
+        return (width, rows, bytes(walk))
+
+    def is_walkable(self, terrain_data: tuple, grid_x: float, grid_y: float) -> bool:
+        """Проверить, проходима ли клетка по данным terrain.
+        grid_x, grid_y — в сетевых координатах (как у EntityData).
+        """
+        if not terrain_data:
+            return False
+        width, height, walk = terrain_data
+
+        # Конвертируем сетевые координаты в индексы массива
+        # Каждая клетка = 23×23 ячеек grid, но walkable data — это ячейки
+        cell_x = int(grid_x)
+        cell_y = int(grid_y)
+
+        if cell_x < 0 or cell_x >= width or cell_y < 0 or cell_y >= height:
+            return False
+
+        return walk[cell_y * width + cell_x] == 1

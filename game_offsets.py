@@ -79,6 +79,30 @@ class ObjectMagicProperties:
     MOD_RECORD_PTR = 0x8
     MOD_ID_STRING = 0x0
 
+class Camera:
+    WORLD_TO_SCREEN_MATRIX = 0x1A0    # float[16], row-major 4x4
+    ZOOM = 0x528                      # float, == 1.0
+
+class MonsterComponent:
+    IS_BOSS = 0x27                    # byte: 0=нет, 1=босс
+    FLIP_ENABLED = 0x26
+    DISABLE_DEFAULT_STATS = 0x24
+
+class Targetable:
+    ATTACKABLE = 0x17
+    IS_TARGETABLE = 0x18
+    FORCE_TARGET = 0x19
+
+class Terrain:
+    TOTAL_TILES = 0x18                # StdTuple2D<long> (tilesX, tilesY)
+    TILE_DETAILS_PTR = 0x28           # StdVector of TileStructure (0x38 bytes)
+    GRID_WALKABLE_DATA = 0xD0         # StdVector — nibble-packed walkable grid
+    GRID_LANDSCAPE_DATA = 0xE8
+    GRID_LAYER_3 = 0x100
+    GRID_LAYER_4 = 0x118
+    BYTES_PER_ROW = 0x130             # int — cellsPerRow = ×2
+    TILE_GRID_CELLS = 23              # tile = 23×23 grid cells
+
 # Визуальные ID выше этого порога — декорации
 VISUAL_ID_THRESHOLD = 0x40000000
 
@@ -92,3 +116,5 @@ COMPONENT_POSITIONED = "Positioned"
 COMPONENT_MAGIC_PROPS = "ObjectMagicProperties"
 COMPONENT_MINIMAP_ICON = "MinimapIcon"
 COMPONENT_CHEST = "Chest"
+COMPONENT_MONSTER = "Monster"
+COMPONENT_TARGETABLE = "Targetable"

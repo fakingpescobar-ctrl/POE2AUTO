@@ -52,6 +52,7 @@ class EntityData(NamedTuple):
     rarity: Rarity
     is_friendly: bool
     distance: float    # расстояние от игрока (в сетевых координатах)
+    is_boss: bool = False
 
 
 class EntityReader:
@@ -233,6 +234,14 @@ class EntityReader:
             if reaction is not None:
                 is_friendly = (reaction & 0x7F) == 1
 
+        # Boss check (Monster component)
+        is_boss = False
+        monster_addr = comps.get(off.COMPONENT_MONSTER)
+        if monster_addr:
+            boss_byte = self._mem.read_uint(monster_addr + off.MonsterComponent.IS_BOSS, 1)
+            if boss_byte is not None:
+                is_boss = boss_byte != 0
+
         # Distance from player
         distance = 0.0
         if player_pos:
@@ -253,6 +262,7 @@ class EntityReader:
             rarity=rarity,
             is_friendly=is_friendly,
             distance=distance,
+            is_boss=is_boss,
         )
 
     def _get_metadata(self, entity_ptr: int) -> Optional[str]:
@@ -307,6 +317,7 @@ class EntityReader:
         target_names = {
             off.COMPONENT_RENDER, off.COMPONENT_LIFE,
             off.COMPONENT_POSITIONED, off.COMPONENT_MAGIC_PROPS,
+            off.COMPONENT_MONSTER, off.COMPONENT_TARGETABLE,
         }
 
         # Read first few entries (budget)
