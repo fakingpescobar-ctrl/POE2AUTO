@@ -73,6 +73,17 @@ class MemoryMobDetector:
         self.reader = EntityReader(self.mem)
         self._connected = True
         self._resolve_game_state()
+
+        # Инициализация discovery системы
+        if self._area_instance:
+            player = self.mem.read_pointer(self._area_instance + off.AreaInstance.LOCAL_PLAYER)
+            if player:
+                comps = self.reader._resolve_components(player)
+                life_addr = comps.get("Life")
+                if life_addr:
+                    self.reader.initialize_discovery(life_addr)
+                    _log.info("Offset discovery initialized (Life=0x%X)", life_addr)
+
         return True
 
     @property
@@ -109,6 +120,15 @@ class MemoryMobDetector:
 
         if not self._area_instance:
             return False
+
+        # Runtime валидация оффсетов (каждые 5 секунд)
+        if self.reader:
+            player_ptr = self.mem.read_pointer(self._area_instance + off.AreaInstance.LOCAL_PLAYER)
+            if player_ptr:
+                comps = self.reader._resolve_components(player_ptr)
+                life_addr = comps.get("Life")
+                if life_addr:
+                    self.reader.validate_offsets(life_addr)
 
         # Читаем позицию игрока
         player = self.reader.read_local_player(self._area_instance)
@@ -367,6 +387,15 @@ class MemoryMobDetector:
                 _log.info("AreaInstance changed: 0x%X → 0x%X", self._area_instance, area_inst)
                 self._area_instance = area_inst
                 self.reader.clear_cache()
+
+                # Re-scan offsets для новой зоны
+                player = self.mem.read_pointer(area_inst + off.AreaInstance.LOCAL_PLAYER)
+                if player:
+                    comps = self.reader._resolve_components(player)
+                    life_addr = comps.get("Life")
+                    if life_addr:
+                        self.reader.force_rescan(life_addr)
+                        _log.info("Offset re-scan triggered for new zone (Life=0x%X)", life_addr)
 
                 # Read area info
                 info = self.reader.read_area_info(area_inst)

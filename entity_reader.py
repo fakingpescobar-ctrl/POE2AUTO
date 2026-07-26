@@ -17,6 +17,7 @@ from enum import IntEnum
 
 from game_memory import GameMemory
 import game_offsets as off
+from offset_discovery import OffsetDiscovery, VitalOffsets
 
 _log = logging.getLogger("poe2auto.entities")
 
@@ -71,11 +72,13 @@ class EntityReader:
         self._component_cache: Dict[int, Dict[str, int]] = {}  # entity_addr → {name → comp_addr}
         self._name_cache: Dict[int, str] = {}  # entity_addr → metadata path
         self._id_cache: Dict[int, int] = {}  # entity_addr → last entity id (recycle guard)
-        # Self-healing vital offsets
+        # Self-healing vital offsets (fallback)
         self._health_off = off.Life.HEALTH
         self._mana_off = off.Life.MANA
         self._es_off = off.Life.ENERGY_SHIELD
         self._vital_offsets_resolved = False
+        # Offset discovery system
+        self._discovery = OffsetDiscovery(mem, self)
 
     def read_entities(self, area_instance: int, player_pos: Optional[tuple] = None) -> List[EntityData]:
         """Прочитать все активные сущности из AwakeEntities.
@@ -506,3 +509,40 @@ class EntityReader:
         self._name_cache.clear()
         self._id_cache.clear()
         # Не сбрасываем _vital_offsets_resolved — offset'ы валидны в пределах сборки игры
+
+    def initialize_discovery(self, life_addr: int = 0):
+        """Инициализировать систему обнаружения оффсетов.
+        Вызывать один раз при старте или при смене зоны.
+        """
+        if life_addr:
+            self._discovery.set_life_addr(life_addr)
+        self._discovery.initialize(life_addr)
+        # Обновить локальные оффсеты из discovery
+        self._sync_vital_offsets()
+
+    def validate_offsets(self, life_addr: int = 0) -> bool:
+        """Runtime валидация оффсетов. Вызывать периодически.
+        Возвращает True если оффсеты валидны.
+        """
+        if life_addr:
+            self._discovery.set_life_addr(life_addr)
+        result = self._discovery.validate(life_addr)
+        self._sync_vital_offsets()
+        return result
+
+    def force_rescan(self, life_addr: int = 0):
+        """Принудительный re-scan оффсетов (F5 или смена зоны)."""
+        self._discovery.force_rescan(life_addr)
+        self._sync_vital_offsets()
+
+    def _sync_vital_offsets(self):
+        """Синхронизировать локальные оффсеты с discovery."""
+        vitals = self._discovery.get_vital_offsets()
+        self._health_off = vitals.health
+        self._mana_off = vitals.mana
+        self._es_off = vitals.es
+        self._vital_offsets_resolved = True
+
+    def get_discovery_stats(self) -> dict:
+        """Статистика discovery системы."""
+        return self._discovery.stats.copy()

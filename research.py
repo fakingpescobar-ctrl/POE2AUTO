@@ -6,6 +6,9 @@
     python research.py --entity <addr>  # дамп компонентов сущности
     python research.py --find-entities  # поиск AwakeEntities в AreaInstance
     python research.py --dump <addr> <size>  # hex dump памяти
+    python research.py --discover       # полное обнаружение оффсетов (AOB + value-scan)
+    python research.py --validate       # runtime валидация текущих оффсетов
+    python research.py --rescan         # принудительный re-scan оффсетов
 
 Адаптировано из POE2Radar.Research (Sikaka, MIT).
 """
@@ -19,6 +22,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from game_memory import GameMemory
 from entity_reader import EntityReader
+from offset_discovery import OffsetDiscovery
 import game_offsets as off
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -281,6 +285,183 @@ def _find_area_instance(mem: GameMemory, reader: EntityReader) -> int:
     return 0
 
 
+def cmd_discover(mem: GameMemory, reader: EntityReader):
+    """Полное обнаружение оффсетов: AOB scan + value-scan."""
+    print("=== Full Offset Discovery ===\n")
+
+    # Найти AreaInstance
+    area_inst = _find_area_instance(mem, reader)
+    if not area_inst:
+        print("ERROR: Cannot find AreaInstance")
+        return False
+
+    print(f"AreaInstance: 0x{area_inst:X}")
+
+    # Найти Player
+    player = mem.read_pointer(area_inst + off.AreaInstance.LOCAL_PLAYER)
+    if not player:
+        print("ERROR: Cannot find LocalPlayer")
+        return False
+
+    print(f"LocalPlayer: 0x{player:X}")
+
+    # Resolve Life component
+    comps = reader._resolve_components(player)
+    life_addr = comps.get("Life")
+    if not life_addr:
+        print("ERROR: Life component not found")
+        return False
+
+    print(f"Life component: 0x{life_addr:X}")
+
+    # Initialize discovery
+    discovery = OffsetDiscovery(mem, reader)
+    discovery.set_life_addr(life_addr)
+    discovery.initialize(life_addr)
+
+    # Run full discovery
+    result = discovery.discover_all_offsets(_get_game_state(mem, reader))
+
+    print("\nDiscovered offsets:")
+    for name, value in result.items():
+        print(f"  {name}: 0x{value:X}")
+
+    # Show vital offsets
+    vitals = discovery.get_vital_offsets()
+    print(f"\nVital offsets:")
+    print(f"  Health: 0x{vitals.health:X}")
+    print(f"  Mana:   0x{vitals.mana:X}")
+    print(f"  ES:     0x{vitals.es:X}")
+
+    # Stats
+    stats = discovery.stats
+    print(f"\nStats:")
+    print(f"  AOB matches: {stats['aob_matches']}")
+    print(f"  Value scan matches: {stats['value_scan_matches']}")
+
+    return True
+
+
+def cmd_validate(mem: GameMemory, reader: EntityReader):
+    """Runtime валидация текущих оффсетов."""
+    print("=== Runtime Offset Validation ===\n")
+
+    discovery = OffsetDiscovery(mem, reader)
+
+    # Найти AreaInstance
+    area_inst = _find_area_instance(mem, reader)
+    if not area_inst:
+        print("ERROR: Cannot find AreaInstance")
+        return False
+
+    # Найти Player и Life
+    player = mem.read_pointer(area_inst + off.AreaInstance.LOCAL_PLAYER)
+    if not player:
+        print("ERROR: Cannot find LocalPlayer")
+        return False
+
+    comps = reader._resolve_components(player)
+    life_addr = comps.get("Life")
+    if not life_addr:
+        print("ERROR: Life component not found")
+        return False
+
+    print(f"Life component: 0x{life_addr:X}")
+    print(f"Current Health offset: 0x{off.Life.HEALTH:X}")
+
+    # Validate
+    discovery.set_life_addr(life_addr)
+    result = discovery.validate(life_addr)
+
+    if result:
+        print("✓ Current offsets are VALID")
+    else:
+        print("✗ Current offsets are INVALID — re-scan recommended")
+
+    vitals = discovery.get_vital_offsets()
+    print(f"\nVital offsets:")
+    print(f"  Health: 0x{vitals.health:X}")
+    print(f"  Mana:   0x{vitals.mana:X}")
+    print(f"  ES:     0x{vitals.es:X}")
+
+    stats = discovery.stats
+    print(f"\nValidation stats:")
+    print(f"  Passed: {stats['validations_passed']}")
+    print(f"  Failed: {stats['validations_failed']}")
+    print(f"  Auto recoveries: {stats['auto_recoveries']}")
+
+    return result
+
+
+def cmd_rescan(mem: GameMemory, reader: EntityReader):
+    """Принудительный re-scan оффсетов."""
+    print("=== Force Re-scan Offsets ===\n")
+
+    discovery = OffsetDiscovery(mem, reader)
+
+    # Найти AreaInstance
+    area_inst = _find_area_instance(mem, reader)
+    if not area_inst:
+        print("ERROR: Cannot find AreaInstance")
+        return False
+
+    # Найти Player и Life
+    player = mem.read_pointer(area_inst + off.AreaInstance.LOCAL_PLAYER)
+    if not player:
+        print("ERROR: Cannot find LocalPlayer")
+        return False
+
+    comps = reader._resolve_components(player)
+    life_addr = comps.get("Life")
+    if not life_addr:
+        print("ERROR: Life component not found")
+        return False
+
+    print(f"Life component: 0x{life_addr:X}")
+    print(f"Current Health offset: 0x{off.Life.HEALTH:X}")
+
+    # Force re-scan
+    discovery.force_rescan(life_addr)
+
+    vitals = discovery.get_vital_offsets()
+    print(f"\nRe-scanned vital offsets:")
+    print(f"  Health: 0x{vitals.health:X} (was 0x{off.Life.HEALTH:X})")
+    print(f"  Mana:   0x{vitals.mana:X} (was 0x{off.Life.MANA:X})")
+    print(f"  ES:     0x{vitals.es:X} (was 0x{off.Life.ENERGY_SHIELD:X})")
+
+    changed = (vitals.health != off.Life.HEALTH or
+               vitals.mana != off.Life.MANA or
+               vitals.es != off.Life.ENERGY_SHIELD)
+    if changed:
+        print("\n⚠ Offsets CHANGED — update game_offsets.py!")
+    else:
+        print("\n✓ Offsets unchanged — defaults are correct")
+
+    return True
+
+
+def _get_game_state(mem: GameMemory, reader: EntityReader) -> int:
+    """Найти GameState адрес."""
+    pattern_info = off.AOB_PATTERNS.get("game_states")
+    if not pattern_info:
+        return 0
+
+    pattern, wildcards, disp_off, instr_len, desc = pattern_info
+    matches = mem.aob_scan(pattern, wildcards)
+
+    for match_addr in matches:
+        next_instr = match_addr + instr_len
+        disp_data = mem.read_bytes(match_addr + disp_off, 4)
+        if not disp_data:
+            continue
+        displacement = struct.unpack("<i", disp_data)[0]
+        slot_addr = next_instr + displacement
+        game_state = mem.read_pointer(slot_addr)
+        if game_state and game_state >= 0x10000:
+            return game_state
+    return 0
+
+
 def main():
     if not mem.connect():
         print("ERROR: Cannot connect to PoE2. Make sure the game is running.")
@@ -295,6 +476,9 @@ def main():
         print("  python research.py --entity <hex_address>")
         print("  python research.py --find-entities")
         print("  python research.py --dump <hex_address> <size>")
+        print("  python research.py --discover")
+        print("  python research.py --validate")
+        print("  python research.py --rescan")
         return 0
 
     cmd = sys.argv[1]
@@ -309,6 +493,12 @@ def main():
         cmd_find_entities(mem)
     elif cmd == "--dump" and len(sys.argv) >= 4:
         cmd_dump(mem, int(sys.argv[2], 16), int(sys.argv[3]))
+    elif cmd == "--discover":
+        return 0 if cmd_discover(mem, reader) else 1
+    elif cmd == "--validate":
+        return 0 if cmd_validate(mem, reader) else 1
+    elif cmd == "--rescan":
+        return 0 if cmd_rescan(mem, reader) else 1
     else:
         print(f"Unknown command: {cmd}")
         return 1
