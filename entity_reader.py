@@ -70,6 +70,12 @@ class EntityReader:
         self._mem = mem
         self._component_cache: Dict[int, Dict[str, int]] = {}  # entity_addr → {name → comp_addr}
         self._name_cache: Dict[int, str] = {}  # entity_addr → metadata path
+        self._id_cache: Dict[int, int] = {}  # entity_addr → last entity id (recycle guard)
+        # Self-healing vital offsets
+        self._health_off = off.Life.HEALTH
+        self._mana_off = off.Life.MANA
+        self._es_off = off.Life.ENERGY_SHIELD
+        self._vital_offsets_resolved = False
 
     def read_entities(self, area_instance: int, player_pos: Optional[tuple] = None) -> List[EntityData]:
         """Прочитать все активные сущности из AwakeEntities.
@@ -102,9 +108,10 @@ class EntityReader:
                 continue
             visited.add(node)
 
-            # Read node (48 bytes)
+            # One read for the whole node — Left/Right/IsNil/KeyId/ValueEntityPtr are
+            # contiguous in 48 bytes, so this replaces 5 separate reads with one.
             node_data = self._mem.read_bytes(node, 48)
-            if node_data is None:
+            if node_data is None or len(node_data) < 48:
                 continue
 
             import struct
@@ -186,6 +193,14 @@ class EntityReader:
         if is_valid is not None and (is_valid & 1):
             return None
 
+        # Recycle guard: entity addresses get reused within an area.
+        # If this address now carries a different id, evict stale caches.
+        prev_id = self._id_cache.get(entity_ptr)
+        if prev_id is not None and prev_id != entity_id:
+            self._component_cache.pop(entity_ptr, None)
+            self._name_cache.pop(entity_ptr, None)
+        self._id_cache[entity_ptr] = entity_id
+
         # EntityDetails → metadata path
         metadata = self._get_metadata(entity_ptr)
         if not metadata:
@@ -214,7 +229,8 @@ class EntityReader:
         hp_ratio = 0.0
         life_addr = comps.get(off.COMPONENT_LIFE)
         if life_addr:
-            hp_cur, hp_max = self._read_vital(life_addr + off.Life.HEALTH)
+            self._ensure_vital_offsets(life_addr)
+            hp_cur, hp_max = self._read_vital(life_addr + self._health_off)
             if hp_max > 0:
                 hp_ratio = hp_cur / hp_max
 
@@ -357,14 +373,101 @@ class EntityReader:
         return comps
 
     def _read_vital(self, address: int) -> tuple:
-        """Прочитать VitalStruct (current, max)."""
+        """Прочитать VitalStruct (current, max).
+        Layout: ReservedFlat@0x10, ReservedFraction@0x14, Regen@0x28, Max@0x2C, Current@0x30."""
         data = self._mem.read_bytes(address, off.VitalStruct.SIZE)
         if data is None:
             return 0, 0
         import struct
-        current = struct.unpack("<i", data[off.VitalStruct.CURRENT:off.VitalStruct.CURRENT + 4])[0]
         max_val = struct.unpack("<i", data[off.VitalStruct.MAX:off.VitalStruct.MAX + 4])[0]
+        current = struct.unpack("<i", data[off.VitalStruct.CURRENT:off.VitalStruct.CURRENT + 4])[0]
         return max(0, current), max(0, max_val)
+
+    def _read_vital_unreserved(self, address: int) -> tuple:
+        """Прочитать VitalStruct с учётом reserved (auras).
+        Возвращает (current, unreserved_max)."""
+        data = self._mem.read_bytes(address, off.VitalStruct.SIZE)
+        if data is None:
+            return 0, 0
+        import struct
+        reserved_flat = struct.unpack("<i", data[off.VitalStruct.RESERVED_FLAT:off.VitalStruct.RESERVED_FLAT + 4])[0]
+        reserved_frac = struct.unpack("<i", data[off.VitalStruct.RESERVED_FRACTION:off.VitalStruct.RESERVED_FRACTION + 4])[0]
+        max_val = struct.unpack("<i", data[off.VitalStruct.MAX:off.VitalStruct.MAX + 4])[0]
+        current = struct.unpack("<i", data[off.VitalStruct.CURRENT:off.VitalStruct.CURRENT + 4])[0]
+        if max_val <= 0:
+            return 0, 0
+        # Reserved: ceiling(frac/10000 * max) + flat
+        import math
+        reserved = math.ceil(reserved_frac / 10000.0 * max_val) + reserved_flat
+        unreserved = max(0, max_val - reserved)
+        return max(0, current), unreserved
+
+    def _vital_looks_valid(self, address: int) -> bool:
+        """Проверить, что VitalStruct выглядит валидной."""
+        data = self._mem.read_bytes(address, off.VitalStruct.SIZE)
+        if data is None:
+            return False
+        import struct
+        max_val = struct.unpack("<i", data[off.VitalStruct.MAX:off.VitalStruct.MAX + 4])[0]
+        current = struct.unpack("<i", data[off.VitalStruct.CURRENT:off.VitalStruct.CURRENT + 4])[0]
+        reserved_flat = struct.unpack("<i", data[off.VitalStruct.RESERVED_FLAT:off.VitalStruct.RESERVED_FLAT + 4])[0]
+        if max_val <= 0 or max_val > 10_000_000:
+            return False
+        if current < -max_val or current > max_val + 1:
+            return False
+        if reserved_flat < 0 or reserved_flat > max_val:
+            return False
+        return True
+
+    def _ptr(self, address: int) -> int:
+        """Safe pointer read: возвращает 0 для невалидных/мусорных адресов.
+        Отсекает адреса вне user-mode пространства x64 Windows."""
+        p = self._mem.read_pointer(address)
+        if not p:
+            return 0
+        u = p & 0xFFFFFFFFFFFFFFFF  # unsigned
+        if u < 0x10000 or u > 0x7FFFFFFFFFFF:
+            return 0
+        return p
+
+    def _ensure_vital_offsets(self, life_addr: int):
+        """Self-healing: если Health offset сломался, сканирует Life компонент
+        в диапазоне 0x80–0x400 и находит валидные VitalStruct."""
+        if self._vital_offsets_resolved or life_addr == 0:
+            return
+
+        # Проверяем текущий offset
+        if self._vital_looks_valid(life_addr + self._health_off):
+            self._vital_offsets_resolved = True
+            return
+
+        _log.warning("Health offset 0x%X invalid on Life@0x%X — scanning for VitalStructs",
+                     self._health_off, life_addr)
+
+        # Сканируем диапазон 0x80–0x400, ищем валидные VitalStruct (шаг 0x34)
+        found = []
+        for scan_off in range(0x80, 0x401, 4):
+            if self._vital_looks_valid(life_addr + scan_off):
+                found.append(scan_off)
+                if len(found) >= 4:
+                    break
+                scan_off += 0x34  # прыгаем через структуру
+            else:
+                scan_off += 4
+
+        if not found:
+            _log.error("No valid VitalStruct found in Life@0x%X range 0x80-0x400", life_addr)
+            return
+
+        self._health_off = found[0]
+        if len(found) >= 2:
+            self._mana_off = found[1]
+        if len(found) >= 3:
+            self._es_off = found[2]
+
+        self._vital_offsets_resolved = True
+        _log.warning("Auto-relocated vital offsets: Health=0x%X, Mana=0x%X, ES=0x%X",
+                     self._health_off, self._mana_off, self._es_off)
 
     def _categorize(self, metadata: str) -> EntityCategory:
         """Определить категорию сущности по metadata path."""
@@ -401,3 +504,5 @@ class EntityReader:
         """Очистить кэш компонентов (вызывать при смене зоны)."""
         self._component_cache.clear()
         self._name_cache.clear()
+        self._id_cache.clear()
+        # Не сбрасываем _vital_offsets_resolved — offset'ы валидны в пределах сборки игры

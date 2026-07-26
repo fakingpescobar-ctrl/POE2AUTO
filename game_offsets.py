@@ -33,11 +33,11 @@ class AreaInstance:
     AREA_INFO = 0x0A0              # → AreaInfo (UTF-16 area code)
     AREA_LEVEL = 0x0C4             # int: area level
     AREA_HASH = 0x11C              # uint: instance hash
-    SERVER_DATA = 0x5A0            # → ServerData
-    LOCAL_PLAYER = 0x5C0           # → Entity (local player)
-    AWAKE_ENTITIES = 0x6E0         # StdMap: live entity map
-    SLEEPING_ENTITIES = 0x6F0      # StdMap: inactive entities
-    TERRAIN_METADATA = 0x8C0       # → TerrainStruct
+    SERVER_DATA = 0x580            # → ServerData (candidate)
+    LOCAL_PLAYER = 0x5A0           # ✓ → Entity (local player)
+    AWAKE_ENTITIES = 0x6C0         # ✓ StdMap: live entity map
+    SLEEPING_ENTITIES = 0x6D0      # ✓ StdMap: inactive entities
+    TERRAIN_METADATA = 0x8A0       # ✓ → TerrainStruct
 
 class Entity:
     DETAILS_PTR = 0x08             # → EntityDetails
@@ -58,15 +58,26 @@ class Render:
     WORLD_POSITION = 0x138         # Vector3 {float X, Y, Z}
 
 class Life:
-    HEALTH = 0x1DC                  # VitalStruct (Max @ +0x00, Current @ +0x04; validated 2026-07-26)
-    MANA = 0x208                    # VitalStruct
-    ENERGY_SHIELD = 0x24C           # VitalStruct
+    """Life component. Owner @ +0x08 (back-pointer to entity).
+    VitalStruct: ReservedFlat@0x10, ReservedFraction@0x14, Regen@0x28, Max@0x2C, Current@0x30.
+    Layout validated live 2026-06-04 (was 0x1A8/0x1F8/0x230 pre-patch → now 0x1B0/0x208/0x248)."""
+    OWNER = 0x008                  # back-pointer to entity
+    HEALTH = 0x1B0                 # ✓ VitalStruct (was 0x1A8 pre-patch)
+    MANA = 0x208                   # ✓ VitalStruct (was 0x1F8 pre-patch)
+    ENERGY_SHIELD = 0x248          # ✓ VitalStruct (was 0x230 pre-patch)
 
 class VitalStruct:
-    """Max и Current идут подряд (validated 2026-07-26)."""
-    MAX = 0x00                      # int
-    CURRENT = 0x04                  # int
-    SIZE = 0x08
+    """MSVC x64 VitalStruct — 0x34 bytes total.
+    Layout: ReservedFlat(0x10), ReservedFraction(0x14), Regen(0x28), Max(0x2C), Current(0x30).
+    ReservedFraction — parts per 10000 (e.g. 2023 = 20.23% reserved by auras).
+    Validated live from GameHelper2 + POE2Radar."""
+    OWNER = 0x00                   # back-pointer to Life component
+    RESERVED_FLAT = 0x10           # int: flat reserved HP/mana
+    RESERVED_FRACTION = 0x14       # int: reserved fraction × 10000
+    REGEN = 0x28                   # float: regen per second
+    MAX = 0x2C                     # ✓ int
+    CURRENT = 0x30                 # ✓ int
+    SIZE = 0x34
 
 class Positioned:
     REACTION = 0x1E0               # byte: (Reaction & 0x7F) == 1 → friendly
