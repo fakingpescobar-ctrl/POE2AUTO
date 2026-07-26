@@ -194,6 +194,43 @@ class MemoryMobDetector:
             return {}
         return self.reader.read_area_info(self._area_instance)
 
+    def read_player_vitals(self) -> tuple:
+        """Прочитать HP% и Mana% игрока из памяти.
+        Возвращает (hp_pct, mana_pct) или (None, None)."""
+        if not self._area_instance or not self.reader:
+            return None, None
+        player = self.reader.read_local_player(self._area_instance)
+        if not player:
+            return None, None
+
+        import game_offsets as off
+        import struct
+
+        comps = self.reader._resolve_components(player)
+        life_addr = comps.get(off.COMPONENT_LIFE)
+        if not life_addr:
+            return None, None
+
+        # HP
+        hp_pct = None
+        data = self.reader._mem.read_bytes(life_addr + off.Life.HEALTH, off.VitalStruct.SIZE)
+        if data:
+            hp_max = struct.unpack("<i", data[off.VitalStruct.MAX:off.VitalStruct.MAX+4])[0]
+            hp_cur = struct.unpack("<i", data[off.VitalStruct.CURRENT:off.VitalStruct.CURRENT+4])[0]
+            if hp_max > 0:
+                hp_pct = max(0.0, min(1.0, hp_cur / hp_max))
+
+        # Mana
+        mana_pct = None
+        data = self.reader._mem.read_bytes(life_addr + off.Life.MANA, off.VitalStruct.SIZE)
+        if data:
+            mp_max = struct.unpack("<i", data[off.VitalStruct.MAX:off.VitalStruct.MAX+4])[0]
+            mp_cur = struct.unpack("<i", data[off.VitalStruct.CURRENT:off.VitalStruct.CURRENT+4])[0]
+            if mp_max > 0:
+                mana_pct = max(0.0, min(1.0, mp_cur / mp_max))
+
+        return hp_pct, mana_pct
+
     def get_nearest_hostile(self) -> Optional[EntityData]:
         """Ближайший враждебный моб в радиусе атаки."""
         hostiles = [e for e in self._last_entities
@@ -219,6 +256,39 @@ class MemoryMobDetector:
                 and not e.is_friendly
                 and e.hp_current > 0
                 and e.distance <= self.attack_range]
+
+    def get_best_target(self) -> Optional[EntityData]:
+        """Лучшая цель для атаки. Приоритет:
+        1. Боссы (is_boss) — ближайший
+        2. Unique — ближайший
+        3. Rare — ближайший
+        4. Magic — ближайший
+        5. Normal — ближайший
+        В пределах одной редкости — по расстоянию (ближе = лучше)."""
+        hostiles = self.get_hostiles_in_range()
+        if not hostiles:
+            return None
+
+        # Разделяем по приоритету: босс > unique > rare > magic > normal
+        def target_score(e: EntityData) -> tuple:
+            rarity_order = {
+                Rarity.UNIQUE: 0,
+                Rarity.RARE: 1,
+                Rarity.MAGIC: 2,
+                Rarity.NORMAL: 3,
+            }
+            is_boss_penalty = 0 if e.is_boss else 1
+            rarity_penalty = rarity_order.get(e.rarity, 4)
+            return (is_boss_penalty, rarity_penalty, e.distance)
+
+        return min(hostiles, key=target_score)
+
+    def get_lowest_hp_target(self) -> Optional[EntityData]:
+        """Цель с минимальным HP% в радиусе атаки (для добивания)."""
+        hostiles = self.get_hostiles_in_range()
+        if not hostiles:
+            return None
+        return min(hostiles, key=lambda e: e.hp_ratio if e.hp_max > 0 else 1.0)
 
     def get_chests(self) -> List[EntityData]:
         """Сундуки."""

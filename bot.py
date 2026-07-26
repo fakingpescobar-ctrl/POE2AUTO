@@ -38,6 +38,7 @@ from zone_detector import ZoneDetector
 from mem_detect import MemoryMobDetector
 from diag_dump import HPDiag, dump_loot, dump_attack_trigger
 from overlay import Overlay, OverlayState
+from auto_flask import AutoFlaskEngine, FlaskRule, FlaskState, FlaskDecision, default_rules
 from virtual_xbox import VirtualXbox360, XUSB
 from dualsense_bridge import DualSenseBridge
 from utils import Toggle, build_detector
@@ -434,6 +435,26 @@ def main() -> int:
     flask = Toggle(default=True)
     diag = HPDiag()  # диагностика потери HP (F7) — пишет улики в _debug/hp_events
     manual_shot = threading.Event()
+
+    # --- auto-flask engine (memory-based) ---
+    af_cfg = cfg.get("auto_flask", {})
+    af_enabled = af_cfg.get("enabled", True) and use_memory
+    auto_flask = AutoFlaskEngine()
+    if af_enabled:
+        for rule_cfg in af_cfg.get("rules", default_rules()):
+            auto_flask.add_rule(FlaskRule(
+                name=rule_cfg.get("name", "Unnamed"),
+                key=rule_cfg.get("key", "left_trigger"),
+                hp_below=rule_cfg.get("hp_below"),
+                mana_below=rule_cfg.get("mana_below"),
+                enemies_nearby=rule_cfg.get("enemies_nearby"),
+                enemy_radius=rule_cfg.get("enemy_radius", 30.0),
+                cooldown_s=rule_cfg.get("cooldown_s", 1.0),
+                enabled=rule_cfg.get("enabled", True),
+            ))
+    auto_flask.enabled = af_enabled
+    if af_enabled:
+        log.info("Auto-flask MEMORY: %d правил", len(auto_flask.rules))
     stop = threading.Event()
     k_toggle = cfg["hotkeys"].get("toggle", "f8")
     k_quit = cfg["hotkeys"].get("quit", "f12")
@@ -685,6 +706,34 @@ def main() -> int:
                              "R2" if flask_right else "L2",
                              f"{hp_engine.hp_pct*100:.0f}%" if hp_engine.hp_pct is not None else "?",
                              hp_engine.hp_src, hp_engine.threshold * 100)
+
+            # --- AUTO-FLASK: memory-based rules (HP%, Mana%, enemies) ---
+            if (auto_flask.enabled and flask.on and use_memory
+                    and mob_det is not None and isinstance(mob_det, MemoryMobDetector)
+                    and mob_det.available and foreground and not mob_det.in_hideout()):
+                hp_pct, mana_pct = mob_det.read_player_vitals()
+                enemies = len(mob_det.get_hostiles_in_range())
+
+                af_state = FlaskState(
+                    hp_pct=hp_pct,
+                    mana_pct=mana_pct,
+                    enemies_in_range=enemies,
+                    foreground=foreground,
+                    in_hideout=mob_det.in_hideout(),
+                )
+                af_decision = auto_flask.evaluate(af_state)
+                if af_decision.should_press:
+                    key_name = af_decision.rule.key
+                    _btn = XUSB.get(key_name, XUSB.get("left_trigger"))
+                    bridge.suppress_triggers = True
+                    def _do_af_flask(btn=_btn):
+                        vx.tap(btn, hold_ms=flask_hold)
+                        bridge.suppress_triggers = False
+                    threading.Thread(target=_do_af_flask, daemon=True).start()
+                    auto_flask.mark_used(af_decision.rule)
+                    last_flask = time.perf_counter()
+                    flasks += 1
+                    log.info("Auto-flask: %s", af_decision.reason)
 
             # обновляем оверлей (дешёвые записи в общий state, читает поток tkinter)
             ov_state.auto_loot = auto.on

@@ -139,6 +139,30 @@ auto_attack:
     # авто-атаку, пока на экране виден заголовок панели заданий «Убежище».
     roi: {x1: 0.88, y1: 0.10, x2: 1.0, y2: 0.32}   # зона заголовка панели заданий (доли кадра)
     match_min: 0.85        # порог сходства с шаблоном zone_templates/hideout_label.png
+auto_flask:
+  # автофляска через чтение памяти (HP/Mana% + кол-во врагов).
+  # Работает только при use_memory=true в auto_attack (нужен доступ к памяти).
+  # При use_memory=false используй CV-based фляску (hp.threshold и hp.cooldown_ms).
+  enabled: true
+  rules:
+    - name: "HP Critical"
+      key: left_trigger       # L2 = HP фляга
+      hp_below: 0.30          # HP < 30% → жмём
+      cooldown_s: 1.0
+    - name: "HP Low"
+      key: left_trigger
+      hp_below: 0.50          # HP < 50% → жмём (реже)
+      cooldown_s: 3.0
+    - name: "Mana Low"
+      key: right_trigger      # R2 = мана фляга
+      mana_below: 0.30        # Mana < 30% → жмём
+      cooldown_s: 2.0
+    - name: "Enemies + Low HP"
+      key: left_trigger
+      hp_below: 0.70          # HP < 70% + ≥3 врага рядом → жмём
+      enemies_nearby: 3
+      enemy_radius: 30.0
+      cooldown_s: 2.0
 hotkeys:
   toggle: f8
   diag: f7
