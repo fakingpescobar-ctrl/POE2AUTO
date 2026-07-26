@@ -274,3 +274,96 @@ class TestUpdate:
         det._last_update = 0.0
         result = det.update()
         assert result is False
+
+
+def _transition(id=1, x=5.0, y=5.0, dist=10.0, metadata="/Metadata/Objects/Transition"):
+    return EntityData(
+        id=id, category=EntityCategory.TRANSITION, metadata=metadata,
+        x=x, y=y, z=0.0, grid_x=x, grid_y=y,
+        hp_current=0, hp_max=0, hp_ratio=0.0,
+        rarity=Rarity.NORMAL, is_friendly=False, distance=dist,
+    )
+
+
+class TestGetTransitions:
+    def test_empty(self):
+        det = MemoryMobDetector()
+        det._last_entities = []
+        assert det.get_transitions() == []
+
+    def test_no_transitions(self):
+        det = MemoryMobDetector()
+        det._last_entities = [_hostile(id=1), _chest(id=200)]
+        assert det.get_transitions() == []
+
+    def test_single_transition(self):
+        det = MemoryMobDetector()
+        det._last_entities = [_transition(id=1, x=10.0, y=10.0)]
+        result = det.get_transitions()
+        assert len(result) == 1
+        assert result[0].id == 1
+
+    def test_two_far_apart(self):
+        det = MemoryMobDetector()
+        det._last_entities = [
+            _transition(id=1, x=10.0, y=10.0, dist=5.0),
+            _transition(id=2, x=50.0, y=50.0, dist=50.0),
+        ]
+        result = det.get_transitions()
+        assert len(result) == 2
+
+    def test_two_close_together(self):
+        det = MemoryMobDetector()
+        det._last_entities = [
+            _transition(id=1, x=10.0, y=10.0, dist=5.0),
+            _transition(id=2, x=10.1, y=10.1, dist=5.1),  # within 0.5 radius
+        ]
+        result = det.get_transitions()
+        assert len(result) == 1
+        assert result[0].id == 1  # closest to player
+
+    def test_exact_same_position(self):
+        det = MemoryMobDetector()
+        det._last_entities = [
+            _transition(id=1, x=10.0, y=10.0, dist=5.0),
+            _transition(id=2, x=10.0, y=10.0, dist=6.0),
+        ]
+        result = det.get_transitions()
+        assert len(result) == 1
+        assert result[0].id == 1
+
+    def test_three_in_clusters(self):
+        det = MemoryMobDetector()
+        det._last_entities = [
+            _transition(id=1, x=10.0, y=10.0, dist=5.0),
+            _transition(id=2, x=10.1, y=10.1, dist=5.1),
+            _transition(id=3, x=50.0, y=50.0, dist=50.0),
+        ]
+        result = det.get_transitions()
+        assert len(result) == 2
+
+    def test_sorted_by_distance(self):
+        det = MemoryMobDetector()
+        det._last_entities = [
+            _transition(id=1, x=50.0, y=50.0, dist=50.0),
+            _transition(id=2, x=10.0, y=10.0, dist=5.0),
+            _transition(id=3, x=30.0, y=30.0, dist=30.0),
+        ]
+        result = det.get_transitions()
+        assert len(result) == 3
+        assert result[0].id == 2
+        assert result[1].id == 3
+        assert result[2].id == 1
+
+    def test_custom_radius(self):
+        det = MemoryMobDetector()
+        det._last_entities = [
+            _transition(id=1, x=10.0, y=10.0, dist=5.0),
+            _transition(id=2, x=11.0, y=11.0, dist=6.0),
+        ]
+        # Default radius 0.5 — different positions
+        result = det.get_transitions(dedup_radius=0.5)
+        assert len(result) == 2
+        # Custom radius 2.0 — same group
+        result = det.get_transitions(dedup_radius=2.0)
+        assert len(result) == 1

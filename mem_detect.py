@@ -315,6 +315,35 @@ class MemoryMobDetector:
         return [e for e in self._last_entities
                 if e.category == EntityCategory.CHEST]
 
+    def get_transitions(self, dedup_radius: float = 0.5) -> List[EntityData]:
+        """Уникальные переходы (portals, doorways) с дедупликацией по позиции.
+        Группирует переходы в пределах dedup_radius сетевых единиц,
+        оставляя самый ближний к игроку в каждой группе.
+        """
+        transitions = [e for e in self._last_entities
+                       if e.category == EntityCategory.TRANSITION]
+        if not transitions:
+            return []
+
+        # Сортируем по расстоянию (ближайшие первые)
+        transitions.sort(key=lambda e: e.distance)
+
+        unique = []
+        for t in transitions:
+            # Проверяем, не попадает ли в существующую группу
+            is_dup = False
+            for i, u in enumerate(unique):
+                dx = t.grid_x - u.grid_x
+                dy = t.grid_y - u.grid_y
+                if dx * dx + dy * dy <= dedup_radius * dedup_radius:
+                    # Дубликат — уже есть переход в этой зоне
+                    is_dup = True
+                    break
+            if not is_dup:
+                unique.append(t)
+
+        return unique
+
     # --- Internal ---
 
     def _resolve_game_state(self):
