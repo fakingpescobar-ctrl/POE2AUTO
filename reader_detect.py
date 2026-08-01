@@ -11,13 +11,15 @@ PoE2Reader.exe.
 
 Требования:
   - pythonnet>=3.0 (pip install pythonnet)
-  - Скомпилированная PoE2ReaderLib.dll (C:\\Projects\\poe2-reader\\lib\\bin\\Release)
+  - Скомпилированная PoE2ReaderLib.dll (poe2-reader/lib/bin/Release; см. build_reader.bat)
   - PoE2 запущен (PathOfExileSteam.exe)
   - Бот запущен с правами admin (OpenProcess PROCESS_VM_READ)
 
-Ограничение (временное): HP сущностей пока не читается (life=[0,...]).
-Все враждебные мобы считаются «живыми» (hp_ratio=1.0), чтобы авто-атака работала.
-Как только в ReaderBridge добавится чтение Life-компонента — hp_ratio станет точным.
+Жив/мёртв определяется многоуровневой классификацией TargetStatus
+(см. ниже): DEAD (труп, Life+0x10) → SPIRIT (дух/немоб) → LATENT (умирает,
+HP≤порога) → GHOST_STATIC (спящий призрак, не двигался) → UNKNOWN (HP не
+прочитан) → COMBAT (атаковать). HP читается из Life-компонента (reader_bridge.
+_read_vitals). Атакуются только цели со статусом COMBAT.
 """
 from __future__ import annotations
 
@@ -33,6 +35,42 @@ _log = logging.getLogger("poe2auto.readerdetect")
 
 # Кеш hideout-результата: (area_hash, result, timestamp)
 _HIDEOUT_CACHE_TTL = 3.0  # секунды
+
+
+class TargetStatus:
+    """Многоуровневый статус цели (вместо бинарного «жив/мёртв»).
+
+    Заменяет разрозненные проверки _is_hostile_alive + _is_static_target_ok
+    одной детерминированной классификацией. Порядок проверок — от самого
+    «мёртвого» к самому «боеготовому».
+
+    DEAD         — труп. Флаг смерти Life+0x10 == 1 (C# уже отсёк, is_alive=False).
+    SPIRIT       — небоевой дух/эффект. Уже перекатегоризован в OTHER в _parse_entity,
+                   сюда попадает как теоретический путь (других враждебных MONSTER
+                   с этими keywords не бывает). Боевой фильтр добивает надёжно.
+    LATENT       — alive, но hp_max>0 И hp_cur<=min_hp (умирает / пустышка-невидимка).
+                   Не атакуем: это либо труп в процессе, либо сущность без реального HP.
+    GHOST_STATIC — alive + HP есть, но НИ РАЗУ не двигался сверх grace-периода
+                   (спящий утопленник, декоративный труп, который числится живым).
+                   Не атакуем: висит R1 по невидимой цели.
+    UNKNOWN      — alive, но HP НЕ прочитан (life_addr ещё не резолвнулся, холодный
+                   кэш). Решение по attack_unknown_hp: по умолчанию ждём, для
+                   rare/boss и «двигался» — даём поблажку.
+    COMBAT       — ✅ атаковать. alive + (реальный hp>0) + (двигался ИЛИ grace ИЛИ
+                   игрок под огнём ИЛИ rare/boss). Боеготовая цель.
+    """
+    DEAD = "dead"
+    SPIRIT = "spirit"
+    LATENT = "latent"
+    GHOST_STATIC = "ghost_static"
+    UNKNOWN = "unknown"
+    COMBAT = "combat"
+
+    # Статусы, которые считаются «достойными атаки».
+    ATTACKABLE = frozenset({COMBAT})
+
+    # Статусы, которые технически живы (для статистики «всего живых»).
+    LIVING = frozenset({LATENT, GHOST_STATIC, UNKNOWN, COMBAT})
 
 
 class ReaderMobDetector:
@@ -85,6 +123,14 @@ class ReaderMobDetector:
         # раз двигался, либо ещё не прошёл grace-период (только заспавненный).
         self.ignore_static = bool(cfg.get("ignore_static_mobs", True))
         self.static_grace_s = float(cfg.get("static_grace_s", 2.0))
+        # Порог HP: моб с hp_cur <= min_hp при hp_max>0 — LATENT (умирает/пустышка),
+        # в атаку не идёт. Rare/Unique/боссы этим порогом не отсекаются.
+        self.min_hp_threshold = int(cfg.get("min_hp_threshold", 0))
+        # Что делать с живым мобом, у которого HP НЕ прочитан (холодный кэш Life):
+        # True  — атаковать (старое поведение: HP читается не сразу после спавна).
+        # False — ждать реальных данных, не атаковать вслепую.
+        # Rare/boss и «когда-либо двигался» атакуются независимо от этого флага.
+        self.attack_unknown_hp = bool(cfg.get("attack_unknown_hp", True))
         self._static_track = {}   # addr -> {ever_moved, ever_hit, first_seen, last_seen, last}
         self._last_area_hash = -1
         # Признак «игрок в бою»: вражеский снаряд, приближающийся к игроку.
@@ -207,8 +253,7 @@ class ReaderMobDetector:
         monsters_alive = [e for e in self._last_entities
                           if e.category == EntityCategory.MONSTER
                           and not e.is_friendly
-                          and self._is_hostile_alive(e)
-                          and self._is_static_target_ok(e)]
+                          and self._classify_target(e) in TargetStatus.ATTACKABLE]
         in_range = [e for e in monsters_alive if e.distance <= self.attack_range]
 
         self.stats["total_entities"] = len(self._last_entities)
@@ -216,6 +261,14 @@ class ReaderMobDetector:
         self.stats["friendlies"] = sum(1 for e in self._last_entities if e.is_friendly)
         self.stats["chests"] = sum(1 for e in self._last_entities
                                    if e.category == EntityCategory.CHEST)
+        # Распределение статусов целей (отладка: видно сколько мобов в каждой
+        # категории — COMBAT/LATENT/GHOST_STATIC/UNKNOWN/DEAD/SPIRIT).
+        status_counts = {}
+        for e in self._last_entities:
+            if e.category == EntityCategory.MONSTER and not e.is_friendly:
+                st = self._classify_target(e)
+                status_counts[st] = status_counts.get(st, 0) + 1
+        self.stats["target_status"] = status_counts
         return True
 
     def present(self, frame_bgr=None) -> bool:
@@ -242,21 +295,19 @@ class ReaderMobDetector:
         return min(hostiles, key=lambda e: e.distance)
 
     def get_all_hostiles(self) -> List[EntityData]:
-        """Все враждебные мобы."""
+        """Все враждебные мобы (боеготовые, статус COMBAT)."""
         return [e for e in self._last_entities
                 if e.category == EntityCategory.MONSTER
                 and not e.is_friendly
-                and self._is_hostile_alive(e)
-                and self._is_static_target_ok(e)]
+                and self._classify_target(e) in TargetStatus.ATTACKABLE]
 
     def get_hostiles_in_range(self) -> List[EntityData]:
-        """Враждебные мобы в радиусе атаки."""
+        """Враждебные мобы в радиусе атаки (статус COMBAT)."""
         return [e for e in self._last_entities
                 if e.category == EntityCategory.MONSTER
                 and not e.is_friendly
-                and self._is_hostile_alive(e)
-                and e.distance <= self.attack_range
-                and self._is_static_target_ok(e)]
+                and self._classify_target(e) in TargetStatus.ATTACKABLE
+                and e.distance <= self.attack_range]
 
     def get_best_target(self) -> Optional[EntityData]:
         """Лучшая цель: босс > unique > rare > magic > normal, потом по расстоянию."""
@@ -358,21 +409,71 @@ class ReaderMobDetector:
             return (lc[1] / lc[0]), None
         return None, None
 
-    @staticmethod
-    def _is_hostile_alive(entity: EntityData) -> bool:
-        """Живой боевой моб.
+    def _classify_target(self, entity: EntityData) -> str:
+        """Единая многоуровневая классификация цели. См. TargetStatus.
 
-        is_alive (C#-флаг Life+0x10) — базовая живость. Дополнительно:
-        у невидимых «пустышек» (заспавненные, но не активированные сущности вроде
-        RiverTaniwhaNoJank / FallenKaruiShieldAxeHalls) и у трупов без флага
-        hp_cur == 0 при rarity < RARE — их не атакуем. Rare/Unique/боссов
-        атакуем даже при hp_cur == 0 (их VitalStruct current может не читаться).
+        Заменяет прежние _is_hostile_alive + _is_static_target_ok. Возвращает
+        один из TargetStatus.*. Атаковать только если результат в
+        TargetStatus.ATTACKABLE (т.е. == COMBAT). Порядок проверок — от самого
+        «мёртвого» к самому «боеготовому», каждая отсекает свою категорию шума.
         """
+        # 1) DEAD — труп. C#-флаг Life+0x10 (is_alive) уже учтён в _parse_entity.
         if not entity.is_alive:
-            return False
-        if entity.hp_current > 0:
+            return TargetStatus.DEAD
+
+        # 2) SPIRIT — небоевой дух/эффект (Tormented Spirit, Summoned, Daemon,
+        # Invisible, MonsterMods). В _parse_entity они перекатегоризуются в OTHER
+        # и сюда как MONSTER не дойдут, но фильтр добивает надёжно на любом пути.
+        path = entity.metadata or ""
+        if any(kw in path for kw in EntityReader.NON_COMBAT_KEYWORDS):
+            return TargetStatus.SPIRIT
+
+        significant = entity.rarity >= Rarity.RARE or entity.is_boss
+
+        # 3) LATENT / UNKNOWN — проверка HP.
+        if entity.hp_max > 0:
+            # HP прочитан. LATENT: живой, но HP<=порога (умирает / пустышка).
+            # Rare/boss не отсекаем — у них current может кратко читаться как 0.
+            if entity.hp_current <= self.min_hp_threshold and not significant:
+                return TargetStatus.LATENT
+        else:
+            # HP НЕ прочитан (холодный кэш Life). Поблажка только если разрешено
+            # конфигом, либо это significant, либо моб уже «проявил себя» движением.
+            moved = self._ever_engaged(entity.id)
+            if not (self.attack_unknown_hp or significant or moved):
+                return TargetStatus.UNKNOWN
+
+        # 4) HP ok. Остался фильтр статики-призраков (движение/grace/огонь).
+        return self._check_static(entity, significant)
+
+    def _ever_engaged(self, eid: int) -> bool:
+        """Моб когда-либо двигался или получал урон (значит он реальный)."""
+        if not self.ignore_static:
             return True
-        return entity.rarity >= Rarity.RARE or entity.is_boss
+        tr = self._static_track.get(eid)
+        return bool(tr and (tr.get("ever_moved") or tr.get("ever_hit")))
+
+    def _check_static(self, entity: EntityData, significant: bool) -> str:
+        """Фильтр статичных «призраков». COMBAT = атаковать, GHOST_STATIC = нет.
+
+        Спящий утопленник/декоративный труп: жив в памяти, но НИ РАЗУ не двигался
+        сверх grace-периода. Rare/boss не фильтруем (бьют с точки спавна).
+        """
+        if not self.ignore_static or significant:
+            return TargetStatus.COMBAT
+        now = time.perf_counter()
+        # Игрок под вражеским огнём — в бою: стоячий стрелок становится целью.
+        if now - self._player_fire_time < 2.0:
+            return TargetStatus.COMBAT
+        tr = self._static_track.get(entity.id)
+        if tr is None:
+            return TargetStatus.COMBAT  # нет трека — свежий, атакуем
+        if tr.get("ever_moved") or tr.get("ever_hit"):
+            return TargetStatus.COMBAT
+        # Не двигался и не бит — призрак, если grace-период уже вышел.
+        if now - tr.get("first_seen", 0.0) < self.static_grace_s:
+            return TargetStatus.COMBAT  # grace — даём шанс шевельнуться
+        return TargetStatus.GHOST_STATIC
 
     # --- Parsing (internal) ---
 
@@ -457,26 +558,6 @@ class ReaderMobDetector:
         if fired:
             self._player_fire_time = now
 
-    def _is_static_target_ok(self, entity: EntityData) -> bool:
-        """True если моба можно атаковать с учётом фильтра статичных «призраков»."""
-        if not self.ignore_static:
-            return True
-        # Rare/Unique/боссов не фильтруем: это значимые цели, их не отсекаем
-        # за то, что они стоят на месте (боссы часто бьют с точки спавна).
-        if entity.rarity >= Rarity.RARE or entity.is_boss:
-            return True
-        now = time.perf_counter()
-        # Игрок под вражеским огнём (снаряд летит к нему) — в бою, статику
-        # разблокируем на 2с: стоячий стрелок, бьющий с места, становится целью.
-        if now - self._player_fire_time < 2.0:
-            return True
-        tr = self._static_track.get(entity.id)
-        if tr is None:
-            return True
-        if tr["ever_moved"] or tr["ever_hit"]:
-            return True
-        return now - tr["first_seen"] < self.static_grace_s
-
     def _parse_entities(self, raw_entities: list) -> List[EntityData]:
         """Преобразовать список raw-сущностей из ReaderBridge → список EntityData."""
         entities: List[EntityData] = []
@@ -529,14 +610,15 @@ class ReaderMobDetector:
         is_alive = bool(raw.get("alive", True)) and (z_ok or significant)
 
         lc = raw.get("life") or []
+        # ЧЕСТНОЕ чтение HP: life=[hp_max, hp_cur, ...] из reader_bridge._read_vitals.
+        # Раньше здесь был фейк hp=1/1 для «живого без HP» — он маскировал мёртвых и
+        # духов под «полный HP». Теперь если HP не прочитан — hp_max=hp_cur=0, и
+        # решение принимает _classify_target (статус UNKNOWN/LATENT), а не враньё.
         if len(lc) >= 2 and (lc[0] > 0 or lc[1] > 0):
-            hp_max = lc[0]
-            hp_cur = lc[1]
-        elif is_alive and z_ok:
-            hp_max = 1
-            hp_cur = 1
+            hp_max = max(0, int(lc[0]))
+            hp_cur = max(0, int(lc[1]))
         else:
-            hp_max = 1
+            hp_max = 0
             hp_cur = 0
         hp_ratio = (hp_cur / hp_max) if hp_max > 0 else 1.0
 
