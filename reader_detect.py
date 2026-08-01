@@ -132,6 +132,9 @@ class ReaderMobDetector:
         self.ignore_static = bool(cfg.get("ignore_static_mobs", True))
         self.static_grace_s = float(cfg.get("static_grace_s", 2.0))
         self.corpse_timeout_s = float(cfg.get("corpse_timeout_s", 30.0))
+        # Grace period after dead_since: don't attack mobs that died
+        # within this window (death animation, C# flag lag).
+        self.death_grace_s = float(cfg.get("death_grace_s", 2.0))
         # Порог HP: моб с hp_cur <= min_hp при hp_max>0 — LATENT (умирает/пустышка),
         # в атаку не идёт. Rare/Unique/боссы этим порогом не отсекаются.
         self.min_hp_threshold = int(cfg.get("min_hp_threshold", 0))
@@ -360,7 +363,8 @@ class ReaderMobDetector:
         def target_score(e: EntityData) -> tuple:
             is_boss_penalty = 0 if e.is_boss else 1
             rarity_penalty = rarity_order.get(e.rarity, 4)
-            return (is_boss_penalty, rarity_penalty, e.distance)
+            confidence_penalty = 0 if e.confidence >= 0.7 else 1
+            return (is_boss_penalty, rarity_penalty, confidence_penalty, e.distance)
 
         return min(hostiles, key=target_score)
 
@@ -375,6 +379,20 @@ class ReaderMobDetector:
         """Сундуки."""
         return [e for e in self._last_entities
                 if e.category == EntityCategory.CHEST]
+
+    def get_corpses_in_range(self, radius: float = 5.0) -> List[EntityData]:
+        """Трупы в радиусе — потенциальный лут.
+
+        Возвращает недавно умерших мобов (CORPSE), которые ещё не
+        исчезли из кадра и могут дропать предметы.
+        """
+        now = time.perf_counter()
+        return [e for e in self._last_entities
+                if e.category == EntityCategory.MONSTER
+                and e.is_corpse
+                and e.dead_since is not None
+                and (now - e.dead_since) < self.corpse_timeout_s
+                and e.distance <= radius]
 
     def get_transitions(self, dedup_radius: float = 0.5) -> List[EntityData]:
         """Уникальные переходы (portals) с дедупликацией по позиции."""
@@ -457,6 +475,12 @@ class ReaderMobDetector:
             if self._is_recently_dead(entity.id):
                 return TargetStatus.CORPSE
             return TargetStatus.DEAD
+
+        # 1b) RECENTLY_DEAD — C# ещё говорит alive, но мы знаем что моб
+        # умер (исчез из кадра и вернулся). Не атакуем — анимация смерти.
+        if entity.dead_since is not None:
+            if (time.perf_counter() - entity.dead_since) < self.death_grace_s:
+                return TargetStatus.DEAD
 
         # 1a) UNREACHABLE - alive but different Z-level or too far.
         if not entity.is_reachable:
@@ -597,11 +621,6 @@ class ReaderMobDetector:
                     tr["ever_moved"] = True
                     tr["last"] = (gx, gy)
         # Track deaths: entity was seen before but not in this frame -> dead
-        for a, tr in list(self._static_track.items()):
-            if a not in seen and tr.get("ever_moved"):
-                self._dead_track[a] = now
-
-        # Track deaths: entity was alive before but not in this frame
         for a, tr in list(self._static_track.items()):
             if a not in seen and tr.get("ever_moved"):
                 self._dead_track[a] = now

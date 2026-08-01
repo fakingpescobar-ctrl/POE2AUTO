@@ -19,6 +19,7 @@ def _make_detector(**overrides):
     det.ignore_static = overrides.get("ignore_static", True)
     det.static_grace_s = overrides.get("static_grace_s", 2.0)
     det.corpse_timeout_s = overrides.get("corpse_timeout_s", 30.0)
+    det.death_grace_s = overrides.get("death_grace_s", 2.0)
     det.min_hp_threshold = overrides.get("min_hp_threshold", 0)
     det.attack_unknown_hp = overrides.get("attack_unknown_hp", True)
     det._static_track = overrides.get("_static_track", {})
@@ -29,16 +30,19 @@ def _make_detector(**overrides):
 
 def _mob(eid=1, hp_cur=800, hp_max=1000, alive=True, rarity=Rarity.NORMAL,
          is_boss=False, path="/Monsters/Test", friendly=False, distance=10.0,
-         confidence=0.0, dead_since=None):
+         confidence=0.0, dead_since=None, is_corpse=False,
+         category=None):
     """Создать EntityData-моба для классификации."""
+    cat = category or EntityCategory.MONSTER
     return EntityData(
-        id=eid, category=EntityCategory.MONSTER, metadata=path,
+        id=eid, category=cat, metadata=path,
         x=0, y=0, z=0, grid_x=0, grid_y=0,
         hp_current=hp_cur, hp_max=hp_max,
         hp_ratio=(hp_cur / hp_max) if hp_max > 0 else 1.0,
         rarity=rarity, is_friendly=friendly, distance=distance,
         is_boss=is_boss, is_alive=alive, is_reachable=True,
         confidence=confidence, dead_since=dead_since,
+        is_corpse=is_corpse,
     )
 
 
@@ -289,3 +293,112 @@ class TestDeadSince:
         det.corpse_timeout_s = 5.0
         det._dead_track = {1: time.perf_counter() - 10.0}
         assert det._is_recently_dead(1) is False
+
+
+# --- death_grace_s: don't attack mobs that died recently ---
+
+class TestDeathGrace:
+    def test_recently_dead_not_combat(self):
+        det = _make_detector(death_grace_s=2.0)
+        now = time.perf_counter()
+        det._dead_track = {1: now}
+        e = _mob(eid=1, alive=True, hp_cur=800, hp_max=1000, dead_since=now)
+        assert det._classify_target(e) == TargetStatus.DEAD
+
+    def test_old_death_is_combat(self):
+        det = _make_detector(death_grace_s=2.0)
+        det._dead_track = {1: time.perf_counter() - 10.0}
+        e = _mob(eid=1, alive=True, hp_cur=800, hp_max=1000, dead_since=time.perf_counter() - 10.0)
+        assert det._classify_target(e) == TargetStatus.COMBAT
+
+    def test_no_dead_since_skips_grace(self):
+        det = _make_detector(death_grace_s=2.0)
+        e = _mob(eid=1, alive=True, hp_cur=800, hp_max=1000)
+        assert det._classify_target(e) == TargetStatus.COMBAT
+
+    def test_zero_grace_disables(self):
+        det = _make_detector(death_grace_s=0.0)
+        now = time.perf_counter()
+        det._dead_track = {1: now}
+        e = _mob(eid=1, alive=True, hp_cur=800, hp_max=1000, dead_since=now)
+        assert det._classify_target(e) == TargetStatus.COMBAT
+
+
+# --- get_corpses_in_range ---
+
+class TestCorpsesInRange:
+    def test_corpse_in_range(self):
+        det = _make_detector()
+        now = time.perf_counter()
+        det._last_entities = [
+            _mob(eid=1, alive=False, hp_cur=0, distance=3.0,
+                 is_corpse=True, dead_since=now - 1.0),
+        ]
+        corpses = det.get_corpses_in_range(radius=5.0)
+        assert len(corpses) == 1
+        assert corpses[0].id == 1
+
+    def test_corpse_out_of_range(self):
+        det = _make_detector()
+        now = time.perf_counter()
+        det._last_entities = [
+            _mob(eid=1, alive=False, hp_cur=0, distance=10.0,
+                 is_corpse=True, dead_since=now - 1.0),
+        ]
+        corpses = det.get_corpses_in_range(radius=5.0)
+        assert len(corpses) == 0
+
+    def test_old_corpse_excluded(self):
+        det = _make_detector()
+        now = time.perf_counter()
+        det._last_entities = [
+            _mob(eid=1, alive=False, hp_cur=0, distance=3.0,
+                 is_corpse=True, dead_since=now - 40.0),
+        ]
+        corpses = det.get_corpses_in_range(radius=5.0)
+        assert len(corpses) == 0
+
+    def test_alive_mob_not_corpses(self):
+        det = _make_detector()
+        now = time.perf_counter()
+        det._last_entities = [
+            _mob(eid=1, alive=True, hp_cur=800, hp_max=1000, distance=3.0),
+        ]
+        corpses = det.get_corpses_in_range(radius=5.0)
+        assert len(corpses) == 0
+
+    def test_non_monster_not_corpses(self):
+        det = _make_detector()
+        now = time.perf_counter()
+        det._last_entities = [
+            _mob(eid=1, category=EntityCategory.CHEST, alive=False,
+                 hp_cur=0, distance=3.0, is_corpse=True, dead_since=now - 1.0),
+        ]
+        corpses = det.get_corpses_in_range(radius=5.0)
+        assert len(corpses) == 0
+
+
+# --- confidence in get_best_target ---
+
+class TestBestTargetConfidence:
+    def test_high_confidence_preferred(self):
+        det = _make_detector()
+        det._static_track = {}
+        det._last_entities = [
+            _mob(eid=1, hp_cur=800, hp_max=1000, distance=10.0, confidence=0.9),
+            _mob(eid=2, hp_cur=800, hp_max=1000, distance=5.0, confidence=0.2),
+        ]
+        best = det.get_best_target()
+        assert best is not None
+        assert best.id == 1  # high confidence wins over closer low-confidence
+
+    def test_boss_overrides_confidence(self):
+        det = _make_detector()
+        det._static_track = {}
+        det._last_entities = [
+            _mob(eid=1, hp_cur=800, hp_max=1000, distance=10.0, confidence=0.9, is_boss=False),
+            _mob(eid=2, hp_cur=800, hp_max=1000, distance=15.0, confidence=0.3, is_boss=True),
+        ]
+        best = det.get_best_target()
+        assert best is not None
+        assert best.id == 2  # boss wins
