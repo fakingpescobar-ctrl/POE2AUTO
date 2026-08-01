@@ -163,27 +163,20 @@ class MonsterDB:
         _log.debug("MonsterDB writer-поток завершился")
 
     def _flush(self, rows: List[tuple]) -> None:
-        """Записать батч строк (одна транзакция). session_id подставляется."""
+        """Записать батч строк. session_id подставляется. (autocommit-режим:
+        executemany сам коммитит, ручные BEGIN/COMMIT не нужны.)"""
         assert self._conn is not None and self.session_id
         sid = self.session_id
-        # вставляем session_id после ts (позиция 1 в row без него)
         full = [(None, sid) + r for r in rows]
         try:
-            cur = self._conn.cursor()
-            cur.execute("BEGIN")
-            cur.executemany(
+            self._conn.executemany(
                 "INSERT INTO monster_events "
                 "(id, session_id, ts, area, addr, name, category, rarity, "
                 "hp_cur, hp_max, hp_pct, grid_x, grid_y, dist, status, hostile, is_boss) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 full)
-            cur.execute("COMMIT")
         except sqlite3.Error as e:
             _log.warning("MonsterDB write failed (%d rows): %s", len(full), e)
-            try:
-                self._conn.rollback()
-            except sqlite3.Error:
-                pass
 
     def _maybe_cleanup(self) -> None:
         """Периодически удалять записи старше keep_days."""
@@ -304,28 +297,238 @@ class MonsterDB:
         finally:
             conn.close()
 
+    def get_mob_history(self, name: Optional[str] = None,
+                        addr: Optional[int] = None,
+                        session_id: Optional[str] = None,
+                        limit: int = 5000) -> List[Dict[str, Any]]:
+        """История одного моба: как менялись HP/статус/позиция со временем.
+
+        Фильтр по name (все мобы с этим именем) ИЛИ addr (один конкретный моб).
+        Возвращает список словарей {ts, addr, name, hp_cur, hp_max, hp_pct,
+        status, dist, grid_x, grid_y} отсортированных по времени.
+
+        Применение: «почему этот моб умер», «как падал HP босса», «когда моб
+        стал GHOST_STATIC и бот перестал его атаковать».
+        """
+        conn = self._connect_ro(self.path)
+        try:
+            sid = session_id
+            if sid is None:
+                row = conn.execute(
+                    "SELECT session_id FROM monster_events ORDER BY ts DESC LIMIT 1"
+                ).fetchone()
+                if not row:
+                    return []
+                sid = row[0]
+            clauses = ["session_id = ?"]
+            params: list = [sid]
+            if name is not None:
+                clauses.append("name = ?")
+                params.append(name)
+            if addr is not None:
+                clauses.append("addr = ?")
+                params.append(int(addr))
+            where = " AND ".join(clauses)
+            rows = conn.execute(
+                "SELECT ts, addr, name, hp_cur, hp_max, hp_pct, status, dist, "
+                "grid_x, grid_y FROM monster_events WHERE %s "
+                "ORDER BY ts ASC LIMIT ?" % where,
+                params + [int(limit)],
+            ).fetchall()
+            return [{"ts": r[0], "addr": r[1], "name": r[2], "hp_cur": r[3],
+                     "hp_max": r[4], "hp_pct": r[5], "status": r[6],
+                     "dist": r[7], "grid_x": r[8], "grid_y": r[9]} for r in rows]
+        finally:
+            conn.close()
+
+    def get_kill_events(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Детект убийств: кого бот убил в этой сессии.
+
+        «Убийство» = моб, который был в COMBAT (бот его атаковал), а затем:
+          - исчез из записей (умер, сущность выгружена), ИЛИ
+          - его статус стал DEAD (Life+0x10).
+        Уникальные вхождения мобов, которые НИ РАЗУ не были COMBAT (бот их
+        не трогал), не считаются убийствами — они могли умереть от окружения
+        или просто деспавниться.
+
+        Возвращает список {addr, name, first_combat_ts, kill_ts, duration_s,
+        hp_start, hp_max} отсортированный по времени убийства.
+        """
+        conn = self._connect_ro(self.path)
+        try:
+            sid = session_id
+            if sid is None:
+                row = conn.execute(
+                    "SELECT session_id FROM monster_events ORDER BY ts DESC LIMIT 1"
+                ).fetchone()
+                if not row:
+                    return []
+                sid = row[0]
+            # Берём весь таймлайн по addr в сессии, группируем в Python
+            # (детект перехода COMBAT→конец — это state-machine, удобнее кодом).
+            rows = conn.execute(
+                "SELECT addr, ts, name, status, hp_cur, hp_max FROM monster_events "
+                "WHERE session_id = ? AND addr > 0 ORDER BY addr, ts ASC",
+                (sid,)).fetchall()
+        finally:
+            conn.close()
+
+        # Группируем по addr, сохраняя порядок времени
+        per_addr: Dict[int, list] = {}
+        for r in rows:
+            per_addr.setdefault(r[0], []).append(r)
+
+        kills = []
+        for addr, events in per_addr.items():
+            ever_combat = any(e[3] == "combat" for e in events)
+            if not ever_combat:
+                continue  # бот не трогал — не наше убийство
+            first = None
+            first_combat = None
+            for e in events:
+                if first is None:
+                    first = e
+                if first_combat is None and e[3] == "combat":
+                    first_combat = e
+            last = events[-1]
+            # Убийство = последний статус DEAD, ИЛИ моб исчез (последняя запись
+            # была COMBAT, дальше ничего нет — умер и выгрузился).
+            died = (last[3] == "dead"
+                    or (last[3] == "combat"))
+            if not died:
+                continue
+            fc_ts = first_combat[1] if first_combat else (first[1] if first else 0)
+            kills.append({
+                "addr": addr,
+                "name": last[2] or (first[2] if first else ""),
+                "first_combat_ts": fc_ts,
+                "kill_ts": last[1],
+                "duration_s": max(0.0, last[1] - fc_ts),
+                "hp_start": first_combat[4] if first_combat else 0,
+                "hp_max": first_combat[5] if first_combat else 0,
+            })
+        kills.sort(key=lambda k: k["kill_ts"])
+        return kills
+
+    def list_sessions(self) -> List[Tuple[str, float, float, int]]:
+        """Все сессии в БД: [(session_id, ts_min, ts_max, frames), ...] по убыванию."""
+        conn = self._connect_ro(self.path)
+        try:
+            return conn.execute(
+                "SELECT session_id, MIN(ts), MAX(ts), COUNT(*) "
+                "FROM monster_events GROUP BY session_id ORDER BY 3 DESC"
+            ).fetchall()
+        finally:
+            conn.close()
+
+
 
 # ──────────────────────────────────────────────────────────────────────────
-# CLI: python monster_db.py [db_path]  — сводка последней сессии
+# CLI:
+#   python monster_db.py                    — сводка последней сессии
+#   python monster_db.py --name Shambler    — HP-кривая моба(ов) по имени
+#   python monster_db.py --addr 0x1A2B      — история конкретного моба по адресу
+#   python monster_db.py --kills            — кого бот убил (детект убийств)
+#   python monster_db.py --sessions         — список всех сессий
+#   python monster_db.py --session ID       — сводка конкретной сессии
+#   (опц. позиционный аргумент = путь к БД)
 # ──────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
+    from datetime import datetime as _dt
+
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s: %(message)s",
                         datefmt="%H:%M:%S")
-    db_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+
+    opts = {"db": None, "name": None, "addr": None, "kills": False,
+            "sessions": False, "session": None}
+    rest = []
+    i = 0
+    argv = sys.argv[1:]
+    while i < len(argv):
+        a = argv[i]
+        if a == "--name" and i + 1 < len(argv):
+            opts["name"] = argv[i + 1]; i += 2
+        elif a == "--addr" and i + 1 < len(argv):
+            opts["addr"] = int(argv[i + 1], 0); i += 2  # 0x.. или dec
+        elif a == "--session" and i + 1 < len(argv):
+            opts["session"] = argv[i + 1]; i += 2
+        elif a == "--kills":
+            opts["kills"] = True; i += 1
+        elif a == "--sessions":
+            opts["sessions"] = True; i += 1
+        else:
+            rest.append(a); i += 1
+    if rest:
+        opts["db"] = rest[0]
+
+    def _t(ts):
+        return _dt.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "?"
+
+    db_path = opts["db"] or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "monster_telemetry.db")
     if not os.path.exists(db_path):
         print("БД не найдена: %s" % db_path)
         print("Запусти бота с monster_db.enabled: true — БД создастся сама.")
         sys.exit(1)
     db = MonsterDB(db_path)
-    summary = db.get_session_summary()
-    if summary.get("empty"):
-        print("БД пуста (нет записей).")
+
+    if opts["sessions"]:
+        sessions = db.list_sessions()
+        if not sessions:
+            print("БД пуста (нет сессий)."); sys.exit(0)
+        print("%-22s %-10s %-10s %8s" % ("СЕССИЯ", "НАЧАЛО", "КОНЕЦ", "КАДРОВ"))
+        print("-" * 54)
+        for sid, tmin, tmax, n in sessions:
+            print("%-22s %-10s %-10s %8d" % (sid, _t(tmin), _t(tmax), n))
         sys.exit(0)
+
+    if opts["kills"]:
+        kills = db.get_kill_events(opts["session"])
+        if not kills:
+            print("Убийств не зафиксировано в этой сессии."); sys.exit(0)
+        by_name = {}
+        for k in kills:
+            by_name.setdefault(k["name"], []).append(k)
+        print("=" * 60)
+        print("Детект убийств (%d шт.)" % len(kills))
+        print("=" * 60)
+        print("%-28s %5s %8s %8s" % ("ИМЯ", "КОЛ.", "СРЕД.с", "СРЕД.HP"))
+        print("-" * 60)
+        for nm in sorted(by_name, key=lambda x: -len(by_name[x])):
+            ks = by_name[nm]
+            print("%-28s %5d %7.1fc %8d" % (
+                nm[:28], len(ks),
+                sum(k["duration_s"] for k in ks) / len(ks),
+                sum(k["hp_max"] for k in ks) // len(ks)))
+        sys.exit(0)
+
+    if opts["name"] is not None or opts["addr"] is not None:
+        hist = db.get_mob_history(name=opts["name"], addr=opts["addr"],
+                                  session_id=opts["session"])
+        if not hist:
+            who = ("name=%s" % opts["name"]) if opts["name"] else ("addr=0x%X" % opts["addr"])
+            print("Записей не найдено (%s)." % who); sys.exit(0)
+        print("=" * 72)
+        print("История моба: %s  (%d записей)" % (hist[0]["name"], len(hist)))
+        print("=" * 72)
+        step = max(1, len(hist) // 50)
+        print("%-9s %-9s %8s %8s %8s %8s" % ("ВРЕМЯ", "СТАТУС", "ADDR", "HP", "MAX", "ДИСТ"))
+        print("-" * 72)
+        for h in hist[::step]:
+            hp = h["hp_cur"] if h["hp_cur"] else "-"
+            mx = h["hp_max"] if h["hp_max"] else "-"
+            print("%-9s %-9s %8s %8s %8s %8.1f" % (
+                _t(h["ts"]), (h["status"] or "?")[:9],
+                ("0x%X" % h["addr"]) if h["addr"] else "-", hp, mx, h["dist"]))
+        sys.exit(0)
+
+    summary = db.get_session_summary(opts["session"])
+    if summary.get("empty"):
+        print("БД пуста (нет записей)."); sys.exit(0)
     print("=" * 64)
-    print("MonsterDB — сводка последней сессии")
+    print("MonsterDB — сводка сессии")
     print("=" * 64)
     print("Сессия:    %s" % summary["session_id"])
     print("Кадров:    %d" % summary["frames"])
@@ -343,6 +546,8 @@ if __name__ == "__main__":
         pct_s = ("%.0f%%" % (avg_pct * 100)) if avg_pct is not None else "-"
         print("  %-30s HPmax=%-7s avg=%-5s  %d кадр." % (
             name[:30], hp_s, pct_s, cnt))
+    kills = db.get_kill_events(summary["session_id"])
+    print("\n— Убийств детектировано: %d" % len(kills))
     print("\nУникальных имён всего: %d" % len(db.get_unique_names()))
 
 

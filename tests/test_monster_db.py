@@ -143,3 +143,106 @@ class TestEdgeCases:
         d.close()
 
 
+# --- История моба (get_mob_history) ---
+
+class TestMobHistory:
+    def test_history_by_name(self, db):
+        db.record_frame("A", [(_mob(eid=1, path="/Monsters/X/Runner", hp_cur=900), "combat")])
+        db.record_frame("A", [(_mob(eid=1, path="/Monsters/X/Runner", hp_cur=300), "combat")])
+        db.flush()
+        time.sleep(0.3)
+        hist = db.get_mob_history(name="Runner")
+        assert len(hist) == 2
+        assert hist[0]["name"] == "Runner"
+        assert hist[0]["hp_cur"] == 900
+        assert hist[1]["hp_cur"] == 300  # упорядочено по времени (убывание HP)
+
+    def test_history_by_addr(self, db):
+        db.record_frame("A", [(_mob(eid=12345, hp_cur=500), "combat")])
+        db.flush()
+        time.sleep(0.3)
+        hist = db.get_mob_history(addr=12345)
+        assert len(hist) == 1
+        assert hist[0]["addr"] == 12345
+
+    def test_history_empty_for_unknown(self, db):
+        db.record_frame("A", [(_mob(path="/Monsters/Z"), "combat")])
+        db.flush()
+        time.sleep(0.3)
+        hist = db.get_mob_history(name="Nonexistent")
+        assert hist == []
+
+    def test_history_has_status_and_dist(self, db):
+        db.record_frame("A", [(_mob(distance=15.5), "ghost_static")])
+        db.flush()
+        time.sleep(0.3)
+        hist = db.get_mob_history()
+        assert hist[0]["status"] == "ghost_static"
+        assert abs(hist[0]["dist"] - 15.5) < 0.01
+
+
+# --- Детект убийств (get_kill_events) ---
+
+class TestKillEvents:
+    def test_kill_on_dead_status(self, db):
+        # моб: combat → dead = убийство засчитано
+        db.record_frame("A", [(_mob(eid=1, hp_cur=800), "combat")])
+        db.record_frame("A", [(_mob(eid=1, hp_cur=0), "dead")])
+        db.flush()
+        time.sleep(0.3)
+        kills = db.get_kill_events()
+        assert len(kills) == 1
+        assert kills[0]["name"] == "Test"
+
+    def test_kill_on_disappear(self, db):
+        # моб был combat, потом исчез (последняя запись combat, дальше нет) = убийство
+        db.record_frame("A", [(_mob(eid=1, hp_cur=500), "combat")])
+        db.flush()
+        time.sleep(0.3)
+        kills = db.get_kill_events()
+        assert len(kills) == 1
+
+    def test_no_kill_if_never_combat(self, db):
+        # моб только ghost_static (бот не трогал) — НЕ убийство
+        db.record_frame("A", [(_mob(eid=1), "ghost_static")])
+        db.record_frame("A", [(_mob(eid=1, hp_cur=0), "dead")])
+        db.flush()
+        time.sleep(0.3)
+        kills = db.get_kill_events()
+        assert len(kills) == 0
+
+    def test_kill_aggregates_by_name(self, db):
+        # 3 разных моба (разные addr) одного имени — 3 убийства
+        for eid in (10, 20, 30):
+            db.record_frame("A", [(_mob(eid=eid), "combat")])
+            db.record_frame("A", [(_mob(eid=eid, hp_cur=0), "dead")])
+        db.flush()
+        time.sleep(0.3)
+        kills = db.get_kill_events()
+        assert len(kills) == 3
+        assert all(k["name"] == "Test" for k in kills)
+
+    def test_kill_duration(self, db):
+        # combat в t=0, dead в t=0.5 → duration ~0.5
+        db.record_frame("A", [(_mob(eid=1), "combat")])
+        time.sleep(0.5)
+        db.record_frame("A", [(_mob(eid=1, hp_cur=0), "dead")])
+        db.flush()
+        time.sleep(0.3)
+        kills = db.get_kill_events()
+        assert kills[0]["duration_s"] >= 0.4  # допускаем погрешность таймера
+
+
+# --- list_sessions ---
+
+class TestSessions:
+    def test_list_sessions(self, db):
+        db.record_frame("A", [(_mob(), "combat")])
+        db.flush()
+        time.sleep(0.3)
+        sessions = db.list_sessions()
+        assert len(sessions) == 1
+        assert sessions[0][0] == "test_session"
+        assert sessions[0][3] == 1  # frames
+
+
