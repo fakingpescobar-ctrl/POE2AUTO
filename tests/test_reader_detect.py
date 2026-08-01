@@ -20,11 +20,13 @@ def _make_detector(**overrides):
     det.static_grace_s = overrides.get("static_grace_s", 2.0)
     det.corpse_timeout_s = overrides.get("corpse_timeout_s", 30.0)
     det.death_grace_s = overrides.get("death_grace_s", 2.0)
+    det.kill_cooldown_s = overrides.get("kill_cooldown_s", 5.0)
     det.min_hp_threshold = overrides.get("min_hp_threshold", 0)
     det.attack_unknown_hp = overrides.get("attack_unknown_hp", True)
     det._static_track = overrides.get("_static_track", {})
     det._dead_track = overrides.get("_dead_track", {})
     det._player_fire_time = overrides.get("_player_fire_time", 0.0)
+    det.db = overrides.get("db", None)
     return det
 
 
@@ -321,6 +323,50 @@ class TestDeathGrace:
         now = time.perf_counter()
         det._dead_track = {1: now}
         e = _mob(eid=1, alive=True, hp_cur=800, hp_max=1000, dead_since=now)
+        assert det._classify_target(e) == TargetStatus.COMBAT
+
+
+# --- kill cooldown: don't attack recently killed mobs ---
+
+class TestKillCooldown:
+    def test_recently_killed_not_combat(self):
+        det = _make_detector(kill_cooldown_s=5.0)
+        now = time.perf_counter()
+
+        class FakeDB:
+            def get_recently_killed_addrs(self, cooldown_s):
+                return {1}
+
+        det.db = FakeDB()
+        e = _mob(eid=1, alive=True, hp_cur=800, hp_max=1000)
+        assert det._classify_target(e) == TargetStatus.DEAD
+
+    def test_old_kill_is_combat(self):
+        det = _make_detector(kill_cooldown_s=5.0)
+
+        class FakeDB:
+            def get_recently_killed_addrs(self, cooldown_s):
+                return set()  # no recently killed mobs
+
+        det.db = FakeDB()
+        e = _mob(eid=1, alive=True, hp_cur=800, hp_max=1000)
+        assert det._classify_target(e) == TargetStatus.COMBAT
+
+    def test_no_db_skips_cooldown(self):
+        det = _make_detector(kill_cooldown_s=5.0)
+        det.db = None
+        e = _mob(eid=1, alive=True, hp_cur=800, hp_max=1000)
+        assert det._classify_target(e) == TargetStatus.COMBAT
+
+    def test_zero_cooldown_disables(self):
+        det = _make_detector(kill_cooldown_s=0.0)
+
+        class FakeDB:
+            def get_recently_killed_addrs(self, cooldown_s):
+                return {1}
+
+        det.db = FakeDB()
+        e = _mob(eid=1, alive=True, hp_cur=800, hp_max=1000)
         assert det._classify_target(e) == TargetStatus.COMBAT
 
 

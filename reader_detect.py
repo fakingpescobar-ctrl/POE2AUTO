@@ -135,6 +135,10 @@ class ReaderMobDetector:
         # Grace period after dead_since: don't attack mobs that died
         # within this window (death animation, C# flag lag).
         self.death_grace_s = float(cfg.get("death_grace_s", 2.0))
+        # Kill cooldown: don't attack mobs that the bot recently killed
+        # (loot not yet picked up, death animation still playing).
+        # Uses MonsterDB kill tracking; only active when monster_db is enabled.
+        self.kill_cooldown_s = float(cfg.get("kill_cooldown_s", 5.0))
         # Порог HP: моб с hp_cur <= min_hp при hp_max>0 — LATENT (умирает/пустышка),
         # в атаку не идёт. Rare/Unique/боссы этим порогом не отсекаются.
         self.min_hp_threshold = int(cfg.get("min_hp_threshold", 0))
@@ -480,6 +484,14 @@ class ReaderMobDetector:
         # умер (исчез из кадра и вернулся). Не атакуем — анимация смерти.
         if entity.dead_since is not None:
             if (time.perf_counter() - entity.dead_since) < self.death_grace_s:
+                return TargetStatus.DEAD
+
+        # 1c) KILL COOLDOWN — моб был убит недавно (из monster_db).
+        # Не атакуем — дроп ещё не поднят / анимация смерти.
+        if self.db is not None and self.kill_cooldown_s > 0:
+            recently_killed = self.db.get_recently_killed_addrs(
+                cooldown_s=self.kill_cooldown_s)
+            if entity.id in recently_killed:
                 return TargetStatus.DEAD
 
         # 1a) UNREACHABLE - alive but different Z-level or too far.

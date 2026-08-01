@@ -410,6 +410,39 @@ class MonsterDB:
         kills.sort(key=lambda k: k["kill_ts"])
         return kills
 
+    def get_recently_killed_addrs(self, session_id: Optional[str] = None,
+                                    cooldown_s: float = 10.0) -> set:
+        """Адреса мобов, которых бот убил в последние cooldown_s секунд.
+
+        «Убийство» = моб был в COMBAT (бот атаковал), а затем
+        статус стал DEAD или моб исчез из записи.
+        Используется для kill cooldown: не атаковать недавно убитых
+        (дроп ещё не поднят, анимация смерти).
+
+        Returns:
+            Множество addr мобов, убитых недавно.
+        """
+        conn = self._connect_ro(self.path)
+        try:
+            sid = session_id
+            if sid is None:
+                row = conn.execute(
+                    "SELECT session_id FROM monster_events "
+                    "ORDER BY ts DESC LIMIT 1"
+                ).fetchone()
+                if not row:
+                    return set()
+                sid = row[0]
+            now = time.perf_counter()
+            cutoff = now - cooldown_s
+            rows = conn.execute(
+                "SELECT DISTINCT addr FROM monster_events "
+                "WHERE session_id = ? AND ts >= ? AND status = 'dead'",
+                (sid, cutoff)).fetchall()
+        finally:
+            conn.close()
+        return {r[0] for r in rows if r[0]}
+
     def list_sessions(self) -> List[Tuple[str, float, float, int]]:
         """Все сессии в БД: [(session_id, ts_min, ts_max, frames), ...] по убыванию."""
         conn = self._connect_ro(self.path)
