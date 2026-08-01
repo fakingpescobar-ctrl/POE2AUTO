@@ -54,18 +54,19 @@ class EntityData(NamedTuple):
     is_friendly: bool
     distance: float    # расстояние от игрока (в сетевых координатах)
     is_boss: bool = False
+    is_alive: bool = True
 
 
 class EntityReader:
     """Читает список сущностей из памяти PoE2."""
 
     # Метаданные для категоризации
-    MONSTER_PREFIXES = ("/Monsters/",)
+    MONSTER_PREFIXES = ("/Monsters/", "/Critters/")
     NPC_KEYWORDS = ("/NPC/",)
     PLAYER_KEYWORDS = ("/Characters/",)
     CHEST_KEYWORDS = ("/Chests",)
     TRANSITION_KEYWORDS = ("Transition",)
-    NON_COMBAT_KEYWORDS = ("MonsterMods", "Summoned", "/Daemon/", "Invisible")
+    NON_COMBAT_KEYWORDS = ("Summoned", "/Daemon/", "Invisible", "MonsterMods", "TormentedSpirit")
 
     def __init__(self, mem: GameMemory):
         self._mem = mem
@@ -80,28 +81,22 @@ class EntityReader:
         # Offset discovery system
         self._discovery = OffsetDiscovery(mem, self)
 
-    def read_entities(self, area_instance: int, player_pos: Optional[tuple] = None) -> List[EntityData]:
-        """Прочитать все активные сущности из AwakeEntities.
-        Возвращает список EntityData с позициями и HP.
-        """
+    def _read_entity_map(self, map_addr: int, player_pos: Optional[tuple]) -> List[EntityData]:
+        """Прочитать std::map сущностей (AwakeEntities или SleepingEntities)."""
         entities = []
-
-        # Читаем AwakeEntities (std::map)
-        map_addr = area_instance + off.AreaInstance.AWAKE_ENTITIES
         root_ptr = self._mem.read_pointer(map_addr)
         size = self._mem.read_uint(map_addr + 8)
         if not root_ptr or not size:
             return entities
 
-        # BFS по std::map (red-black tree)
-        head_ptr = root_ptr  # head points to sentinel node
-        root = self._mem.read_pointer(head_ptr + 0x08)  # parent of head = actual root
+        head_ptr = root_ptr
+        root = self._mem.read_pointer(head_ptr + 0x08)
         if not root:
             return entities
 
         queue = deque([root])
         visited = set()
-        max_iter = min(size * 2, 5000)  # safety limit
+        max_iter = min(size * 2, 5000)
 
         for _ in range(max_iter):
             if not queue:
@@ -111,8 +106,6 @@ class EntityReader:
                 continue
             visited.add(node)
 
-            # One read for the whole node — Left/Right/IsNil/KeyId/ValueEntityPtr are
-            # contiguous in 48 bytes, so this replaces 5 separate reads with one.
             node_data = self._mem.read_bytes(node, 48)
             if node_data is None or len(node_data) < 48:
                 continue
@@ -124,13 +117,11 @@ class EntityReader:
             key_id = struct.unpack("<I", node_data[0x20:0x24])[0]
             entity_ptr = struct.unpack("<Q", node_data[0x28:0x30])[0]
 
-            # Enqueue children
             if left and left != head_ptr:
                 queue.append(left)
             if right and right != head_ptr:
                 queue.append(right)
 
-            # Skip nil nodes and visual entities
             if is_nil:
                 continue
             if key_id >= off.VISUAL_ID_THRESHOLD:
@@ -138,11 +129,21 @@ class EntityReader:
             if not entity_ptr:
                 continue
 
-            # Read entity
             ed = self._read_entity(entity_ptr, key_id, player_pos)
             if ed is not None:
                 entities.append(ed)
 
+        return entities
+
+    def read_entities(self, area_instance: int, player_pos: Optional[tuple] = None) -> List[EntityData]:
+        """Прочитать все активные + спящие сущности.
+        Возвращает список EntityData с позициями и HP.
+        """
+        entities = []
+        entities.extend(self._read_entity_map(
+            area_instance + off.AreaInstance.AWAKE_ENTITIES, player_pos))
+        entities.extend(self._read_entity_map(
+            area_instance + off.AreaInstance.SLEEPING_ENTITIES, player_pos))
         return entities
 
     def find_area_instance(self, game_state: int) -> Optional[int]:
@@ -340,7 +341,7 @@ class EntityReader:
         }
 
         # Read first few entries (budget)
-        max_entries = 64
+        max_entries = 256
         for i in range(max_entries):
             entry_addr = bucket_ptr + i * off.ComponentLookUp.ENTRY_STRIDE
             entry_data = self._mem.read_bytes(entry_addr, off.ComponentLookUp.ENTRY_STRIDE)
@@ -480,11 +481,12 @@ class EntityReader:
                 return EntityCategory.NPC
 
         # Non-combat monsters
-        if "/Monsters/" in metadata:
-            for kw in self.NON_COMBAT_KEYWORDS:
-                if kw in metadata:
-                    return EntityCategory.OTHER
-            return EntityCategory.MONSTER
+        for mp in self.MONSTER_PREFIXES:
+            if mp in metadata:
+                for kw in self.NON_COMBAT_KEYWORDS:
+                    if kw in metadata:
+                        return EntityCategory.OTHER
+                return EntityCategory.MONSTER
 
         # Players
         for kw in self.PLAYER_KEYWORDS:

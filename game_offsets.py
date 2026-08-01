@@ -2,6 +2,10 @@
 
 Адаптировано из POE2GPS (Sikaka/POE2Radar, MIT).
 Оффсеты могут сдвигаться при патчах игры — проверяйте обновления.
+
+Обновление 2026-07-16: патч сдвинул AreaInstance на +0x20 (32 байта).
+LOCAL_PLAYER 0x5A0→0x5C0, AWAKE_ENTITIES 0x6C0→0x6E0.
+Подтверждено: Metadata читается, Entity+0x08→EntityDetails работает.
 """
 
 # AOB паттерны для поиска корневых указателей
@@ -33,11 +37,11 @@ class AreaInstance:
     AREA_INFO = 0x0A0              # → AreaInfo (UTF-16 area code)
     AREA_LEVEL = 0x0C4             # int: area level
     AREA_HASH = 0x11C              # uint: instance hash
-    SERVER_DATA = 0x580            # → ServerData (candidate)
-    LOCAL_PLAYER = 0x5A0           # ✓ → Entity (local player)
-    AWAKE_ENTITIES = 0x6C0         # ✓ StdMap: live entity map
-    SLEEPING_ENTITIES = 0x6D0      # ✓ StdMap: inactive entities
-    TERRAIN_METADATA = 0x8A0       # ✓ → TerrainStruct
+    SERVER_DATA = 0x5A0            # → ServerData (candidate, shifted +0x20)
+    LOCAL_PLAYER = 0x5C0           # ✓ → Entity (local player, shifted +0x20)
+    AWAKE_ENTITIES = 0x6E0         # ✓ StdMap: live entity map (shifted +0x20)
+    SLEEPING_ENTITIES = 0x6F0      # ✓ StdMap: inactive entities (shifted +0x20)
+    TERRAIN_METADATA = 0x8C0       # ✓ → TerrainStruct (shifted +0x20)
 
 class Entity:
     DETAILS_PTR = 0x08             # → EntityDetails
@@ -60,11 +64,11 @@ class Render:
 class Life:
     """Life component. Owner @ +0x08 (back-pointer to entity).
     VitalStruct: ReservedFlat@0x10, ReservedFraction@0x14, Regen@0x28, Max@0x2C, Current@0x30.
-    Layout validated live 2026-06-04 (was 0x1A8/0x1F8/0x230 pre-patch → now 0x1B0/0x208/0x248)."""
+    Patch 2026-07-29: Life internal layout shifted (0x1B0→0x1D8, 0x208→0x1DC/?, 0x248→0x1E8)."""
     OWNER = 0x008                  # back-pointer to entity
-    HEALTH = 0x1B0                 # ✓ VitalStruct (was 0x1A8 pre-patch)
-    MANA = 0x208                   # ✓ VitalStruct (was 0x1F8 pre-patch)
-    ENERGY_SHIELD = 0x248          # ✓ VitalStruct (was 0x230 pre-patch)
+    HEALTH = 0x1B0                 # ✓ VitalStruct — Sikaka POE2Radar live offset
+    MANA = 0x208                   # VitalStruct — Sikaka POE2Radar live offset
+    ENERGY_SHIELD = 0x248          # VitalStruct — Sikaka POE2Radar live offset
 
 class VitalStruct:
     """MSVC x64 VitalStruct — 0x34 bytes total.
@@ -129,3 +133,4 @@ COMPONENT_MINIMAP_ICON = "MinimapIcon"
 COMPONENT_CHEST = "Chest"
 COMPONENT_MONSTER = "Monster"
 COMPONENT_TARGETABLE = "Targetable"
+

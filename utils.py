@@ -1,10 +1,11 @@
-"""Общие утилиты: Toggle (потокобезопасный флаг), build_detector."""
+"""Общие утилиты: Toggle (потокобезопасный флаг), build_detector, build_loot_engine."""
 from __future__ import annotations
 
 import threading
 from typing import Any, Dict, List
 
 from color_detector import ColorDetector
+from loot_engine import LootEngine
 
 
 class Toggle:
@@ -35,4 +36,15 @@ def build_detector(cfg: Dict[str, Any]) -> ColorDetector:
         val_min=v.get("val_min", 120),
         min_blob_area=v.get("min_blob_area", 200),
         close_px=v.get("close_px", 3),
+    )
+
+
+def build_loot_engine(loot: Dict[str, Any]) -> LootEngine:
+    """Построить LootEngine из секции loot конфига."""
+    return LootEngine(
+        loot["pickup_radius_px"],
+        loot["center_offset_xy"],
+        loot["cooldown_ms"],
+        radius_frac=loot.get("radius_frac", 0),
+        priority_mode=loot.get("priority_mode", "size"),
     )

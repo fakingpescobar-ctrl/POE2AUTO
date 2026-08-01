@@ -8,3 +8,4 @@ pywin32>=306
 PyYAML>=6.0
 Pillow>=10.0
 pynput>=1.7
+pythonnet>=3.0

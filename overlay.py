@@ -33,6 +33,7 @@ C_DIM = "#7a7a88"
 C_ON = "#46d369"
 C_OFF = "#5a5a66"
 C_WARN = "#ff5d5d"
+C_RADIAL_BG = "#010101"  # цвет фона radial-окна (прозрачный через transparentcolor)
 
 _GWL_EXSTYLE = -20
 _WS_EX_LAYERED = 0x00080000
@@ -64,6 +65,24 @@ class OverlayState:
         self.debug_hp = ""          # "num=1200/1371 orb=0.88 src=num streak=0"
         self.debug_mob = ""         # "mob=CV dark=no match=strict(45,12,8.2,0.7)"
         self.debug_zone = ""        # "zone=ok range=15.0"
+        self.memory_status = "off"  # "ok" | "fallback" | "off" — memory-режим атаки/фляги
+        self.attack_mode = ""      # "MEM" | "CV" | "" — текущий режим детекции автоатаки
+        self.atk_fallback = ""     # причина фолбэка memory→CV, пусто если нет
+        # Индикаторы модуля памяти (для нижней строки оверлея).
+        # mem_connected — процесс PoE2 найден и подключён (OpenProcess handle есть)
+        # mem_reading   — память реально читается (game_state != 0, данные идут)
+        self.mem_connected = False
+        self.mem_reading = False
+        # Счётчики сущностей (для понимания что видит ридер)
+        self.ent_total = 0       # всего сущностей в зоне
+        self.ent_hostile = 0     # враждебных мобов всего
+        self.ent_in_range = 0    # враждебных в радиусе атаки
+        self.nearest_dist = None  # distance до ближайшего враждебного моба (grid), None если нет
+        # Наглядный круг радиуса авто-атаки вокруг персонажа (хоткей radial, F4)
+        self.radial_visible = False  # показывать круг радиуса поверх игры
+        self.attack_range = 0.0      # текущий attack_range (grid) — для радиуса круга
+        self.radial_scale = 20.0     # px на 1 grid (масштаб экрана, калибруется)
+        self.radial_center = (0, 0)  # смещение персонажа от центра окна (px), из radial.center_offset_xy
 
 
 def _hp_color(pct):
@@ -88,6 +107,8 @@ class Overlay:
         self._visible = True
         self._stop = False
         self._rows = {}
+        self._rad = None          # radial-окно (круг радиуса поверх игры)
+        self._rad_canvas = None
 
     def start(self):
         if not HAS_TK:
@@ -162,17 +183,31 @@ class Overlay:
         k_overlay = hk.get("overlay", "f6").upper()
         k_quit = hk.get("quit", "f12").upper()
         k_flask = hk.get("flask", "f3").upper()
+        k_radial = hk.get("radial", "f4").upper()
         self._rows["loot"] = self._status_row(pad, "Авто-подбор", k_toggle)
         self._rows["attack"] = self._status_row(pad, "Авто-атака", k_attack)
+        self._rows["attack_mode"] = self._status_row(pad, "Режим", "")
         self._rows["flask"] = self._status_row(pad, "Авто-фляска", k_flask)
         self._rows["locate"] = self._status_row(pad, "Калибровка HUD", "")
         self._rows["diag"] = self._status_row(pad, "Диагностика", k_diag)
+        self._rows["radial"] = self._status_row(pad, "Радиус", k_radial)
 
         tk.Frame(pad, bg="#2a2a34", height=1).pack(fill="x", pady=(8, 6))
 
-        self._rows["stats"] = tk.Label(pad, text="", bg=C_PANEL, fg=C_DIM,
+        # stats-строка: основной stats слева + memory-индикатор справа (свой цвет)
+        stats_row = tk.Frame(pad, bg=C_PANEL)
+        stats_row.pack(fill="x")
+        self._rows["stats"] = tk.Label(stats_row, text="", bg=C_PANEL, fg=C_DIM,
                                        font=("Consolas", 9), anchor="w", justify="left")
-        self._rows["stats"].pack(fill="x")
+        self._rows["stats"].pack(side="left")
+        self._rows["stats_mem"] = tk.Label(stats_row, text="", bg=C_PANEL, fg=C_DIM,
+                                           font=("Consolas", 9), anchor="e", justify="right")
+        self._rows["stats_mem"].pack(side="right")
+
+        # вторая строка: счётчики сущностей (entities/mobs/nearest) — только для memory-режима
+        self._rows["stats_ent"] = tk.Label(pad, text="", bg=C_PANEL, fg=C_DIM,
+                                           font=("Consolas", 9), anchor="w", justify="left")
+        self._rows["stats_ent"].pack(fill="x")
 
         self._rows["notif"] = tk.Label(pad, text="", bg=C_PANEL, fg=C_WARN,
                                        font=("Segoe UI Semibold", 9), anchor="w")
@@ -185,13 +220,33 @@ class Overlay:
         self._rows["debug_zone"] = tk.Label(pad, text="", bg=C_PANEL, fg=C_DIM,
                                             font=("Consolas", 8), anchor="w", justify="left")
 
-        tk.Label(pad, text=f"{k_toggle} лут · {k_attack} атака · {k_flask} фляга · {k_diag} диаг · "
-                            f"{k_shot} снимок · {k_overlay} скрыть · {k_quit} выход",
+        tk.Label(pad, text=f"{k_toggle} лут · {k_attack} атака · {k_flask} фляга · {k_radial} радиус · "
+                            f"{k_diag} диаг · {k_shot} снимок · {k_overlay} скрыть · {k_quit} выход",
                  bg=C_PANEL, fg=C_DIM, font=("Segoe UI", 8)).pack(fill="x", pady=(8, 0))
 
         # click-through + не воровать фокус
         root.update_idletasks()
         self._make_click_through()
+
+        # radial-окно: прозрачный canvas поверх игрового региона, рисует круг
+        # радиуса авто-атаки (хоткей radial, F4). Чёрный цвет = прозрачный
+        # (transparentcolor), сам круг цветной. Клики проходят в игру.
+        rad = tk.Toplevel(root)
+        rad.overrideredirect(True)
+        rad.attributes("-topmost", True)
+        reg = self.region
+        rad.geometry(f"{reg['width']}x{reg['height']}+{reg['left']}+{reg['top']}")
+        rad.configure(bg=C_RADIAL_BG)
+        try:
+            rad.attributes("-transparentcolor", C_RADIAL_BG)
+        except Exception:                       # pragma: no cover
+            _log.debug("transparentcolor не поддержан — radial фон непрозрачен")
+        self._rad_canvas = tk.Canvas(rad, bg=C_RADIAL_BG, highlightthickness=0)
+        self._rad_canvas.pack(fill="both", expand=True)
+        self._rad = rad
+        rad.withdraw()
+        root.update_idletasks()
+        self._apply_click_through(rad)
 
         self._tick()
         try:
@@ -216,10 +271,15 @@ class Overlay:
     def _make_click_through(self):
         if not _HAS_CTYPES:
             return
+        self._apply_click_through(self._root)
+
+    def _apply_click_through(self, win):
+        if not _HAS_CTYPES:
+            return
         try:
-            hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
+            hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
             if not hwnd:
-                hwnd = self._root.winfo_id()
+                hwnd = win.winfo_id()
             user32 = ctypes.windll.user32
             ex = user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
             ex |= (_WS_EX_LAYERED | _WS_EX_TRANSPARENT
@@ -269,9 +329,79 @@ class Overlay:
         self._set(self._rows["diag"], s.diag, "ON" if s.diag else "OFF",
                   C_WARN if s.diag else C_OFF)   # диаг подсвечиваем как «внимание» (тормозит)
 
+        # Радиус (круг F4): показывает включён ли показ круга и текущий attack_range
+        if s.radial_visible:
+            self._set(self._rows["radial"], True,
+                      f"R={getattr(s, 'attack_range', 0.0):.0f}", C_ON)
+        else:
+            self._set(self._rows["radial"], False, "OFF", C_OFF)
+
+        # Режим детекции автоатаки
+        if s.attack_enabled and s.attack_on:
+            if s.attack_mode == "MEM":
+                mode_text = "MEM 🧠"
+                mode_color = C_ON
+            elif s.attack_mode == "RDR":
+                mode_text = "RDR 🔌"
+                mode_color = C_ON
+            elif s.attack_mode == "EC2":
+                mode_text = "EC2 🌐"
+                mode_color = C_ON
+            elif s.attack_mode == "CV":
+                mode_text = "CV 👁"
+                mode_color = C_ACCENT
+            else:
+                mode_text = "—"
+                mode_color = C_DIM
+            if s.atk_fallback:
+                mode_text += " (fallback)"
+                mode_color = C_WARN
+            self._set(self._rows["attack_mode"], True, mode_text, mode_color)
+        elif s.attack_enabled:
+            self._set(self._rows["attack_mode"], True, s.attack_mode or "—", C_DIM)
+        else:
+            self._set(self._rows["attack_mode"], False, "—", C_DIM)
+
         self._rows["focus"].config(fg=C_ON if s.foreground else C_OFF)
-        self._rows["stats"].config(
-            text=f"фляг:{s.flasks}  подбор:{s.presses}  fps:{s.fps:.0f}")
+        # Основной stats (левый Label): фляги/подбор/fps — без индикаторов памяти.
+        stats = f"фляг:{s.flasks}  подбор:{s.presses}  fps:{s.fps:.0f}"
+        self._rows["stats"].config(text=stats)
+
+        # Memory-индикатор (правый Label): показывает состояние модуля памяти.
+        # Показывается только для memory-режимов (RDR/MEM/EC2), для CV — скрыт.
+        mode_tag = s.attack_mode if s.attack_mode in ("RDR", "MEM", "EC2") else ""
+        if mode_tag:
+            if s.mem_connected and s.mem_reading:
+                # Всё работает: процесс подключён + память читается → зелёный.
+                mem_text = f"{mode_tag} inj✓ mem✓"
+                mem_color = C_ON
+            elif s.mem_connected:
+                # Подключились к процессу, но память не читается (игра в меню/loading) → жёлтый.
+                mem_text = f"{mode_tag} inj✓ mem✗"
+                mem_color = C_ACCENT
+            else:
+                # Процесс не найден / OpenProcess не прошёл → красный.
+                mem_text = f"{mode_tag} inj✗"
+                mem_color = C_WARN
+            self._rows["stats_mem"].config(text=mem_text, fg=mem_color)
+        else:
+            # CV-режим или режим не определён — индикатор памяти скрыт.
+            self._rows["stats_mem"].config(text="", fg=C_DIM)
+
+        # Счётчики сущностей (вторая строка) — только для memory-режима.
+        if mode_tag:
+            nd = f"{s.nearest_dist:.0f}" if s.nearest_dist is not None else "-"
+            ent_text = f"сущностей:{s.ent_total}  мобов:{s.ent_hostile}  в_радиусе:{s.ent_in_range}  ближ.дист:{nd}"
+            # Цвет: есть мобы в радиусе → зелёный, есть мобы но не в радиусе → жёлтый, нет → серый
+            if s.ent_in_range > 0:
+                ent_color = C_ON
+            elif s.ent_hostile > 0:
+                ent_color = C_ACCENT
+            else:
+                ent_color = C_DIM
+            self._rows["stats_ent"].config(text=ent_text, fg=ent_color)
+        else:
+            self._rows["stats_ent"].config(text="", fg=C_DIM)
 
         import time as _time
         if s.notification and _time.time() < s.notification_until:
@@ -294,7 +424,39 @@ class Overlay:
         elif self._visible and s.foreground:
             self._root.deiconify()
 
+        self._update_radial(s)
+
         try:
             self._root.after(150, self._tick)
         except Exception:
             pass
+
+    def _update_radial(self, s):
+        """Круг радиуса авто-атаки вокруг персонажа (хоткей radial, F4)."""
+        if self._rad is None:
+            return
+        want = bool(s.radial_visible) and bool(s.foreground)
+        if not want:
+            if self._rad.winfo_viewable():
+                self._rad.withdraw()
+            return
+        if not self._rad.winfo_viewable():
+            self._rad.deiconify()
+        c = self._rad_canvas
+        c.delete("all")
+        r = float(getattr(s, "attack_range", 0.0) or 0.0)
+        if r <= 0:
+            return
+        scale = float(getattr(s, "radial_scale", 20.0) or 20.0)
+        off = getattr(s, "radial_center", None) or (0, 0)
+        w = self.region["width"]
+        h = self.region["height"]
+        cx = w / 2.0 + float(off[0])
+        cy = h / 2.0 + float(off[1])
+        rx = r * scale
+        ry = rx / 2.0  # изометрия PoE2: вертикаль экрана сжата вдвое
+        color = C_ACCENT
+        c.create_oval(cx - rx, cy - ry, cx + rx, cy + ry, outline=color, width=2)
+        c.create_text(cx, cy - ry - 10, text=f"R={r:.0f}", fill=color,
+                      font=("Consolas", 11, "bold"))
+        c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=color, outline="")

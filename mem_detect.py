@@ -43,6 +43,7 @@ class MemoryMobDetector:
         self._area_instance = 0
         self._game_state = 0
         self._player_pos = (0.0, 0.0)
+        self._player_hp = None
         self._area_code = ""
         self._last_entities: List[EntityData] = []
         self._last_update = 0.0
@@ -50,8 +51,12 @@ class MemoryMobDetector:
         self._resolve_failures = 0
         self._max_resolve_failures = 3  # после 3 неудач — откат на CV
         self._last_resolve = 0.0
+        self._igs_ptr = 0  # кеш AOB-цепочки
         self._hideout_cache = None  # (area_instance, result)
         self._hideout_cache_ts = 0.0
+
+        # Совместимость с MobBarDetector (allows `if det.last_match`)
+        self.last_match = None
 
         # Статистика
         self.stats = {
@@ -130,20 +135,39 @@ class MemoryMobDetector:
                 if life_addr:
                     self.reader.validate_offsets(life_addr)
 
-        # Читаем позицию игрока
+        # Читаем позицию и HP игрока
         player = self.reader.read_local_player(self._area_instance)
         if player:
             self._player_pos = (player.grid_x, player.grid_y)
+            self._player_hp = (player.hp_current, player.hp_max)
 
         # Читаем сущности
         entities = self.reader.read_entities(self._area_instance, self._player_pos)
         self._last_entities = entities
 
         # Статистика
-        hostile = [e for e in entities
-                   if e.category == EntityCategory.MONSTER
-                   and not e.is_friendly
-                   and e.hp_current > 0]
+        monsters_alive = [e for e in entities
+                          if e.category == EntityCategory.MONSTER
+                          and not e.is_friendly
+                          and e.hp_current > 0]
+
+        # Sanity: если >80% живых монстров имеют одинаковый HP — оффсет Vital сломан
+        # (билды с Ward/LowLife, плейсхолдеры после патча)
+        hp_counts = {}
+        for e in monsters_alive:
+            key = (e.hp_current, e.hp_max)
+            hp_counts[key] = hp_counts.get(key, 0) + 1
+        most_common_hp = max(hp_counts, key=hp_counts.get) if hp_counts else None
+        most_common_count = hp_counts.get(most_common_hp, 0) if most_common_hp else 0
+        hp_broken = (len(monsters_alive) > 3
+                     and most_common_count > len(monsters_alive) * 0.8)
+
+        if hp_broken:
+            hostile = []
+            _log.warning("HP offset похоже сломан: %d/%d монстров имеют hp=%s — отключаю memory детект",
+                         most_common_count, len(monsters_alive), most_common_hp)
+        else:
+            hostile = monsters_alive
         in_range = [e for e in hostile if e.distance <= self.attack_range]
         self.stats["total_entities"] = len(entities)
         self.stats["hostile_in_range"] = len(in_range)
@@ -219,14 +243,16 @@ class MemoryMobDetector:
         Возвращает (hp_pct, mana_pct) или (None, None)."""
         if not self._area_instance or not self.reader:
             return None, None
-        player = self.reader.read_local_player(self._area_instance)
-        if not player:
-            return None, None
 
         import game_offsets as off
         import struct
 
-        comps = self.reader._resolve_components(player)
+        player_ptr = self.reader._mem.read_pointer(
+            self._area_instance + off.AreaInstance.LOCAL_PLAYER
+        )
+        if not player_ptr:
+            return None, None
+        comps = self.reader._resolve_components(player_ptr)
         life_addr = comps.get(off.COMPONENT_LIFE)
         if not life_addr:
             return None, None
@@ -347,16 +373,39 @@ class MemoryMobDetector:
     # --- Internal ---
 
     def _resolve_game_state(self):
-        """Найти GameState → AreaInstance через AOB scan."""
+        """Найти AreaInstance. Кеширует AOB-цепочку — сканирует один раз."""
         if not self.mem.connected:
             return
 
-        # AOB scan для GameStates
+        import struct
+
+        # Если кеш есть — резолвим AreaInstance без AOB
+        if self._igs_ptr:
+            igs = self._igs_ptr
+            area_inst = self.mem.read_pointer(igs + off.InGameState.AREA_INSTANCE)
+            if area_inst and area_inst > 0x10000:
+                vtable = self.mem.read_pointer(area_inst)
+                if vtable and self.mem._base <= vtable <= self.mem._base + self.mem._size:
+                    player = self.mem.read_pointer(area_inst + off.AreaInstance.LOCAL_PLAYER)
+                    if player and player > 0x10000:
+                        if area_inst != self._area_instance:
+                            _log.info("AreaInstance changed: 0x%X → 0x%X",
+                                      self._area_instance, area_inst)
+                            self._area_instance = area_inst
+                            self.reader.clear_cache()
+                            self._on_zone_change(area_inst)
+                        self._resolve_failures = 0
+                        return
+
+            # Кеш протух — сброс
+            _log.info("Cached chain stale, re-scanning AOB...")
+            self._igs_ptr = 0
+
+        # AOB scan (один раз)
         pattern_info = off.AOB_PATTERNS.get("game_states")
         if not pattern_info:
             _log.error("No AOB pattern for game_states")
             return
-
         pattern, wildcards, disp_off, instr_len, desc = pattern_info
 
         try:
@@ -369,46 +418,39 @@ class MemoryMobDetector:
         if not matches:
             self._resolve_failures += 1
             if self._resolve_failures >= self._max_resolve_failures:
-                _log.warning("AOB scan failed %d times — memory detection unavailable "
-                             "(offsets may need updating for this PoE2 version)",
+                _log.warning("AOB scan failed %d times — memory detection unavailable",
                              self._resolve_failures)
             return
 
-        # Try each AOB match and validate
         old_area = self._area_instance
-        self._area_instance = 0
         for match_addr in matches:
-            # Resolve RIP-relative displacement
             next_instr = match_addr + instr_len
             disp_data = self.mem.read_bytes(match_addr + disp_off, 4)
             if disp_data is None:
                 continue
-
-            import struct
             displacement = struct.unpack("<i", disp_data)[0]
             slot_addr = next_instr + displacement
-
-            # Dereference slot → GameState
             game_state = self.mem.read_pointer(slot_addr)
             if not game_state or game_state < 0x10000:
                 continue
-
-            # GameState → InGameState → AreaInstance → Player
+            igs = self.mem.read_pointer(self.mem.read_pointer(game_state + 0x08))
+            if not igs:
+                continue
             area_inst = self.reader.find_area_instance(game_state)
             if not area_inst or area_inst < 0x10000:
                 continue
-
-            # Validate: AreaInstance must have a valid player entity
+            vtable = self.mem.read_pointer(area_inst)
+            if not vtable or not (self.mem._base <= vtable <= self.mem._base + self.mem._size):
+                continue
             player = self.mem.read_pointer(area_inst + off.AreaInstance.LOCAL_PLAYER)
             if not player or player < 0x10000:
                 continue
-
-            # Validate: player metadata must start with "Metadata/" or "data/"
-            meta = self.reader._get_metadata(player)
-            if not meta or not ("Metadata/" in meta or "data/" in meta):
+            player_vtable = self.mem.read_pointer(player)
+            if not player_vtable or not (self.mem._base <= player_vtable <= self.mem._base + self.mem._size):
                 continue
 
-            # Found valid chain!
+            # Валидная цепочка — кешируем
+            self._igs_ptr = igs
             self._game_state = game_state
             self._resolve_failures = 0
 
@@ -416,21 +458,147 @@ class MemoryMobDetector:
                 _log.info("AreaInstance changed: 0x%X → 0x%X", self._area_instance, area_inst)
                 self._area_instance = area_inst
                 self.reader.clear_cache()
+                self._on_zone_change(area_inst)
+            return
 
-                # Re-scan offsets для новой зоны
-                player = self.mem.read_pointer(area_inst + off.AreaInstance.LOCAL_PLAYER)
-                if player:
+        _log.warning("No valid GameState chain found in AOB matches (%d matches tried)",
+                      len(matches))
+        self._resolve_failures += 1
+
+        # Self-healing
+        if self._resolve_failures <= self._max_resolve_failures:
+            healed = self._heal_offsets(self._game_state, self._area_instance)
+            if healed:
+                _log.info("Self-heal: AreaInstance found via heuristic")
+                return
+
+        if self._resolve_failures >= self._max_resolve_failures:
+            _log.warning("AOB scan failed %d times — memory detection unavailable",
+                         self._resolve_failures)
+
+    def _on_zone_change(self, area_inst: int):
+        """Re-scan offsets при смене зоны."""
+        if not self.reader:
+            return
+        player = self.mem.read_pointer(area_inst + off.AreaInstance.LOCAL_PLAYER)
+        if player:
+            comps = self.reader._resolve_components(player)
+            life_addr = comps.get("Life")
+            if life_addr:
+                self.reader.force_rescan(life_addr)
+                _log.info("Offset re-scan triggered for new zone (Life=0x%X)", life_addr)
+        info = self.reader.read_area_info(area_inst)
+        _log.info("Zone: %s level=%d hash=%d",
+                  info.get("code", "?"), info.get("level", 0), info.get("hash", 0))
+
+    def _heal_offsets(self, game_state: int, old_area: int) -> bool:
+        """Self-healing: brute-force key offsets around defaults when static chain fails.
+
+        Tries three tiers:
+          1. Wide brute-force InGameState.AREA_INSTANCE ±256 + AreaInstance.LOCAL_PLAYER ±256
+          2. OffsetScanner (full discovery engine)
+          3. Area brute-force with area code validation
+        """
+        _log.info("Self-healing AOB chain: trying tier-1 brute-force...")
+
+        # Tier 1: wide brute-force
+        for area_off_shift in range(-256, 257, 8):
+            area_off = off.InGameState.AREA_INSTANCE + area_off_shift
+            if area_off < 0 or area_off > 0xFFFF:
+                continue
+            in_game = self.mem.read_pointer(game_state + 0x08)
+            if not isinstance(in_game, int) or not in_game:
+                continue
+            area_inst = self.mem.read_pointer(in_game + area_off)
+            if not isinstance(area_inst, int) or not area_inst or area_inst < 0x10000:
+                continue
+
+            # Validate area code at +0x0A0 (faster than checking every player offset)
+            code_ptr = self.mem.read_pointer(area_inst + off.AreaInstance.AREA_INFO)
+            if not code_ptr:
+                continue
+            code = self.mem.read_std_wstring(code_ptr)
+            if not code or len(code) < 2 or not code[0].isalpha():
+                continue
+
+            for lp_off_shift in range(-256, 257, 8):
+                lp_off = off.AreaInstance.LOCAL_PLAYER + lp_off_shift
+                if lp_off < 0 or lp_off > 0xFFFF:
+                    continue
+                player = self.mem.read_pointer(area_inst + lp_off)
+                if not isinstance(player, int) or not player or player < 0x10000:
+                    continue
+
+                meta = self.reader._get_metadata(player)
+                if meta and ("Metadata/" in meta or "data/" in meta):
+                    _log.info(
+                        "Tier-1 SUCCESS: InGameState.AREA_INSTANCE=0x%X (shift=+%d), "
+                        "AreaInstance.LOCAL_PLAYER=0x%X (shift=+%d) area=%s",
+                        area_off, area_off_shift, lp_off, lp_off_shift, code
+                    )
+                    return self._apply_healed_offsets(
+                        game_state, area_inst, area_off, lp_off, old_area, player
+                    )
+
+        # Tier 2: OffsetScanner full discovery
+        _log.info("Tier-1 failed. Trying tier-2: OffsetScanner...")
+        try:
+            from offset_scanner import OffsetScanner
+            scanner = OffsetScanner()
+            result = scanner.scan()
+            if result.confidence > 0 and result.area_instance:
+                self._game_state = result.game_state
+                self._area_instance = result.area_instance
+                # Update runtime offsets
+                if result.area_instance_offset:
+                    off.InGameState.AREA_INSTANCE = result.area_instance_offset
+                if result.local_player_offset:
+                    off.AreaInstance.LOCAL_PLAYER = result.local_player_offset
+                if result.awake_entities_offset:
+                    off.AreaInstance.AWAKE_ENTITIES = result.awake_entities_offset
+                if result.health_offset:
+                    off.Life.HEALTH = result.health_offset
+                if result.mana_offset:
+                    off.Life.MANA = result.mana_offset
+                if result.es_offset:
+                    off.Life.ENERGY_SHIELD = result.es_offset
+
+                self._resolve_failures = 0
+                player = self.mem.read_pointer(
+                    result.area_instance + off.AreaInstance.LOCAL_PLAYER
+                )
+                if player and result.area_instance != old_area:
+                    self.reader.clear_cache()
                     comps = self.reader._resolve_components(player)
                     life_addr = comps.get("Life")
                     if life_addr:
                         self.reader.force_rescan(life_addr)
-                        _log.info("Offset re-scan triggered for new zone (Life=0x%X)", life_addr)
+                _log.info("OffsetScanner healed all offsets")
+                return True
+        except Exception as e:
+            _log.warning("OffsetScanner error: %s", e)
 
-                # Read area info
-                info = self.reader.read_area_info(area_inst)
-                _log.info("Zone: %s level=%d hash=%d",
-                          info.get("code", "?"), info.get("level", 0), info.get("hash", 0))
-            return
+        _log.warning("Self-heal failed: no valid offset combination found")
+        return False
 
-        _log.warning("No valid GameState chain found in AOB matches")
-        self._resolve_failures += 1
+    def _apply_healed_offsets(self, game_state, area_inst, area_off, lp_off,
+                               old_area, player) -> bool:
+        """Apply healed offsets and re-init."""
+        old_ai = off.InGameState.AREA_INSTANCE
+        old_lp = off.AreaInstance.LOCAL_PLAYER
+        off.InGameState.AREA_INSTANCE = area_off
+        off.AreaInstance.LOCAL_PLAYER = lp_off
+
+        self._game_state = game_state
+        self._area_instance = area_inst
+        self._resolve_failures = 0
+        if area_inst != old_area:
+            self.reader.clear_cache()
+            comps = self.reader._resolve_components(player)
+            life_addr = comps.get("Life")
+            if life_addr:
+                self.reader.force_rescan(life_addr)
+
+        _log.info("Offsets applied: AREA_INSTANCE 0x%X→0x%X, LOCAL_PLAYER 0x%X→0x%X",
+                  old_ai, area_off, old_lp, lp_off)
+        return True

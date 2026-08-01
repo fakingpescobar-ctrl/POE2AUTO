@@ -28,7 +28,6 @@ from pynput import keyboard
 from config import load_config, save_config
 from screen import ScreenCapture
 from window import GameWindow
-from loot_engine import LootEngine
 from hp_detector import HPDetector
 from hp_engine import HPEngine, HPDecision
 from hp_ocr import HPNumReader
@@ -36,12 +35,14 @@ from hp_locate import find_digits_roi, derive_orb
 from mob_bar import MobBarDetector
 from zone_detector import ZoneDetector
 from mem_detect import MemoryMobDetector
+from ec2_detect import EC2MobDetector
+from reader_detect import ReaderMobDetector
 from diag_dump import HPDiag, dump_loot, dump_attack_trigger
 from overlay import Overlay, OverlayState
 from auto_flask import AutoFlaskEngine, FlaskRule, FlaskState, FlaskDecision, default_rules
 from virtual_xbox import VirtualXbox360, XUSB
 from dualsense_bridge import DualSenseBridge
-from utils import Toggle, build_detector
+from utils import Toggle, build_detector, build_loot_engine
 
 LOG_PATH = os.path.join(os.path.dirname(__file__), "bot.log")
 
@@ -119,23 +120,26 @@ class LootWorker(threading.Thread):
 class AttackWorker(threading.Thread):
     """Детект мобов в отдельном потоке. Поддерживает CV (MobBarDetector) и память (MemoryMobDetector)."""
 
-    def __init__(self, mob_det, zone_det=None, use_memory=False):
+    def __init__(self, mob_det, zone_det=None, use_memory=False, cv_det=None):
         super().__init__(daemon=True)
         self._cfg_lock = threading.Lock()
         self.mob_det = mob_det
         self.zone_det = zone_det
         self.use_memory = use_memory
+        self.cv_det = cv_det
         self._frame_q: queue.Queue = queue.Queue(maxsize=1)
         self._result: Optional[Dict[str, Any]] = None
         self._result_lock = threading.Lock()
         self._stop_event = threading.Event()
+        self.last_cv: Optional[bool] = None  # последний результат CV-подтверждения
 
-    def update_config(self, mob_det, zone_det, use_memory):
+    def update_config(self, mob_det, zone_det, use_memory, cv_det=None):
         """Обновить конфигурацию потокобезопасно."""
         with self._cfg_lock:
             self.mob_det = mob_det
             self.zone_det = zone_det
             self.use_memory = use_memory
+            self.cv_det = cv_det
 
     def submit(self, full_frame=None, foreground=True):
         """Отправить кадр на обработку (неблокирующе). Для memory-детекта frame не нужен."""
@@ -171,6 +175,9 @@ class AttackWorker(threading.Thread):
                     mob_det.update()
                     in_hideout = mob_det.in_hideout()
                     if not in_hideout:
+                        # «Живость» мобов определяется в reader_detect по Life-vtable
+                        # (трупы/латентные сущности отсекаются на уровне парсинга),
+                        # поэтому CV-подтверждение не нужно.
                         mob_present = mob_det.present()
                 elif mob_det is not None and foreground:
                     in_hideout = zone_det is not None and zone_det.in_hideout(full_frame)
@@ -208,11 +215,11 @@ def main() -> int:
                     "Гейт по фокусу отключён.", region)
     cap = ScreenCapture(cfg["capture"]["backend"])
     det = build_detector(cfg)
-    engine = LootEngine(loot["pickup_radius_px"], loot["center_offset_xy"],
-                        loot["cooldown_ms"],
-                        priority_mode=loot.get("priority_mode", "size"))
-    log.info("Детектор: цвета=%s радиус=%d кулдаун=%dмс",
-             det.colors, engine.radius_px, loot["cooldown_ms"])
+    engine = build_loot_engine(loot)
+    r_desc = (f"frac={loot['radius_frac']}" if loot.get("radius_frac", 0) > 0
+              else f"{loot['pickup_radius_px']}px")
+    log.info("Детектор: цвета=%s радиус=%s кулдаун=%dмс",
+             det.colors, r_desc, loot["cooldown_ms"])
 
     # --- автофляска HP ---
     hp_cfg = cfg["hp"]
@@ -382,47 +389,115 @@ def main() -> int:
     # --- авто-атака: держим R1, пока в радиусе есть живой моб ---
     atk_cfg = cfg.get("auto_attack", {})
     atk_enabled = bool(atk_cfg.get("enabled"))
-    use_memory = atk_cfg.get("use_memory", True)  # по умолчанию memory detection
+    # detect_mode: "reader" (встроенный C# ридер, ОДИН процесс — pythonnet) |
+    # "ec2" (ExileCore2 TCP, рекомендуется) | "memory" (PROCESS_VM_READ, старый external) |
+    # False/"cv" (CV-детект полосы HP)
+    # Backward compat: True → "memory", False → "cv"
+    _raw_mode = atk_cfg.get("use_memory", "ec2")
+    if _raw_mode is True or _raw_mode == "memory":
+        detect_mode = "memory"
+    elif _raw_mode == "ec2":
+        detect_mode = "ec2"
+    elif _raw_mode == "reader":
+        detect_mode = "reader"
+    else:
+        detect_mode = "cv"
+    use_memory = detect_mode in ("memory", "ec2", "reader")  # bool для совместимости
 
-    if use_memory and atk_enabled:
-        # Memory-based: чтение памяти PoE2 (PROCESS_VM_READ)
+    if detect_mode == "ec2" and atk_enabled:
+        # ExileCore2 TCP bridge: данные из инжектированного плагина (не ломается на патчах)
+        ec2_cfg = cfg.get("exilecore2", {})
+        mob_det = EC2MobDetector({
+            "attack_range": atk_cfg.get("attack_range", 15.0),
+            "ec2_host": ec2_cfg.get("host", "127.0.0.1"),
+            "ec2_port": ec2_cfg.get("port", 50006),
+        })
+        cv_det = None  # CV fallback не нужен — EC2 не ломается на патчах
+        if not mob_det.connect():
+            log.warning("EC2 detection: не удалось подключиться к ExileCore2 ShareData "
+                        "(%s:%d) — откат на CV-детект. "
+                        "Запусти Loader.exe с плагином ShareData.",
+                        ec2_cfg.get("host", "127.0.0.1"),
+                        ec2_cfg.get("port", 50006))
+            mob_det = None
+            use_memory = False
+            detect_mode = "cv"
+            _atk_fallback_reason = "EC2 → CV: нет подключения к ShareData"
+        else:
+            _atk_fallback_reason = ""
+            log.info("EC2 detection: подключено к ExileCore2 ShareData")
+    elif detect_mode == "reader" and atk_enabled:
+        # Reader bridge: встроенный C# ридер через pythonnet (ОДИН процесс, без TCP).
+        # bot.py сам читает память PoE2 — не нужен отдельный PoE2Reader.exe / ExileCore2.
+        mob_det = ReaderMobDetector({
+            "attack_range": atk_cfg.get("attack_range", 15.0),
+            "ignore_static_mobs": atk_cfg.get("ignore_static_mobs", True),
+            "static_grace_s": atk_cfg.get("static_grace_s", 2.0),
+        })
+        # CV НЕ используется: «живость» мобов определяется в reader_detect по
+        # Life-vtable (vtable != 0 = живой; трупы/латентные отсекаются при парсинге).
+        cv_det = None
+        if not mob_det.connect():
+            log.warning("Reader detection: не удалось инициализировать bridge "
+                        "(PoE2 не запущен / нет admin / нет PoE2ReaderLib.dll?) — "
+                        "откат на CV-детект. Пересобери: "
+                        "cd C:\\Projects\\poe2-reader && dotnet build lib\\PoE2ReaderLib.csproj -c Release")
+            mob_det = None
+            use_memory = False
+            detect_mode = "cv"
+            _atk_fallback_reason = "Reader → CV: нет инициализации bridge"
+        else:
+            _atk_fallback_reason = ""
+            log.info("Reader detection: bridge подключён (pid=%d)" % mob_det.bridge.pid)
+    elif detect_mode == "memory" and atk_enabled:
+        # Memory-based: чтение памяти PoE2 (PROCESS_VM_READ, старый external)
         mob_det = MemoryMobDetector({"attack_range": atk_cfg.get("attack_range", 15.0)})
+        # CV fallback — строгие пороги, чтобы не ловить торчи/баннеры
+        cv_cfg = {**atk_cfg, "min_aspect": 5.0, "min_run_frac": 0.025, "min_fill": 0.55,
+                  "narrow_enabled": False, "bootstrap_enabled": False, "low_hp_lock_timeout_s": 0.0}
+        cv_det = MobBarDetector(cv_cfg)
         if not mob_det.connect():
             log.warning("Memory detection: не удалось подключиться к PoE2 — "
                         "откат на CV-детект")
             mob_det = None
+            cv_det = None
             use_memory = False
+            detect_mode = "cv"
             _atk_fallback_reason = "Memory → CV: нет подключения"
         elif not mob_det.available:
             log.warning("Memory detection: подключён, но AOB scan не нашёл "
                         "игровые структуры (оффсеты устарели?) — откат на CV-детект")
             mob_det.disconnect()
             mob_det = None
+            cv_det = None
             use_memory = False
+            detect_mode = "cv"
             _atk_fallback_reason = "Memory → CV: AOB scan failed"
         else:
             _atk_fallback_reason = ""
     else:
         mob_det = None
+        cv_det = None
         use_memory = False
+        detect_mode = "cv"
         _atk_fallback_reason = ""
 
-    if not use_memory and atk_enabled:
+    if detect_mode == "cv" and atk_enabled:
         # CV-based fallback: детект полосы HP моба по цвету
         mob_det = MobBarDetector(atk_cfg)
 
-    zone_det = None  # memory detector делает in_hideout() сам
-    if not use_memory and atk_enabled:
+    zone_det = None  # memory/ec2 detector делает in_hideout() сам
+    if detect_mode == "cv" and atk_enabled:
         zone_det = ZoneDetector(atk_cfg.get("zone", {}))
 
     atk_btn = XUSB.get(atk_cfg.get("button", "right_bumper"), XUSB["right_bumper"])
     atk_grace = atk_cfg.get("release_grace_s", 0.6)
 
     # attack-детект в отдельном потоке
-    attack_worker = AttackWorker(mob_det, zone_det, use_memory=use_memory)
+    attack_worker = AttackWorker(mob_det, zone_det, use_memory=use_memory, cv_det=cv_det)
     if atk_enabled:
         attack_worker.start()
-        mode = "MEMORY" if use_memory else "CV"
+        mode = {"ec2": "EC2", "memory": "MEMORY", "reader": "READER", "cv": "CV"}.get(detect_mode, "CV")
         log.info("Авто-атака ВКЛ (%s): кнопка=%s режим=%s",
                  cfg["hotkeys"].get("attack", "f2").upper(),
                  atk_cfg.get("button", "right_bumper"), mode)
@@ -463,6 +538,7 @@ def main() -> int:
     k_overlay = cfg["hotkeys"].get("overlay", "f6")
     k_attack = cfg["hotkeys"].get("attack", "f10")
     k_flask = cfg["hotkeys"].get("flask", "f3")
+    k_radial = cfg["hotkeys"].get("radial", "f4")
     k_reload = "f5"
 
     def reload_cfg() -> None:
@@ -480,9 +556,7 @@ def main() -> int:
         loot = cfg["loot"]
         # лут: детектор цвета + радиус/кулдаун
         det = build_detector(cfg)
-        engine = LootEngine(loot["pickup_radius_px"], loot["center_offset_xy"],
-                            loot["cooldown_ms"],
-                            priority_mode=loot.get("priority_mode", "size"))
+        engine = build_loot_engine(loot)
         # HP: пороги, кулдаун, кнопка + пересбор геометрии
         hp_cfg = cfg["hp"]
         num_cfg = cfg.get("hp_num", {})
@@ -504,20 +578,32 @@ def main() -> int:
         atk_cfg = cfg.get("auto_attack", {})
         atk_enabled = bool(atk_cfg.get("enabled"))
         use_memory = atk_cfg.get("use_memory", True)
+        # параметры круга радиуса (F4) — применяются на лету
+        rad_cfg = cfg.get("radial", {})
+        ov_state.radial_scale = float(rad_cfg.get("scale_px_per_grid", 20.0))
+        off = rad_cfg.get("center_offset_xy", [0, -40])
+        ov_state.radial_center = (float(off[0]), float(off[1]))
         old_mob_det = mob_det
+        cv_det = None
         if use_memory and atk_enabled:
-            if mob_det is None or not isinstance(mob_det, MemoryMobDetector):
+            if mob_det is None or not isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)):
                 mob_det = MemoryMobDetector({"attack_range": atk_cfg.get("attack_range", 15.0)})
                 mob_det.connect()
             else:
                 mob_det.attack_range = atk_cfg.get("attack_range", 15.0)
                 mob_det.attack_range_sq = mob_det.attack_range ** 2
+                if isinstance(mob_det, ReaderMobDetector):
+                    mob_det.ignore_static = bool(atk_cfg.get("ignore_static_mobs", True))
+                    mob_det.static_grace_s = float(atk_cfg.get("static_grace_s", 2.0))
+            cv_cfg = {**atk_cfg, "min_aspect": 5.0, "min_run_frac": 0.025, "min_fill": 0.55,
+                      "narrow_enabled": False, "bootstrap_enabled": False, "low_hp_lock_timeout_s": 0.0}
+            cv_det = MobBarDetector(cv_cfg)
         elif atk_enabled:
             mob_det = MobBarDetector(atk_cfg)
         else:
             mob_det = None
         # закрыть handle старого memory-детектора если режим сменился
-        if old_mob_det is not None and isinstance(old_mob_det, MemoryMobDetector):
+        if old_mob_det is not None and isinstance(old_mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)):
             if old_mob_det is not mob_det:
                 try:
                     old_mob_det.disconnect()
@@ -529,18 +615,24 @@ def main() -> int:
         # обновить лут-воркер новыми детектором/движком
         loot_worker.update_config(det, engine)
         # обновить attack-воркер новыми детекторами
-        attack_worker.update_config(mob_det, zone_det, use_memory)
+        attack_worker.update_config(mob_det, zone_det, use_memory, cv_det)
         log.info("Config перезагружен (F5): детектор=%s порог=%.0f%% кулдаун=%dмс",
                  det.colors, hp_threshold * 100, loot["cooldown_ms"])
 
     # --- оверлей со статусами (поверх игры, click-through) ---
     ov_state = OverlayState()
     ov_state.flask_enabled = hpg["hp_det"] is not None
+    rad_cfg = cfg.get("radial", {})
+    ov_state.radial_scale = float(rad_cfg.get("scale_px_per_grid", 20.0))
+    off = rad_cfg.get("center_offset_xy", [0, -40])
+    ov_state.radial_center = (float(off[0]), float(off[1]))
+    ov_state.attack_range = atk_cfg.get("attack_range", 0.0)
     overlay = Overlay(ov_state, region, cfg["hotkeys"])
     overlay.start()
     if _atk_fallback_reason:
         ov_state.notification = _atk_fallback_reason
         ov_state.notification_until = time.time() + 5.0
+        ov_state.atk_fallback = _atk_fallback_reason
 
     def on_press(key) -> Optional[bool]:
         name = getattr(key, "name", None)
@@ -566,15 +658,20 @@ def main() -> int:
         if name == k_flask and hpg["hp_det"] is not None:
             state = flask.flip()
             log.info("Авто-фляска: %s", "ВКЛ" if state else "выкл")
+        if name == k_radial:
+            ov_state.radial_visible = not ov_state.radial_visible
+            log.info("Круг радиуса: %s (R=%.0f, scale=%.1f px/grid)",
+                     "показан" if ov_state.radial_visible else "скрыт",
+                     ov_state.attack_range, ov_state.radial_scale)
         if name == k_reload:
             reload_cfg()
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     log.info("Готово. %s — подбор, %s — авто-атака, %s — авто-фляска, %s — диагностика, "
-             "%s — снимок, %s — оверлей, %s — перезагрузка, %s — выход.",
+             "%s — снимок, %s — оверлей, %s — круг радиуса, %s — перезагрузка, %s — выход.",
              k_toggle.upper(), k_attack.upper(), k_flask.upper(), k_diag.upper(),
-             k_shot.upper(), k_overlay.upper(), k_reload.upper(), k_quit.upper())
+             k_shot.upper(), k_overlay.upper(), k_radial.upper(), k_reload.upper(), k_quit.upper())
 
     # --- главный цикл ---
     last_status = 0.0
@@ -623,19 +720,20 @@ def main() -> int:
                 loot_ctr = loot_center
 
             # авто-атака — в отдельном потоке
-            if mob_det is not None and attack.on and foreground:
+            # В memory/reader-режиме сабмитим ВСЕГДА в фокусе (даже без attack.on),
+            # чтобы счётчики сущностей в оверлее обновлялись постоянно.
+            # В CV-режиме — только при attack.on (CV на каждый кадр дорогой).
+            if mob_det is not None and foreground and (attack.on or use_memory):
                 try:
-                    if use_memory:
-                        attack_worker.submit(foreground=foreground)
-                    else:
-                        attack_worker.submit(full, foreground)
+                    # Всегда сабмитим фрейм — нужен для CV fallback
+                    attack_worker.submit(full, foreground)
                     atk_result = attack_worker.get_result()
                     if atk_result is not None:
                         if atk_result["in_hideout"]:
                             if r1_held and time.perf_counter() - last_bar_seen > atk_grace:
                                 vx.release(atk_btn)
                                 r1_held = False
-                        elif atk_result["mob_present"]:
+                        elif atk_result["mob_present"] and attack.on:
                             if not r1_held and time.perf_counter() - last_atk_dump > 10.0:
                                 atk_dump_n += 1
                                 last_atk_dump = time.perf_counter()
@@ -689,8 +787,14 @@ def main() -> int:
                     log.warning("Цифры HP=%.0f%% при орбе — обрезка ROI, перелокализую",
                                 (num[2] * 100) if num else 0)
                     located = False
-                # жмём флягу по решению движка
-                if (flask.on and hp_engine.decision == HPDecision.LOW
+                # CV-фляга: пропускаем, если HP/Mana ведёт memory auto_flask
+                memory_flask_active = (
+                    auto_flask.enabled and use_memory
+                    and mob_det is not None and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector))
+                    and mob_det.available
+                )
+                if (flask.on and not memory_flask_active
+                        and hp_engine.decision == HPDecision.LOW
                         and time.perf_counter() - last_flask >= hp_cooldown):
                     bridge.suppress_triggers = True
                     def _do_flask():
@@ -709,8 +813,9 @@ def main() -> int:
 
             # --- AUTO-FLASK: memory-based rules (HP%, Mana%, enemies) ---
             if (auto_flask.enabled and flask.on and use_memory
-                    and mob_det is not None and isinstance(mob_det, MemoryMobDetector)
-                    and mob_det.available and foreground and not mob_det.in_hideout()):
+                    and mob_det is not None and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector))
+                    and mob_det.available and foreground and not mob_det.in_hideout()
+                    and time.perf_counter() - last_flask >= hp_cooldown):
                 hp_pct, mana_pct = mob_det.read_player_vitals()
                 enemies = len(mob_det.get_hostiles_in_range())
 
@@ -740,12 +845,74 @@ def main() -> int:
             ov_state.attack_enabled = mob_det is not None
             ov_state.attack_on = attack.on
             ov_state.attacking = r1_held
+            ov_state.attack_range = float(getattr(mob_det, "attack_range", 0.0) or 0.0)
+            is_mem = (use_memory and mob_det is not None
+                      and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector))
+                      and mob_det.available)
+            is_cv = (mob_det is not None
+                     and not isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)))
+            if is_mem:
+                if isinstance(mob_det, EC2MobDetector):
+                    ov_state.attack_mode = "EC2"
+                elif isinstance(mob_det, ReaderMobDetector):
+                    ov_state.attack_mode = "RDR"
+                else:
+                    ov_state.attack_mode = "MEM"
+            elif is_cv:
+                ov_state.attack_mode = "CV"
+            else:
+                ov_state.attack_mode = ""
             ov_state.flask_on = flask.on
             ov_state.diag = diag.enabled
             ov_state.hp_pct = hp_engine.hp_pct
             ov_state.foreground = foreground
             ov_state.flasks = flasks
             ov_state.presses = presses
+            if atk_enabled and atk_cfg.get("use_memory", True):
+                mem_ok = (use_memory and mob_det is not None
+                          and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector))
+                          and mob_det.available)
+                ov_state.memory_status = "ok" if mem_ok else "fallback"
+                if mem_ok:
+                    ov_state.atk_fallback = ""
+                # Индикаторы модуля памяти для нижней строки оверлея:
+                #   mem_connected — детектор создан и подключился к процессу PoE2
+                #   mem_reading   — память реально читается (available = game_state != 0)
+                if mob_det is not None and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)):
+                    ov_state.mem_connected = bool(getattr(mob_det, "_connected", False))
+                    ov_state.mem_reading = bool(mob_det.available)
+                    # Счётчики сущностей для оверлея
+                    try:
+                        stats = getattr(mob_det, "stats", {})
+                        ov_state.ent_total = stats.get("total_entities", 0)
+                        all_hostiles = mob_det.get_all_hostiles() if hasattr(mob_det, "get_all_hostiles") else []
+                        ov_state.ent_hostile = len(all_hostiles)
+                        ov_state.ent_in_range = stats.get("hostile_in_range", 0)
+                        # nearest distance до ближайшего враждебного моба
+                        if all_hostiles:
+                            ov_state.nearest_dist = min(e.distance for e in all_hostiles)
+                        else:
+                            ov_state.nearest_dist = None
+                    except Exception:
+                        ov_state.ent_total = 0
+                        ov_state.ent_hostile = 0
+                        ov_state.ent_in_range = 0
+                        ov_state.nearest_dist = None
+                else:
+                    ov_state.mem_connected = False
+                    ov_state.mem_reading = False
+                    ov_state.ent_total = 0
+                    ov_state.ent_hostile = 0
+                    ov_state.ent_in_range = 0
+                    ov_state.nearest_dist = None
+            else:
+                ov_state.memory_status = "off"
+                ov_state.mem_connected = False
+                ov_state.mem_reading = False
+                ov_state.ent_total = 0
+                ov_state.ent_hostile = 0
+                ov_state.ent_in_range = 0
+                ov_state.nearest_dist = None
             if hp_enabled and num_cfg.get("enabled") and num_cfg.get("auto_locate"):
                 ov_state.locate_state = "ok" if located else "search"
                 ov_state.locate_info = loc_info["text"]
@@ -786,6 +953,17 @@ def main() -> int:
                          f"{hp_engine.hp_pct*100:.0f}%" if hp_engine.hp_pct is not None else "-",
                          hp_engine.hp_src, hp_engine.low_streak,
                          flasks, atk_state, fps)
+                # Диагностика сущностей для memory-режима: total/hostile/in_range/nearest
+                if mob_det is not None and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)):
+                    try:
+                        _ah = mob_det.get_all_hostiles()
+                        _nd = min((e.distance for e in _ah), default=None)
+                        _nd_s = f"{_nd:.0f}" if _nd is not None else "-"
+                        log.info("ENT: total=%d hostile=%d in_range=%d nearest=%s range=%.1f",
+                                 ov_state.ent_total, len(_ah), ov_state.ent_in_range,
+                                 _nd_s, mob_det.attack_range)
+                    except Exception:
+                        pass
                 # debug overlay info
                 if diag.enabled:
                     hp_pct_s = f"{hp_engine.hp_pct*100:.0f}%" if hp_engine.hp_pct is not None else "-"
@@ -808,7 +986,7 @@ def main() -> int:
     finally:
         attack_worker.stop()
         attack_worker.join(timeout=1.0)
-        if use_memory and mob_det is not None and isinstance(mob_det, MemoryMobDetector):
+        if use_memory and mob_det is not None and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)):
             mob_det.disconnect()
         loot_worker.stop()
         loot_worker.join(timeout=1.0)

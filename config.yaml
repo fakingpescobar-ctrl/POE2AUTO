@@ -15,6 +15,7 @@ vision:
   close_px: 3
 loot:
   pickup_radius_px: 400
+  radius_frac: 0          # 0 = pickup_radius_px; >0 = min(h,w)*frac (напр. 0.21 ≈ 400px на 1080p)
   center_offset_xy:
   - 0
   - -40
@@ -59,11 +60,22 @@ hp_num:
   menu_grace_s: 0.5     # цифры нет дольше этого = меню/перекрыт HUD → не пьём (орб подстрахует только в пределах окна)
 auto_attack:
   # авто-атака: держим R1, пока в радиусе есть живой враждебный моб.
-  # use_memory=true — чтение памяти игры (PROCESS_VM_READ, точнее, без ложных CV-срабатываний).
+  # use_memory=reader — встроенный C# ридер (ОДИН процесс, pythonnet → PoE2ReaderLib.dll).
+  #   НЕ нужен отдельный PoE2Reader.exe / ExileCore2 / TCP. Рекомендуется.
+  # use_memory=ec2 — ExileCore2 TCP bridge (нужен Loader.exe + ключ ExileCore2).
+  # use_memory=memory — старый external PROCESS_VM_READ (ломается на патчах).
   # use_memory=false — CV-детект полосы HP моба по цвету (fallback).
   enabled: true
-  use_memory: true        # true=чтение памяти (Recommended) | false=CV-детект полосы
-  attack_range: 15.0      # радиус атаки в сетевых координатах
+  use_memory: reader          # reader (Recommended) | ec2 | memory | false
+  attack_range: 55.0     # радиус атаки в grid-координатах (позиция игрока теперь из Render-компонента; мобы "рядом" = ~120-150 grid)
+  # Статичные «призраки»: моб числится живым в памяти (Life-флаг смерти == 0),
+  # но НИ РАЗУ не двигался с момента появления — спящие утопленники в воде /
+  # декоративные трупы. На MapPort бот держал R1 по невидимому DrownedCrewAxe на
+  # 22 grid. Цель = моб, который хоть раз сдвинулся с места (ever_moved) — после
+  # этого валиден навсегда, даже если встанет в упор. static_grace_s — сколько
+  # секунд новый моб атакуется без движения (чтобы успеть шевельнуться).
+  ignore_static_mobs: true
+  static_grace_s: 2.0
   button: right_bumper   # R1 (right_bumper | left_bumper | a | b | x | y)
   # зона полосы HP моба (доли кадра). Обычный моб/рара укладывается в 0.36-0.64,
   # но у боссов бар шире (замерено на Графе Жеоноре: 0.323-0.677) — упирался в
@@ -141,8 +153,8 @@ auto_attack:
     match_min: 0.85        # порог сходства с шаблоном zone_templates/hideout_label.png
 auto_flask:
   # автофляска через чтение памяти (HP/Mana% + кол-во врагов).
-  # Работает только при use_memory=true в auto_attack (нужен доступ к памяти).
   # При use_memory=false используй CV-based фляску (hp.threshold и hp.cooldown_ms).
+  # Работает с use_memory=ec2 и use_memory=memory.
   enabled: true
   rules:
     - name: "HP Critical"
@@ -163,6 +175,13 @@ auto_flask:
       enemies_nearby: 3
       enemy_radius: 30.0
       cooldown_s: 2.0
+exilecore2:
+  # Настройки подключения к ExileCore2 ShareData плагину.
+  # ShareData — C# плагин, инжектируется ВНУТРЬ PoE2 через Loader.exe,
+  # поднимает TCP-сервер и отдаёт JSON с entities/HP/позициями.
+  # Установка: см. 0_guest/ в репозитории poe_bot или discord.gg/eMmeSyqEA3
+  host: 127.0.0.1       # IP машины с запущенным PoE2+ExileCore2
+  port: 50006           # TCP порт ShareData
 hotkeys:
   toggle: f8
   diag: f7
@@ -170,4 +189,12 @@ hotkeys:
   overlay: f6
   attack: f2
   flask: f3
+  radial: f4
   quit: f12
+radial:
+  # Наглядный круг радиуса авто-атаки вокруг персонажа (F4).
+  # scale_px_per_grid — сколько пикселей экрана в одном grid по горизонтали
+  # (изометрия PoE2: вертикаль сжата вдвое). Калибруется вручную: встань так,
+  # чтобы моб был ровно на линии, и подстрой. Смена применится по F5.
+  scale_px_per_grid: 20.0
+  center_offset_xy: [0, -40]   # персонаж на экране относительно центра окна (px)

@@ -27,6 +27,7 @@ DEFAULTS = {
     },
     "loot": {
         "pickup_radius_px": 400,
+        "radius_frac": 0,           # >0 → радиус = min(h,w)*frac (масштаб под разрешение); 0 → pickup_radius_px
         "center_offset_xy": [0, -40],
         "cooldown_ms": 100,
         "pickup_hold_ms": 60,
@@ -133,6 +134,7 @@ _SCHEMA = {
     "vision.min_blob_area": (int, float),
     "vision.close_px": (int, float),
     "loot.pickup_radius_px": (int, float),
+    "loot.radius_frac": (int, float),
     "loot.center_offset_xy": list,
     "loot.cooldown_ms": (int, float),
     "loot.pickup_hold_ms": (int, float),
@@ -166,7 +168,7 @@ _SCHEMA = {
     "hp_num.max_hp": (int, float),
     "hp_num.menu_grace_s": (int, float),
     "auto_attack.enabled": bool,
-    "auto_attack.use_memory": bool,
+    "auto_attack.use_memory": (bool, str),
     "auto_attack.attack_range": (int, float),
     "auto_attack.button": str,
     "auto_attack.roi": dict,

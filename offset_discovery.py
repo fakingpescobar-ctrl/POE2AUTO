@@ -232,21 +232,21 @@ class OffsetDiscovery:
                          life_addr, self.VITAL_SCAN_MIN, self.VITAL_SCAN_MAX)
             return False
 
-        # Health — обычно самый большой пул (HP > Mana > ES)
-        # Сортируем по Max (убывание) — HP обычно最大的
-        candidates.sort(key=lambda x: x[1], reverse=True)
+        # Health — используем default (off.Life.HEALTH), не переопределяем value-scan'ом
+        # value-scan может найти неверный VitalStruct для Ward/LowLife билдов
+        rest = [c for c in candidates if c[0] != off.Life.HEALTH]
+        rest.sort(key=lambda x: x[1], reverse=True)
 
-        self._health_off = candidates[0][0]
-        if len(candidates) >= 2:
-            self._mana_off = candidates[1][0]
-        if len(candidates) >= 3:
-            self._es_off = candidates[2][0]
+        if len(rest) >= 1:
+            self._mana_off = rest[0][0]
+        if len(rest) >= 2:
+            self._es_off = rest[1][0]
 
-        _log.info("Value-scan found %d VitalStructs: Health=0x%X (%d), Mana=0x%X (%d), ES=0x%X (%d)",
+        _log.info("Value-scan found %d VitalStructs: Health=0x%X (default), Mana=0x%X (%d), ES=0x%X (%d)",
                   len(candidates),
-                  self._health_off, candidates[0][1],
-                  self._mana_off, candidates[1][1] if len(candidates) > 1 else 0,
-                  self._es_off, candidates[2][1] if len(candidates) > 2 else 0)
+                  off.Life.HEALTH,
+                  self._mana_off, rest[0][1] if len(rest) > 0 else 0,
+                  self._es_off, rest[1][1] if len(rest) > 1 else 0)
 
         return True
 
