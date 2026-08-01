@@ -61,7 +61,9 @@ class TestValueScan:
         region = bytearray(region_size)
         # All Max fields are 0 (invalid) by default
 
-        # Plant Health at +0x100 (Max=5000) — well separated from others
+        # Plant a VitalStruct at +0x100 (Max=5000, largest) — well separated.
+        # Health больше не сканируется value-scan'ом (см. assertion ниже),
+        # поэтому +0x100 попадёт в candidates и станет Mana (наибольшим из rest).
         struct.pack_into("<i", region, 0x100 + off.VitalStruct.MAX, 5000)
         struct.pack_into("<i", region, 0x100 + off.VitalStruct.CURRENT, 4500)
         # Plant Mana at +0x200 (Max=1000)
@@ -84,11 +86,13 @@ class TestValueScan:
         assert result is True
 
         vitals = d.get_vital_offsets()
-        # Health is the largest (5000) → sorted first
-        assert vitals.health == 0x100
-        # Mana (1000) and ES (500) follow
-        assert vitals.mana == 0x200
-        assert vitals.es == 0x300
+        # Health больше НЕ определяется value-scan'ом (Ward/LowLife билды
+        # путают Health с Ward-пулом) — берётся дефолтный оффсет off.Life.HEALTH.
+        assert vitals.health == off.Life.HEALTH
+        # Mana/ES — оставшиеся VitalStructs, отсортированные по Max (убывание):
+        # Max=5000 @0x100 → mana, Max=1000 @0x200 → es.
+        assert vitals.mana == 0x100
+        assert vitals.es == 0x200
 
     def test_no_valid_structs(self):
         mem = MagicMock()
