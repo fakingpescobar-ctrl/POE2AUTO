@@ -26,10 +26,12 @@ from __future__ import annotations
 import logging
 import math
 import time
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 from entity_reader import EntityCategory, Rarity, EntityData, EntityReader
 from reader_bridge import ReaderBridge
+from monster_db import MonsterDB
 
 _log = logging.getLogger("poe2auto.readerdetect")
 
@@ -131,6 +133,17 @@ class ReaderMobDetector:
         # False — ждать реальных данных, не атаковать вслепую.
         # Rare/boss и «когда-либо двигался» атакуются независимо от этого флага.
         self.attack_unknown_hp = bool(cfg.get("attack_unknown_hp", True))
+        # SQLite телеметрия: полный дамп мобов по кадрам (для дебага классификации
+        # и аналитики). Включается в config → monster_db. None = телеметрия выключена.
+        mdb = cfg.get("monster_db") or {}
+        self.db: Optional[MonsterDB] = None
+        if mdb.get("enabled"):
+            self.db = MonsterDB(
+                path=mdb.get("path", "monster_telemetry.db"),
+                batch_size=mdb.get("batch_size", 50),
+                flush_interval_s=mdb.get("flush_interval_s", 1.0),
+                keep_days=mdb.get("keep_days", 3.0),
+            )
         self._static_track = {}   # addr -> {ever_moved, ever_hit, first_seen, last_seen, last}
         self._last_area_hash = -1
         # Признак «игрок в бою»: вражеский снаряд, приближающийся к игроку.
@@ -177,10 +190,15 @@ class ReaderMobDetector:
             return False
         self._connected = True
         _log.info("ReaderDetector connected: pid=%d", self.bridge.pid)
+        # Старт SQLite телеметрии (если включена в config). session_id = время.
+        if self.db is not None:
+            self.db.start(datetime.now().strftime("%Y-%m-%d_%H%M%S"))
         return True
 
     def disconnect(self):
         """Отключиться от процесса PoE2."""
+        if self.db is not None:
+            self.db.close()
         self.bridge.shutdown()
         self._connected = False
         self._area_code = ""
@@ -264,11 +282,17 @@ class ReaderMobDetector:
         # Распределение статусов целей (отладка: видно сколько мобов в каждой
         # категории — COMBAT/LATENT/GHOST_STATIC/UNKNOWN/DEAD/SPIRIT).
         status_counts = {}
+        db_rows: List[Tuple[EntityData, str]] = []  # (entity, status) для телеметрии
         for e in self._last_entities:
             if e.category == EntityCategory.MONSTER and not e.is_friendly:
                 st = self._classify_target(e)
                 status_counts[st] = status_counts.get(st, 0) + 1
+                if self.db is not None:
+                    db_rows.append((e, st))
         self.stats["target_status"] = status_counts
+        # SQLite телеметрия: полный снимок кадра (для дебага/аналитики). Неблокирующий.
+        if self.db is not None and db_rows:
+            self.db.record_frame(self._area_code, db_rows)
         return True
 
     def present(self, frame_bgr=None) -> bool:

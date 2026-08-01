@@ -9,6 +9,9 @@ venv/
 # Runtime / debug
 *.log
 *.log.*
+*.db
+*.db-wal
+*.db-shm
 _debug/
 _help_preview.png
 bot_console.log

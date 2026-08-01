@@ -433,6 +433,10 @@ def main() -> int:
             "attack_range": atk_cfg.get("attack_range", 15.0),
             "ignore_static_mobs": atk_cfg.get("ignore_static_mobs", True),
             "static_grace_s": atk_cfg.get("static_grace_s", 2.0),
+            "min_hp_threshold": atk_cfg.get("min_hp_threshold", 0),
+            "attack_unknown_hp": atk_cfg.get("attack_unknown_hp", True),
+            # SQLite телеметрия мобов (полный дамп по кадрам для дебага/аналитики).
+            "monster_db": cfg.get("monster_db", {}),
         })
         # CV НЕ используется: «живость» мобов определяется в reader_detect по
         # Life-vtable (vtable != 0 = живой; трупы/латентные отсекаются при парсинге).
