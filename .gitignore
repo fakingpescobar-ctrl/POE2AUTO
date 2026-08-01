@@ -24,6 +24,12 @@ poe2-reader/**/bin/
 poe2-reader/**/obj/
 poe2-reader/**/*.user
 
+# Research / scratch скрипты (диагностика памяти — не часть рантайма бота)
+_debug_*.py
+_diag_*.py
+diagnostics/
+_fight_log.txt
+
 # OS
 Thumbs.db
 desktop.ini
