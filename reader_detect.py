@@ -71,8 +71,14 @@ class TargetStatus:
     # Статусы, которые считаются «достойными атаки».
     ATTACKABLE = frozenset({COMBAT})
 
+    # Alive but on different Z-level or too far to be a valid target.
+    UNREACHABLE = frozenset()
+
+    # Recently dead entity (corpse) — may have loot, not a combat target.
+    CORPSE = frozenset()
+
     # Статусы, которые технически живы (для статистики «всего живых»).
-    LIVING = frozenset({LATENT, GHOST_STATIC, UNKNOWN, COMBAT})
+    LIVING = frozenset({LATENT, GHOST_STATIC, UNKNOWN, COMBAT, UNREACHABLE})
 
 
 class ReaderMobDetector:
@@ -125,6 +131,7 @@ class ReaderMobDetector:
         # раз двигался, либо ещё не прошёл grace-период (только заспавненный).
         self.ignore_static = bool(cfg.get("ignore_static_mobs", True))
         self.static_grace_s = float(cfg.get("static_grace_s", 2.0))
+        self.corpse_timeout_s = float(cfg.get("corpse_timeout_s", 30.0))
         # Порог HP: моб с hp_cur <= min_hp при hp_max>0 — LATENT (умирает/пустышка),
         # в атаку не идёт. Rare/Unique/боссы этим порогом не отсекаются.
         self.min_hp_threshold = int(cfg.get("min_hp_threshold", 0))
@@ -145,6 +152,7 @@ class ReaderMobDetector:
                 keep_days=mdb.get("keep_days", 3.0),
             )
         self._static_track = {}   # addr -> {ever_moved, ever_hit, first_seen, last_seen, last}
+        self._dead_track = {}       # addr -> death_timestamp
         self._last_area_hash = -1
         # Признак «игрок в бою»: вражеский снаряд, приближающийся к игроку.
         # Вражеские снаряды не лежат в awake-дереве — фича опциональна.
@@ -271,6 +279,7 @@ class ReaderMobDetector:
         monsters_alive = [e for e in self._last_entities
                           if e.category == EntityCategory.MONSTER
                           and not e.is_friendly
+                          and e.is_reachable
                           and self._classify_target(e) in TargetStatus.ATTACKABLE]
         in_range = [e for e in monsters_alive if e.distance <= self.attack_range]
 
@@ -323,6 +332,7 @@ class ReaderMobDetector:
         return [e for e in self._last_entities
                 if e.category == EntityCategory.MONSTER
                 and not e.is_friendly
+                and e.is_reachable
                 and self._classify_target(e) in TargetStatus.ATTACKABLE]
 
     def get_hostiles_in_range(self) -> List[EntityData]:
@@ -330,6 +340,7 @@ class ReaderMobDetector:
         return [e for e in self._last_entities
                 if e.category == EntityCategory.MONSTER
                 and not e.is_friendly
+                and e.is_reachable
                 and self._classify_target(e) in TargetStatus.ATTACKABLE
                 and e.distance <= self.attack_range]
 
@@ -443,7 +454,13 @@ class ReaderMobDetector:
         """
         # 1) DEAD — труп. C#-флаг Life+0x10 (is_alive) уже учтён в _parse_entity.
         if not entity.is_alive:
+            if self._is_recently_dead(entity.id):
+                return TargetStatus.CORPSE
             return TargetStatus.DEAD
+
+        # 1a) UNREACHABLE - alive but different Z-level or too far.
+        if not entity.is_reachable:
+            return TargetStatus.UNREACHABLE
 
         # 2) SPIRIT — небоевой дух/эффект (Tormented Spirit, Summoned, Daemon,
         # Invisible, MonsterMods). В _parse_entity они перекатегоризуются в OTHER
@@ -476,6 +493,44 @@ class ReaderMobDetector:
             return True
         tr = self._static_track.get(eid)
         return bool(tr and (tr.get("ever_moved") or tr.get("ever_hit")))
+
+    def _is_recently_dead(self, eid: int) -> bool:
+        ts = self._dead_track.get(eid)
+        if ts is None:
+            return False
+        return (time.perf_counter() - ts) < self.corpse_timeout_s
+
+    def _compute_confidence(self, eid: int, is_alive: bool,
+                            is_reachable: bool, hp_max: int,
+                            hp_cur: int, significant: bool) -> float:
+        """Confidence score (0.0-1.0) for the entity classification.
+
+        Higher = more trustworthy the current status.
+        Based on HP data availability, movement history, and death state.
+        """
+        c = 0.0
+        if hp_max > 0:
+            c += 0.3
+        if hp_cur > 0:
+            c += 0.2
+        if is_reachable:
+            c += 0.2
+        if is_alive:
+            c += 0.15
+        # Movement/hit history boost
+        tr = self._static_track.get(eid)
+        if tr:
+            if tr.get("ever_moved"):
+                c += 0.1
+            if tr.get("ever_hit"):
+                c += 0.05
+        # Corpse penalty
+        if self._dead_track.get(eid) is not None:
+            c -= 0.3
+        # Unknown HP penalty (no Life component resolved yet)
+        if hp_max == 0 and hp_cur == 0:
+            c -= 0.2
+        return max(0.0, min(1.0, round(c, 2)))
 
     def _check_static(self, entity: EntityData, significant: bool) -> str:
         """Фильтр статичных «призраков». COMBAT = атаковать, GHOST_STATIC = нет.
@@ -541,6 +596,16 @@ class ReaderMobDetector:
                 if (gx, gy) != tr["last"]:
                     tr["ever_moved"] = True
                     tr["last"] = (gx, gy)
+        # Track deaths: entity was seen before but not in this frame -> dead
+        for a, tr in list(self._static_track.items()):
+            if a not in seen and tr.get("ever_moved"):
+                self._dead_track[a] = now
+
+        # Track deaths: entity was alive before but not in this frame
+        for a, tr in list(self._static_track.items()):
+            if a not in seen and tr.get("ever_moved"):
+                self._dead_track[a] = now
+
         stale = [a for a, tr in self._static_track.items()
                  if a not in seen and now - tr["last_seen"] > 10.0]
         for a in stale:
@@ -631,7 +696,8 @@ class ReaderMobDetector:
 
         # Живость: C#-флаг из Life+0x10 (0=жив, 1=труп) + Z-слой. Надёжнее
         # hp_cur>0: у живых боссов hp_cur может быть 0 при hp_max>0.
-        is_alive = bool(raw.get("alive", True)) and (z_ok or significant)
+        is_alive = bool(raw.get("alive", True))
+        is_reachable = is_alive and (z_ok or significant)
 
         lc = raw.get("life") or []
         # ЧЕСТНОЕ чтение HP: life=[hp_max, hp_cur, ...] из reader_bridge._read_vitals.
@@ -654,12 +720,19 @@ class ReaderMobDetector:
         dy = grid_y - player_y
         distance = math.sqrt(dx * dx + dy * dy)
 
+        confidence = self._compute_confidence(eid, is_alive, is_reachable,
+                                             hp_max, hp_cur, significant)
+        dead_since = self._dead_track.get(eid)
+
         return EntityData(
             id=eid, category=category, metadata=path,
             x=wx, y=wy, z=wz, grid_x=grid_x, grid_y=grid_y,
             hp_current=hp_cur, hp_max=hp_max, hp_ratio=hp_ratio,
             rarity=rarity, is_friendly=is_friendly,
             distance=distance, is_boss=is_boss, is_alive=is_alive,
+            is_reachable=is_reachable,
+            is_corpse=bool(self._dead_track.get(eid)),
+            confidence=confidence, dead_since=dead_since,
         )
 
     @staticmethod

@@ -55,6 +55,10 @@ class EntityData(NamedTuple):
     distance: float    # расстояние от игрока (в сетевых координатах)
     is_boss: bool = False
     is_alive: bool = True
+    is_reachable: bool = True
+    is_corpse: bool = False
+    confidence: float = 0.0   # 0..1 — уверенность в классификации
+    dead_since: Optional[float] = None  # timestamp смерти (perf_counter), None если жив
 
 
 class EntityReader:
@@ -66,7 +70,13 @@ class EntityReader:
     PLAYER_KEYWORDS = ("/Characters/",)
     CHEST_KEYWORDS = ("/Chests",)
     TRANSITION_KEYWORDS = ("Transition",)
-    NON_COMBAT_KEYWORDS = ("Summoned", "/Daemon/", "Invisible", "MonsterMods", "TormentedSpirit")
+    NON_COMBAT_KEYWORDS = (
+        "Summoned", "/Daemon/", "Invisible", "MonsterMods", "TormentedSpirit",
+        "Wisp", "/Spirit/", "Spectre", "Phantom", "Illusion", "Duplicate",
+        "Clone", "Shade", "Wraith", "Ghost", "Undead", "Skeleton",
+        "Rogue", "TreasureGuard", "Trap", "Mine", "Explosive",
+        "Blighted", "Seething", "Festering", "Carrion",
+    )
 
     def __init__(self, mem: GameMemory):
         self._mem = mem

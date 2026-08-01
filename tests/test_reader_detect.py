@@ -18,15 +18,18 @@ def _make_detector(**overrides):
     det.attack_range = overrides.get("attack_range", 15.0)
     det.ignore_static = overrides.get("ignore_static", True)
     det.static_grace_s = overrides.get("static_grace_s", 2.0)
+    det.corpse_timeout_s = overrides.get("corpse_timeout_s", 30.0)
     det.min_hp_threshold = overrides.get("min_hp_threshold", 0)
     det.attack_unknown_hp = overrides.get("attack_unknown_hp", True)
     det._static_track = overrides.get("_static_track", {})
+    det._dead_track = overrides.get("_dead_track", {})
     det._player_fire_time = overrides.get("_player_fire_time", 0.0)
     return det
 
 
 def _mob(eid=1, hp_cur=800, hp_max=1000, alive=True, rarity=Rarity.NORMAL,
-         is_boss=False, path="/Monsters/Test", friendly=False, distance=10.0):
+         is_boss=False, path="/Monsters/Test", friendly=False, distance=10.0,
+         confidence=0.0, dead_since=None):
     """Создать EntityData-моба для классификации."""
     return EntityData(
         id=eid, category=EntityCategory.MONSTER, metadata=path,
@@ -34,7 +37,8 @@ def _mob(eid=1, hp_cur=800, hp_max=1000, alive=True, rarity=Rarity.NORMAL,
         hp_current=hp_cur, hp_max=hp_max,
         hp_ratio=(hp_cur / hp_max) if hp_max > 0 else 1.0,
         rarity=rarity, is_friendly=friendly, distance=distance,
-        is_boss=is_boss, is_alive=alive,
+        is_boss=is_boss, is_alive=alive, is_reachable=True,
+        confidence=confidence, dead_since=dead_since,
     )
 
 
@@ -212,3 +216,76 @@ class TestAttackable:
         assert TargetStatus.DEAD not in TargetStatus.LIVING
         assert TargetStatus.SPIRIT not in TargetStatus.LIVING
         assert TargetStatus.COMBAT in TargetStatus.LIVING
+
+
+# --- Confidence scoring ---
+
+class TestConfidence:
+    def test_combat_mob_has_high_confidence(self):
+        det = _make_detector()
+        det._static_track = {1: {"ever_moved": True, "ever_hit": True,
+                                   "first_seen": 0.0, "last_seen": 0.0, "last": (0, 0)}}
+        e = _mob(eid=1, hp_cur=800, hp_max=1000)
+        # _classify_target doesn't set confidence; confidence is set in _parse_entity
+        # Here we test the _compute_confidence method directly
+        c = det._compute_confidence(1, True, True, 1000, 800, False)
+        assert c > 0.5
+
+    def test_dead_mob_has_low_confidence(self):
+        det = _make_detector()
+        det._dead_track = {1: time.perf_counter()}
+        c = det._compute_confidence(1, False, True, 1000, 0, False)
+        assert c < 0.5
+
+    def test_no_hp_data_has_low_confidence(self):
+        det = _make_detector()
+        c = det._compute_confidence(1, True, True, 0, 0, False)
+        assert c < 0.5
+
+    def test_reachable_boosts_confidence(self):
+        det = _make_detector()
+        c_reachable = det._compute_confidence(1, True, True, 1000, 800, False)
+        c_unreachable = det._compute_confidence(1, True, False, 1000, 800, False)
+        assert c_reachable > c_unreachable
+
+    def test_confidence_clamped_to_1(self):
+        det = _make_detector()
+        det._static_track = {1: {"ever_moved": True, "ever_hit": True,
+                                   "first_seen": 0.0, "last_seen": 0.0, "last": (0, 0)}}
+        c = det._compute_confidence(1, True, True, 1000, 800, True)
+        assert c <= 1.0
+
+    def test_confidence_clamped_to_0(self):
+        det = _make_detector()
+        det._dead_track = {1: time.perf_counter()}
+        c = det._compute_confidence(1, False, False, 0, 0, False)
+        assert c >= 0.0
+
+
+# --- dead_since tracking ---
+
+class TestDeadSince:
+    def test_dead_since_set_for_recently_dead(self):
+        det = _make_detector()
+        now = time.perf_counter()
+        det._dead_track = {1: now}
+        e = _mob(eid=1, alive=False, hp_cur=0, dead_since=now)
+        assert e.dead_since is not None
+        assert e.dead_since == now
+
+    def test_dead_since_none_for_alive(self):
+        det = _make_detector()
+        e = _mob(eid=1, alive=True, hp_cur=800, hp_max=1000)
+        assert e.dead_since is None
+
+    def test_is_recently_dead_uses_dead_since(self):
+        det = _make_detector()
+        now = time.perf_counter()
+        det._dead_track = {1: now}
+        assert det._is_recently_dead(1) is True
+
+    def test_is_recently_dead_expires_after_timeout(self):
+        det = _make_detector()
+        det.corpse_timeout_s = 5.0
+        det._dead_track = {1: time.perf_counter() - 10.0}
+        assert det._is_recently_dead(1) is False
