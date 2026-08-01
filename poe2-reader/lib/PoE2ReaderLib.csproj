@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <DefineConstants>$(DefineConstants);READER_LIB</DefineConstants>
+    <AssemblyName>PoE2ReaderLib</AssemblyName>
+    <RootNamespace>PoE2Reader</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Program.cs" />
+  </ItemGroup>
+
+</Project>

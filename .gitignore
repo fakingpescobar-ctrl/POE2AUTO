@@ -17,6 +17,14 @@ bot_stderr.log
 # Project artifacts (не относятся к боту)
 graphify-out/
 
+# C# ридер памяти (poe2-reader/) — собираемые артефакты
+# Исходники (Program.cs, *.csproj) коммитим, артефакты сборки — нет.
+# Собрать DLL: build_reader.bat (нужен .NET 8 SDK).
+poe2-reader/**/bin/
+poe2-reader/**/obj/
+poe2-reader/**/*.user
+
 # OS
 Thumbs.db
 desktop.ini
+nul
