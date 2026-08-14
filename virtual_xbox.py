@@ -122,6 +122,16 @@ class VirtualXbox360:
             self._pad.right_joystick(x_value=x, y_value=y)
             self._pad.update()
 
+    def reset_state(self):
+        """Сброс виртуального геймпада в нейтраль: стики в центр, триггеры 0,
+        все кнопки отпущены. Вызывается при обрыве/реконнекте DualSense, чтобы
+        зажатые в момент отвала стики/кнопки не остались «залипшими» в игре."""
+        if not self._pad:
+            return
+        with self._lock:
+            self._pad.reset()
+            self._pad.update()
+
     def set_left_trigger(self, value):
         if not self._pad:
             return

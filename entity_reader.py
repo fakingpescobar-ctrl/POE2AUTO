@@ -73,7 +73,7 @@ class EntityReader:
     NON_COMBAT_KEYWORDS = (
         "Summoned", "/Daemon/", "Invisible", "MonsterMods", "TormentedSpirit",
         "Wisp", "/Spirit/", "Spectre", "Phantom", "Illusion", "Duplicate",
-        "Clone", "Shade", "Wraith", "Ghost", "Undead", "Skeleton",
+        "Clone", "Shade", "Wraith", "Ghost", "Undead",
         "Rogue", "TreasureGuard", "Trap", "Mine", "Explosive",
         "Blighted", "Seething", "Festering", "Carrion",
     )

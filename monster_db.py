@@ -54,6 +54,12 @@ CREATE INDEX IF NOT EXISTS idx_session ON monster_events(session_id);
 CREATE INDEX IF NOT EXISTS idx_ts ON monster_events(ts);
 CREATE INDEX IF NOT EXISTS idx_addr_session ON monster_events(addr, session_id);
 CREATE INDEX IF NOT EXISTS idx_name_session ON monster_events(name, session_id);
+-- Kill-cooldown запрос: SELECT DISTINCT addr WHERE session_id=? AND status='dead'
+-- AND ts>=? AND EXISTS(... combat ...). Без этого индекса SQLite сканирует ВСЮ
+-- сессию (сотни тысяч строк) на КАЖДЫЙ вызов get_recently_killed_addrs — ридер
+-- вставал на 3 сек при раздутой БД (1.1M строк).
+CREATE INDEX IF NOT EXISTS idx_session_status_ts
+    ON monster_events(session_id, status, ts);
 """
 
 
@@ -433,12 +439,28 @@ class MonsterDB:
                 if not row:
                     return set()
                 sid = row[0]
-            now = time.perf_counter()
+            # ВАЖНО: ts пишется как time.time() (Unix-эпоха, см. record_frame).
+            # Раньше тут был time.perf_counter() — монотонный счётчик с маленькими
+            # значениями, условие ts >= cutoff выполнялось для ВСЕХ строк сессии,
+            # и cooldown превращался в «вечный». Теперь часы согласованы.
+            now = time.time()
             cutoff = now - cooldown_s
+            # ВАЖНО: cooldown только для мобов, которые РЕАЛЬНО атаковались
+            # (были COMBAT) в этой сессии и ПОТОМ стали dead. Раньше брался
+            # любой status='dead' — а record_frame пишет текущую классификацию
+            # каждый кадр. Моб, однажды увиденный dead (исчез из кадра / был
+            # убит кем-то), застревал в cooldown НАВСЕГДА: dead-строка
+            # продлевала cooldown, cooldown возвращал DEAD, DEAD снова писался.
+            # Пример: VaalBloodPriestFemale hp 8315/12281 (живой!) числился
+            # dead минутами. Требуем наличие combat-строки ДО dead.
             rows = conn.execute(
-                "SELECT DISTINCT addr FROM monster_events "
-                "WHERE session_id = ? AND ts >= ? AND status = 'dead'",
-                (sid, cutoff)).fetchall()
+                "SELECT DISTINCT d.addr FROM monster_events d "
+                "WHERE d.session_id = ? AND d.status = 'dead' AND d.ts >= ? "
+                "AND EXISTS (SELECT 1 FROM monster_events c "
+                "            WHERE c.session_id = d.session_id "
+                "              AND c.addr = d.addr AND c.status = 'combat' "
+                "              AND c.ts >= ? AND c.ts <= d.ts)",
+                (sid, cutoff, cutoff)).fetchall()
         finally:
             conn.close()
         return {r[0] for r in rows if r[0]}

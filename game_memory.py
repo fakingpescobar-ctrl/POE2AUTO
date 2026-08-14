@@ -216,16 +216,32 @@ class GameMemory:
             return None
 
     def read_string_utf16(self, address: int, max_len: int = 256) -> Optional[str]:
-        """Read null-terminated UTF-16 string."""
+        """Read null-terminated UTF-16 string.
+
+        PoE2 пути часто имеют leaked мусор после NUL-terminator (например,
+        trailing `*\x01\x00\x00...` от соседних heap-allocations), что вызывает
+        UnicodeDecodeError при strict decode. Решение: найти двойной-NUL runtime
+        boundary и декодировать только валидный префикс.
+        """
         raw = self.read_bytes(address, max_len * 2)
         if raw is None:
             return None
+        # находим NUL-terminator (два подряд 0x00 байта на чётной позиции)
+        nul = raw.find(b"\x00\x00")
+        if nul > 0 and nul % 2 == 0:
+            raw = raw[:nul]
+        elif nul == 0:
+            return ""
         try:
-            s = raw.decode("utf-16-le")
-            idx = s.find("\x00")
-            return s[:idx] if idx >= 0 else s
+            return raw.decode("utf-16-le")
         except Exception:
-            return None
+            try:
+                # fallback с errors='replace' — часть пути валидна
+                s = raw.decode("utf-16-le", errors="replace")
+                idx = s.find("\x00")
+                return s[:idx] if idx >= 0 else s
+            except Exception:
+                return None
 
     def read_std_wstring(self, address: int) -> Optional[str]:
         """Read std::wstring. MSVC x64 layout:

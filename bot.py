@@ -35,14 +35,18 @@ from hp_locate import find_digits_roi, derive_orb
 from mob_bar import MobBarDetector
 from zone_detector import ZoneDetector
 from mem_detect import MemoryMobDetector
-from ec2_detect import EC2MobDetector
-from reader_detect import ReaderMobDetector
+from reader_detect import ReaderMobDetector, TargetStatus
+from entity_reader import EntityCategory
 from diag_dump import HPDiag, dump_loot, dump_attack_trigger
 from overlay import Overlay, OverlayState
 from auto_flask import AutoFlaskEngine, FlaskRule, FlaskState, FlaskDecision, default_rules
 from virtual_xbox import VirtualXbox360, XUSB
 from dualsense_bridge import DualSenseBridge
 from utils import Toggle, build_detector, build_loot_engine
+from nav_worker import NavWorker
+from game_memory import GameMemory as _GM
+from stash_flow import open_maps_tab as _open_maps_tab, summarize_items as _summarize, list_stash_tabs as _list_stash_tabs, filter_maps as _filter_maps, read_all_maps as _read_all_maps
+from map_run_flow import run_map_flow as _run_map_flow
 
 LOG_PATH = os.path.join(os.path.dirname(__file__), "bot.log")
 
@@ -108,13 +112,18 @@ class LootWorker(threading.Thread):
                 loot_frame, loot_ctr, foreground = self._frame_q.get(timeout=0.1)
             except queue.Empty:
                 continue
-            with self._cfg_lock:
-                detector = self.detector
-                engine = self.engine
-            points, _mask = detector.detect(loot_frame)
-            in_radius = engine.targets_in_radius(points, loot_frame.shape, center=loot_ctr)
-            with self._result_lock:
-                self._result = (points, in_radius)
+            try:
+                with self._cfg_lock:
+                    detector = self.detector
+                    engine = self.engine
+                points, _mask = detector.detect(loot_frame)
+                in_radius = engine.targets_in_radius(points, loot_frame.shape, center=loot_ctr)
+                with self._result_lock:
+                    self._result = (points, in_radius)
+            except Exception:
+                # Защита от молчаливой гибели потока: падение в детекте лута
+                # не должно убивать LootWorker (пикап бы молча умер).
+                log.exception("LootWorker: ошибка детекта лута")
 
 
 class AttackWorker(threading.Thread):
@@ -344,10 +353,10 @@ def main() -> int:
         return True
 
     # старт: пробуем авто-локализацию (HUD может быть не виден сразу — несколько попыток);
-    # не вышло → работаем по ROI из конфига и продолжаем искать в главном цикле.
+    # не вышло → работаем по ROI из конфига и продолжаем искать в фоне.
     located = False
     if hp_enabled and num_cfg.get("enabled") and num_cfg.get("auto_locate"):
-        for _ in range(20):                       # ~до 2с попыток на старте
+        for _ in range(5):                       # ~до 0.5с на старте (полный скан кэшируется)
             if try_locate_hud("старт"):
                 located = True
                 break
@@ -390,51 +399,23 @@ def main() -> int:
     atk_cfg = cfg.get("auto_attack", {})
     atk_enabled = bool(atk_cfg.get("enabled"))
     # detect_mode: "reader" (встроенный C# ридер, ОДИН процесс — pythonnet) |
-    # "ec2" (ExileCore2 TCP, рекомендуется) | "memory" (PROCESS_VM_READ, старый external) |
+    # "memory" (PROCESS_VM_READ, старый external) |
     # False/"cv" (CV-детект полосы HP)
     # Backward compat: True → "memory", False → "cv"
-    _raw_mode = atk_cfg.get("use_memory", "ec2")
+    _raw_mode = atk_cfg.get("use_memory", "reader")
     if _raw_mode is True or _raw_mode == "memory":
         detect_mode = "memory"
-    elif _raw_mode == "ec2":
-        detect_mode = "ec2"
     elif _raw_mode == "reader":
         detect_mode = "reader"
     else:
         detect_mode = "cv"
-    use_memory = detect_mode in ("memory", "ec2", "reader")  # bool для совместимости
+    use_memory = detect_mode in ("memory", "reader")  # bool для совместимости
 
-    if detect_mode == "ec2" and atk_enabled:
-        # ExileCore2 TCP bridge: данные из инжектированного плагина (не ломается на патчах)
-        ec2_cfg = cfg.get("exilecore2", {})
-        mob_det = EC2MobDetector({
-            "attack_range": atk_cfg.get("attack_range", 15.0),
-            "ec2_host": ec2_cfg.get("host", "127.0.0.1"),
-            "ec2_port": ec2_cfg.get("port", 50006),
-        })
-        cv_det = None  # CV fallback не нужен — EC2 не ломается на патчах
-        if not mob_det.connect():
-            log.warning("EC2 detection: не удалось подключиться к ExileCore2 ShareData "
-                        "(%s:%d) — откат на CV-детект. "
-                        "Запусти Loader.exe с плагином ShareData.",
-                        ec2_cfg.get("host", "127.0.0.1"),
-                        ec2_cfg.get("port", 50006))
-            mob_det = None
-            use_memory = False
-            detect_mode = "cv"
-            _atk_fallback_reason = "EC2 → CV: нет подключения к ShareData"
-        else:
-            _atk_fallback_reason = ""
-            log.info("EC2 detection: подключено к ExileCore2 ShareData")
-    elif detect_mode == "reader" and atk_enabled:
+    if detect_mode == "reader" and atk_enabled:
         # Reader bridge: встроенный C# ридер через pythonnet (ОДИН процесс, без TCP).
-        # bot.py сам читает память PoE2 — не нужен отдельный PoE2Reader.exe / ExileCore2.
+        # bot.py сам читает память PoE2 — не нужен отдельный процесс.
         mob_det = ReaderMobDetector({
-            "attack_range": atk_cfg.get("attack_range", 15.0),
-            "ignore_static_mobs": atk_cfg.get("ignore_static_mobs", True),
-            "static_grace_s": atk_cfg.get("static_grace_s", 2.0),
-            "min_hp_threshold": atk_cfg.get("min_hp_threshold", 0),
-            "attack_unknown_hp": atk_cfg.get("attack_unknown_hp", True),
+            **atk_cfg,
             # SQLite телеметрия мобов (полный дамп по кадрам для дебага/аналитики).
             "monster_db": cfg.get("monster_db", {}),
         })
@@ -490,7 +471,7 @@ def main() -> int:
         # CV-based fallback: детект полосы HP моба по цвету
         mob_det = MobBarDetector(atk_cfg)
 
-    zone_det = None  # memory/ec2 detector делает in_hideout() сам
+    zone_det = None  # memory/reader detector делает in_hideout() сам
     if detect_mode == "cv" and atk_enabled:
         zone_det = ZoneDetector(atk_cfg.get("zone", {}))
 
@@ -501,7 +482,7 @@ def main() -> int:
     attack_worker = AttackWorker(mob_det, zone_det, use_memory=use_memory, cv_det=cv_det)
     if atk_enabled:
         attack_worker.start()
-        mode = {"ec2": "EC2", "memory": "MEMORY", "reader": "READER", "cv": "CV"}.get(detect_mode, "CV")
+        mode = {"memory": "MEMORY", "reader": "READER", "cv": "CV"}.get(detect_mode, "CV")
         log.info("Авто-атака ВКЛ (%s): кнопка=%s режим=%s",
                  cfg["hotkeys"].get("attack", "f2").upper(),
                  atk_cfg.get("button", "right_bumper"), mode)
@@ -544,6 +525,22 @@ def main() -> int:
     k_flask = cfg["hotkeys"].get("flask", "f3")
     k_radial = cfg["hotkeys"].get("radial", "f4")
     k_reload = "f5"
+    k_nav = cfg["hotkeys"].get("nav", "f1")
+    k_stash = cfg["hotkeys"].get("stash", "f11")
+    k_map_run = cfg["hotkeys"].get("map_run", "f10")
+
+    # --- навигация (Core Mapping) ---
+    nav_enabled = bool(cfg.get("nav", {}).get("enabled", False))
+    nav_worker = None
+    if nav_enabled:
+        try:
+            nav_worker = NavWorker(vx, cfg=cfg.get("nav", {}))
+            nav_worker.start()
+            log.info("Навигация (Core Map) ВКЛ — цель из nav_target.json (хоткей %s)",
+                     k_nav.upper())
+        except Exception as e:
+            log.error("Навигация не запустилась: %s", e)
+            nav_worker = None
 
     def reload_cfg() -> None:
         """Hot-reload: перечитать config.yaml и применить безопасные параметры на лету."""
@@ -590,7 +587,7 @@ def main() -> int:
         old_mob_det = mob_det
         cv_det = None
         if use_memory and atk_enabled:
-            if mob_det is None or not isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)):
+            if mob_det is None or not isinstance(mob_det, (MemoryMobDetector, ReaderMobDetector)):
                 mob_det = MemoryMobDetector({"attack_range": atk_cfg.get("attack_range", 15.0)})
                 mob_det.connect()
             else:
@@ -607,7 +604,7 @@ def main() -> int:
         else:
             mob_det = None
         # закрыть handle старого memory-детектора если режим сменился
-        if old_mob_det is not None and isinstance(old_mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)):
+        if old_mob_det is not None and isinstance(old_mob_det, (MemoryMobDetector, ReaderMobDetector)):
             if old_mob_det is not mob_det:
                 try:
                     old_mob_det.disconnect()
@@ -638,12 +635,174 @@ def main() -> int:
         ov_state.notification_until = time.time() + 5.0
         ov_state.atk_fallback = _atk_fallback_reason
 
+    # --- stash flow state (F11) ---
+    _stash_running = {"on": False}
+    _stash_lock = threading.Lock()
+
+    def _stash_task() -> None:
+        """Открыть вкладку MAPS и залогировать результат. Отдельный процесс-хэндл памяти
+        (наш StashReader использует GameMemory с ReadProcessMemory — без конфликта с
+        reader_bridge, который владеет pythonnet). Переключение R1/L1 — через тот же vx,
+        что в bot.py main (DualSenseBridge → vx → XInput-слот PoE2)."""
+        with _stash_lock:
+            if _stash_running["on"]:
+                return
+            _stash_running["on"] = True
+        try:
+            mem = _GM()
+            if not mem.connect():
+                log.warning("Stash: GameMemory.connect() failed — PoE2 pid не найден")
+                ov_state.notification = "Stash: не подключиться к PoE2"
+                ov_state.notification_until = time.time() + 4.0
+                return
+            try:
+                # сначала: какие вообще вкладки есть
+                names = _list_stash_tabs(mem, vx)
+                if names:
+                    log.info("Stash tabs (%d): %s", len(names), ", ".join(names))
+                # открываем MAPS — получаем ВСЕ items одним ItemView-scan (а не двумя)
+                ok, msg, items = _open_maps_tab(mem, vx)
+                main_maps = _filter_maps(items) if items else None
+                log.info("Stash flow: ok=%s msg=%s items=%s main_tab_maps=%s",
+                         ok, msg,
+                         len(items) if items else 0,
+                         len(main_maps) if main_maps else 0)
+                if items:
+                    log.info("Stash MAPS open tab dump: %s", _summarize(items))
+                # отдельно — все карты из подвкладок MAPS (12×8 subtabs, разных tier)
+                all_maps = _read_all_maps(mem)
+                log.info("Stash all subtabs: total maps=%d (across %d subtabs)",
+                         len(all_maps), len({m.container for m in all_maps}))
+                if all_maps:
+                    # group by tier (MapKeyTierNN)
+                    tiers: dict = {}
+                    for m in all_maps:
+                        tier = m.path.split("MapKeyTier")[-1] if "MapKeyTier" in m.path else "?"
+                        tiers[tier] = tiers.get(tier, 0) + 1
+                    tiers_s = ", ".join("Tier%s=%d" % (t, n) for t, n in sorted(tiers.items()))
+                    ov_state.notification = "Maps: %d (%s)" % (len(all_maps), tiers_s)
+                    ov_state.notification_until = time.time() + 8.0
+                    log.info("=== maps across all subtabs (total=%d, tiers: %s) ===",
+                             len(all_maps), tiers_s)
+                    for m in all_maps[:30]:
+                        log.info("  MAP id=%d container=0x%X (%d,%d) %dx%d %s",
+                                 m.id, m.container, m.grid_x, m.grid_y,
+                                 m.width, m.height, m.path)
+                elif main_maps:
+                    ov_state.notification = "Maps: %d (main tab)" % len(main_maps)
+                    ov_state.notification_until = time.time() + 6.0
+                else:
+                    ov_state.notification = "MAPS открыта, 0 карт (см. лог)"
+                    ov_state.notification_until = time.time() + 6.0
+            finally:
+                mem.disconnect()
+        finally:
+            with _stash_lock:
+                _stash_running["on"] = False
+
+    def trigger_stash() -> None:
+        if _stash_running["on"]:
+            log.info("Stash занят, пропускаем F11")
+            return
+        threading.Thread(target=_stash_task, daemon=True).start()
+
+    # ---------------- F10: map run flow (one-shot) ----------------
+    _map_run_running = {"on": False}
+    _map_run_lock = threading.Lock()
+
+    def _map_run_task() -> None:
+        """Полный цикл one-shot map-run (чистый VX360 flow, v2):
+        1) подойти к сташу → tap(A) открыть → R1/L1 до MAPS → D-pad до Tier N
+           → left stick на waystone → tap(Y) → в инвентарь → tap(B) закрыть
+        2) пройти к Map Device entity
+        3) tap(A) — открыть Atlas overview
+        4) left stick на голубую точку → tap(A) → info panel
+        5) left stick на waystone в инвентаре → tap(X) → слот Map Device
+        6) left stick на светящуюся TRAVERSE → tap(A) → запуск карты
+
+        Конфиг: cfg["map_run"] (target_tier, fallback_below, enter_portal_after,
+        map_device_world, stash_world, bindings{тайминги/калибровка}).
+
+        Использует собственный GameMemory (как _stash_task) — отдельный pythonnet
+        не открывает, только reading memory через Win32 ReadProcessMemory.
+        Использует vx из bot.py (владеет XInput-слотом), мышь НЕ используется —
+        весь ввод через виртуальный геймпад.
+        """
+        with _map_run_lock:
+            if _map_run_running["on"]:
+                return
+            _map_run_running["on"] = True
+        try:
+            mrcfg = cfg.get("map_run", {})
+            target_tier = int(mrcfg.get("target_tier", 16))
+            enter_portal_after = bool(mrcfg.get("enter_portal_after", False))
+            map_device_world = mrcfg.get("map_device_world", None)
+            if map_device_world and len(map_device_world) == 2:
+                map_device_world = tuple(map_device_world)
+            else:
+                map_device_world = None
+            stash_world = mrcfg.get("stash_world", None)
+            if stash_world and len(stash_world) == 2:
+                stash_world = tuple(stash_world)
+            else:
+                stash_world = None
+            bindings = mrcfg.get("bindings", {}) or {}
+
+            # overlay notification начинаем
+            ov_state.notification = "Map run: Tier %d..." % target_tier
+            ov_state.notification_until = time.time() + 30.0
+
+            # retra за кадром лог — отдельный mem
+            mem = _GM()
+            if not mem.connect():
+                log.warning("MapRun: GameMemory.connect() failed — PoE2 pid не найден")
+                ov_state.notification = "MapRun: нет PoE2"
+                ov_state.notification_until = time.time() + 4.0
+                return
+            try:
+                # выполним
+                def _progress(phase: str, status: str) -> None:
+                    log.info("MapRun[%s] %s", phase, status)
+                    if "FAIL" in status:
+                        ov_state.notification = "MapRun: %s" % status
+                        ov_state.notification_until = time.time() + 6.0
+                ok, msg = _run_map_flow(
+                    mem, vx,
+                    target_tier=target_tier,
+                    map_device_world=map_device_world,
+                    stash_world=stash_world,
+                    enter_portal_after=enter_portal_after,
+                    bindings=bindings,
+                    progress_cb=_progress,
+                )
+                log.info("MapRun result ok=%s msg=%s", ok, msg)
+                ov_state.notification = ("MapRun: OK %s" % msg if ok
+                                          else "MapRun FAIL: %s" % msg)[:120]
+                ov_state.notification_until = time.time() + 8.0
+            finally:
+                mem.disconnect()
+        finally:
+            with _map_run_lock:
+                _map_run_running["on"] = False
+
+    def trigger_map_run() -> None:
+        if _map_run_running["on"]:
+            log.info("MapRun занят, пропускаем F10")
+            return
+        threading.Thread(target=_map_run_task, daemon=True).start()
+
     def on_press(key) -> Optional[bool]:
         name = getattr(key, "name", None)
         if name == k_quit:
             log.info("Выход (F12)")
             stop.set()
             return False
+        if name == k_stash:
+            trigger_stash()
+            return
+        if name == k_map_run:
+            trigger_map_run()
+            return
         if name == k_toggle:
             state = auto.flip()
             log.info("Авто-подбор: %s", "ВКЛ" if state else "выкл")
@@ -669,13 +828,27 @@ def main() -> int:
                      ov_state.attack_range, ov_state.radial_scale)
         if name == k_reload:
             reload_cfg()
+        if name == k_nav and nav_worker is not None:
+            if nav_worker.is_active():
+                nav_worker.clear_target()
+                log.info("Навигация: остановлена")
+            else:
+                # цель из nav_target.json (если есть) — resume
+                tgt = nav_worker._read_target_file()
+                if tgt:
+                    nav_worker.set_target(*tgt)
+                    log.info("Навигация: возобновлена к (%.1f, %.1f)", tgt[0], tgt[1])
+                else:
+                    log.info("Навигация: нет цели в nav_target.json")
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     log.info("Готово. %s — подбор, %s — авто-атака, %s — авто-фляска, %s — диагностика, "
-             "%s — снимок, %s — оверлей, %s — круг радиуса, %s — перезагрузка, %s — выход.",
+             "%s — снимок, %s — оверлей, %s — круг радиуса, %s — перезагрузка, %s — выход, "
+             "%s — stash MAPS (R1/L1 + чтение карт).",
              k_toggle.upper(), k_attack.upper(), k_flask.upper(), k_diag.upper(),
-             k_shot.upper(), k_overlay.upper(), k_radial.upper(), k_reload.upper(), k_quit.upper())
+             k_shot.upper(), k_overlay.upper(), k_radial.upper(), k_reload.upper(),
+             k_quit.upper(), k_stash.upper())
 
     # --- главный цикл ---
     last_status = 0.0
@@ -794,7 +967,7 @@ def main() -> int:
                 # CV-фляга: пропускаем, если HP/Mana ведёт memory auto_flask
                 memory_flask_active = (
                     auto_flask.enabled and use_memory
-                    and mob_det is not None and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector))
+                    and mob_det is not None and isinstance(mob_det, (MemoryMobDetector, ReaderMobDetector))
                     and mob_det.available
                 )
                 if (flask.on and not memory_flask_active
@@ -817,7 +990,7 @@ def main() -> int:
 
             # --- AUTO-FLASK: memory-based rules (HP%, Mana%, enemies) ---
             if (auto_flask.enabled and flask.on and use_memory
-                    and mob_det is not None and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector))
+                    and mob_det is not None and isinstance(mob_det, (MemoryMobDetector, ReaderMobDetector))
                     and mob_det.available and foreground and not mob_det.in_hideout()
                     and time.perf_counter() - last_flask >= hp_cooldown):
                 hp_pct, mana_pct = mob_det.read_player_vitals()
@@ -851,14 +1024,12 @@ def main() -> int:
             ov_state.attacking = r1_held
             ov_state.attack_range = float(getattr(mob_det, "attack_range", 0.0) or 0.0)
             is_mem = (use_memory and mob_det is not None
-                      and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector))
+                      and isinstance(mob_det, (MemoryMobDetector, ReaderMobDetector))
                       and mob_det.available)
             is_cv = (mob_det is not None
-                     and not isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)))
+                     and not isinstance(mob_det, (MemoryMobDetector, ReaderMobDetector)))
             if is_mem:
-                if isinstance(mob_det, EC2MobDetector):
-                    ov_state.attack_mode = "EC2"
-                elif isinstance(mob_det, ReaderMobDetector):
+                if isinstance(mob_det, ReaderMobDetector):
                     ov_state.attack_mode = "RDR"
                 else:
                     ov_state.attack_mode = "MEM"
@@ -874,7 +1045,7 @@ def main() -> int:
             ov_state.presses = presses
             if atk_enabled and atk_cfg.get("use_memory", True):
                 mem_ok = (use_memory and mob_det is not None
-                          and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector))
+                          and isinstance(mob_det, (MemoryMobDetector, ReaderMobDetector))
                           and mob_det.available)
                 ov_state.memory_status = "ok" if mem_ok else "fallback"
                 if mem_ok:
@@ -882,7 +1053,7 @@ def main() -> int:
                 # Индикаторы модуля памяти для нижней строки оверлея:
                 #   mem_connected — детектор создан и подключился к процессу PoE2
                 #   mem_reading   — память реально читается (available = game_state != 0)
-                if mob_det is not None and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)):
+                if mob_det is not None and isinstance(mob_det, (MemoryMobDetector, ReaderMobDetector)):
                     ov_state.mem_connected = bool(getattr(mob_det, "_connected", False))
                     ov_state.mem_reading = bool(mob_det.available)
                     # Счётчики сущностей для оверлея
@@ -957,8 +1128,17 @@ def main() -> int:
                          f"{hp_engine.hp_pct*100:.0f}%" if hp_engine.hp_pct is not None else "-",
                          hp_engine.hp_src, hp_engine.low_streak,
                          flasks, atk_state, fps)
+                # Навигация (Core Map)
+                if nav_worker is not None:
+                    nst = nav_worker.get_status()
+                    ns = nst.get("status", "idle")
+                    nt = nst.get("target")
+                    nt_s = f"(%.0f,%.0f)" % nt if nt else "-"
+                    log.info("NAV: %s target=%s wp=%d/%d obs=%d err=%s",
+                             ns, nt_s, nst.get("wp_idx", 0), nst.get("path_len", 0),
+                             nst.get("obstacles", 0), nst.get("error", ""))
                 # Диагностика сущностей для memory-режима: total/hostile/in_range/nearest
-                if mob_det is not None and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)):
+                if mob_det is not None and isinstance(mob_det, (MemoryMobDetector, ReaderMobDetector)):
                     try:
                         _ah = mob_det.get_all_hostiles()
                         _nd = min((e.distance for e in _ah), default=None)
@@ -966,6 +1146,22 @@ def main() -> int:
                         log.info("ENT: total=%d hostile=%d in_range=%d nearest=%s range=%.1f",
                                  ov_state.ent_total, len(_ah), ov_state.ent_in_range,
                                  _nd_s, mob_det.attack_range)
+                        if isinstance(mob_det, ReaderMobDetector):
+                            _ts = getattr(mob_det, "stats", {}).get("target_status", {})
+                            _fire = getattr(mob_det, "_player_fire_time", 0.0)
+                            _age = (time.time() - _fire) if _fire else -1
+                            log.info("ENTD: status=%s fire_age=%.1fs player=%s",
+                                     _ts, _age, getattr(mob_det, "_player_pos", None))
+                            _near = [e for e in mob_det._last_entities
+                                     if e.category == EntityCategory.MONSTER and not e.is_friendly
+                                     and e.distance < 70]
+                            _near.sort(key=lambda e: e.distance)
+                            for e in _near[:6]:
+                                _st = mob_det._classify_target(e)
+                                _tr = mob_det._static_track.get(e.id, {})
+                                log.info("ENTD   d=%5.1f st=%-11s hp=%d/%d reach=%s | %s",
+                                         e.distance, _st, e.hp_current, e.hp_max,
+                                         e.is_reachable, e.metadata[-44:])
                     except Exception:
                         pass
                 # debug overlay info
@@ -990,7 +1186,11 @@ def main() -> int:
     finally:
         attack_worker.stop()
         attack_worker.join(timeout=1.0)
-        if use_memory and mob_det is not None and isinstance(mob_det, (MemoryMobDetector, EC2MobDetector, ReaderMobDetector)):
+        if nav_worker is not None:
+            nav_worker.stop()
+            nav_worker.join(timeout=1.0)
+            log.info("Навигация остановлена")
+        if use_memory and mob_det is not None and isinstance(mob_det, (MemoryMobDetector, ReaderMobDetector)):
             mob_det.disconnect()
         loot_worker.stop()
         loot_worker.join(timeout=1.0)

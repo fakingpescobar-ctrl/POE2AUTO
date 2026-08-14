@@ -1,13 +1,13 @@
 """Детектор мобов через ReaderBridge (Python↔C# pythonnet мост, один процесс).
 
-Drop-in замена EC2MobDetector / MemoryMobDetector: тот же интерфейс, но данные
+Drop-in замена MemoryMobDetector: тот же интерфейс, но данные
 читаются напрямую из памяти PoE2 через PoE2ReaderLib.dll, БЕЗ TCP и БЕЗ отдельного
-PoE2Reader.exe.
+процесса.
 
 Преимущества:
   - ОДИН процесс: bot.py сам читает память, не нужно запускать отдельное приложение
-  - НЕ зависит от внешних сервисов (нет ExileCore2/ShareData/TCP :50006)
-  - Патчи PoE2: AOB scan GSO обновляется в C# коде (как и в PoE2Reader.exe)
+  - НЕ зависит от внешних сервисов (нет внешних ридеров/TCP)
+  - Патчи PoE2: AOB scan GSO обновляется в C# коде
 
 Требования:
   - pythonnet>=3.0 (pip install pythonnet)
@@ -72,10 +72,10 @@ class TargetStatus:
     ATTACKABLE = frozenset({COMBAT})
 
     # Alive but on different Z-level or too far to be a valid target.
-    UNREACHABLE = frozenset()
+    UNREACHABLE = "unreachable"
 
     # Recently dead entity (corpse) — may have loot, not a combat target.
-    CORPSE = frozenset()
+    CORPSE = "corpse"
 
     # Статусы, которые технически живы (для статистики «всего живых»).
     LIVING = frozenset({LATENT, GHOST_STATIC, UNKNOWN, COMBAT, UNREACHABLE})
@@ -84,7 +84,7 @@ class TargetStatus:
 class ReaderMobDetector:
     """Детект мобов через прямой ReaderBridge (один процесс, без TCP).
 
-    Реализует тот же интерфейс что и EC2MobDetector / MemoryMobDetector:
+    Реализует тот же интерфейс что и MemoryMobDetector:
       - connect() / disconnect()
       - available (property)
       - update() -> bool
@@ -112,7 +112,7 @@ class ReaderMobDetector:
         "o": EntityCategory.OTHER,
     }
 
-    # Hideout / town area codes в PoE2 (миррор EC2MobDetector)
+    # Hideout / town area codes в PoE2
     _HIDEOUT_CODES = ("hideout", "playerhideout", "guildhideout", "delvemine")
     _TOWN_CODES = ("_town", "town")
 
@@ -123,6 +123,13 @@ class ReaderMobDetector:
         # Параметры
         self.attack_range = cfg.get("attack_range", 15.0)
         self.attack_range_sq = self.attack_range ** 2
+        # Допуск по Z-слою: |dz| больше этого = сущность на другом этаже/слое
+        # (аурные даемоны модов, подводные твари). 25 было мало: на наклонных
+        # аренах (Gallows/босс-гиены) соседние мобы имеют dz 27-37 и резались
+        # в UNREACHABLE при том, что стоят в радиусе атаки. У конструктов
+        # (VaalConstruct*) Z читается криво со сдвигом ~80, у гигантов ~95.
+        # 120 отсекает этажи (dz 300+) но пропускает кривые/наклонные соседей.
+        self.z_tolerance = float(cfg.get("z_tolerance", 120.0))
 
         # Фильтр статичных «призраков»: моб числится живым в памяти (Life-флаг
         # смерти == 0), но НИ РАЗУ не сдвинулся с места с момента появления —
@@ -139,6 +146,17 @@ class ReaderMobDetector:
         # (loot not yet picked up, death animation still playing).
         # Uses MonsterDB kill tracking; only active when monster_db is enabled.
         self.kill_cooldown_s = float(cfg.get("kill_cooldown_s", 5.0))
+        # Кэш cooldown-множества: get_recently_killed_addrs открывает read-only
+        # SQLite-соединение + SELECT DISTINCT на каждый вызов. В _classify_target
+        # он зовётся на КАЖДУЮ враждебную сущность КАЖДОГО кадра (20 Гц) — при
+        # толпе это десятки соединений/сек. Кэшируем результат на короткий TTL.
+        self._kill_cooldown_cache: set = set()
+        self._kill_cooldown_cache_ts = 0.0
+        # Кэш обновляется не чаще раза в 2 сек: SQLite-запрос с коррелированным
+        # подзапросом по таблице в сотни тысяч строк дорогой — при TTL 0.1 сек
+        # ридер вставал на ~3 сек каждые 100 мс (реальная частота опроса 2 Гц).
+        # Cooldown 5 сек не требует свежести 100 мс — 2 сек более чем достаточно.
+        self._kill_cooldown_cache_ttl = 2.0
         # Порог HP: моб с hp_cur <= min_hp при hp_max>0 — LATENT (умирает/пустышка),
         # в атаку не идёт. Rare/Unique/боссы этим порогом не отсекаются.
         self.min_hp_threshold = int(cfg.get("min_hp_threshold", 0))
@@ -264,6 +282,9 @@ class ReaderMobDetector:
         if self._area_hash != self._last_area_hash:
             self._static_track.clear()
             self._last_area_hash = self._area_hash
+            # Смена зоны → старые адреса мобов невалидны, сброс cooldown-кэша.
+            self._kill_cooldown_cache = set()
+            self._kill_cooldown_cache_ts = 0.0
 
         # Позиция игрока: из Render-компонента игрока в дереве (тот же источник,
         # что у мобов — корректна при любом патче). area+0xA90 протух (0xA90
@@ -325,7 +346,7 @@ class ReaderMobDetector:
         self.update()
         return self.stats["hostile_in_range"] > 0
 
-    # --- Entity queries (те же что у EC2MobDetector) ---
+    # --- Entity queries ---
 
     def get_nearest_hostile(self) -> Optional[EntityData]:
         """Ближайший враждебный моб в радиусе атаки."""
@@ -489,9 +510,12 @@ class ReaderMobDetector:
         # 1c) KILL COOLDOWN — моб был убит недавно (из monster_db).
         # Не атакуем — дроп ещё не поднят / анимация смерти.
         if self.db is not None and self.kill_cooldown_s > 0:
-            recently_killed = self.db.get_recently_killed_addrs(
-                cooldown_s=self.kill_cooldown_s)
-            if entity.id in recently_killed:
+            now = time.perf_counter()
+            if now - self._kill_cooldown_cache_ts >= self._kill_cooldown_cache_ttl:
+                self._kill_cooldown_cache = self.db.get_recently_killed_addrs(
+                    cooldown_s=self.kill_cooldown_s)
+                self._kill_cooldown_cache_ts = now
+            if entity.id in self._kill_cooldown_cache:
                 return TargetStatus.DEAD
 
         # 1a) UNREACHABLE - alive but different Z-level or too far.
@@ -577,6 +601,12 @@ class ReaderMobDetector:
         if not self.ignore_static or significant:
             return TargetStatus.COMBAT
         now = time.perf_counter()
+        # Моб уже в радиусе атаки — реальная цель (призраки вплотную не подходят,
+        # а живые стрелки стоят и бьют). Не ждём первого шага — бьём сразу.
+        # is_alive/hp_current>0 — страховка: труп рядом с игроком не атакуем.
+        if (entity.distance <= self.attack_range
+                and entity.is_alive and entity.hp_current > 0):
+            return TargetStatus.COMBAT
         # Игрок под вражеским огнём — в бою: стоячий стрелок становится целью.
         if now - self._player_fire_time < 2.0:
             return TargetStatus.COMBAT
@@ -720,7 +750,7 @@ class ReaderMobDetector:
         # твари) не видны и недостижимы — считаем их «не живыми» для атаки.
         # Исключение: Rare/Unique/боссы (у гигантов z читается криво, dz ~+95).
         dz = abs(float(raw.get("z") or 0.0) - self._player_z)
-        z_ok = dz <= 25.0
+        z_ok = dz <= self.z_tolerance
         rarity = Rarity(raw.get("rarity", 0)) if raw.get("rarity") is not None else Rarity.NORMAL
         is_boss = bool(raw.get("is_boss", False))
         significant = rarity >= Rarity.RARE or is_boss

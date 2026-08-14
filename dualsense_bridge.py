@@ -10,6 +10,7 @@ VirtualXbox360. Реальный DualSense при этом остаётся «к
 """
 import logging
 import threading
+import time
 
 import hid
 
@@ -57,6 +58,8 @@ class DualSenseBridge:
         # бот выставляет True, пока сам жмёт триггер (чтобы мост не перетирал)
         self._suppress_triggers = False
         self._suppress_lock = threading.Lock()
+        # дебаунс предупреждений об обрыве: не дублируем чаще раза в 30 с
+        self._last_warn_ts = 0.0
 
     @property
     def suppress_triggers(self):
@@ -104,6 +107,15 @@ class DualSenseBridge:
         consecutive_errors = 0
         RECONNECT_THRESHOLD = 5  # подряд ошибок до попытки реконнекта
         while not self._stop.is_set():
+            if self._dev is None:
+                # Устройство пропало — не читаем из None, сразу реконнект
+                if self._try_reconnect():
+                    consecutive_errors = 0
+                    prev8 = prev9 = 0
+                else:
+                    _log.error("DualSense: реконнект не удался, повтор через 3с")
+                    self._stop.wait(3.0)
+                continue
             try:
                 report = self._dev.read(64, timeout_ms=200)
                 if not report or len(report) < 11:
@@ -147,11 +159,23 @@ class DualSenseBridge:
             except Exception as e:
                 consecutive_errors += 1
                 if consecutive_errors == 1:
-                    _log.warning("DualSense: ошибка чтения HID — возможен обрыв соединения")
+                    now = time.monotonic()
+                    if now - self._last_warn_ts >= 30.0:
+                        _log.warning("DualSense: ошибка чтения HID — возможен обрыв "
+                                     "соединения, сбрасываю виртуальный геймпад")
+                        self._last_warn_ts = now
+                    self._vx.reset_state()  # гасим залипшие стики/кнопки в игре
                 if consecutive_errors >= RECONNECT_THRESHOLD:
+                    if self._dev is not None:
+                        try:
+                            self._dev.close()
+                        except Exception:
+                            pass
+                        self._dev = None  # битый дескриптор дальше не используем
                     if self._try_reconnect():
                         consecutive_errors = 0
                         prev8 = prev9 = 0
+                        self._vx.reset_state()  # чистое состояние после реконнекта
                     else:
                         _log.error("DualSense: реконнект не удался, повтор через 3с")
                         self._stop.wait(3.0)
@@ -171,12 +195,21 @@ class DualSenseBridge:
             try:
                 self._dev = hid.device()
                 self._dev.open(DS_VID, DS_PID)
+                if self._stop.is_set():
+                    # stop() пришёл во время открытия — не возвращаем живое устройство
+                    try:
+                        self._dev.close()
+                    except Exception:
+                        pass
+                    self._dev = None
+                    return False
                 self._dev.write(_ACTIVATION)
                 _log.info("DualSense: реконнект успешен (попытка %d)", attempt + 1)
                 return True
             except Exception as e:
                 _log.debug("Реконнект попытка %d: %s", attempt + 1, e)
                 self._stop.wait(1.0)
+        self._dev = None  # все попытки провалились — дальше ждём появления
         return False
 
     @staticmethod

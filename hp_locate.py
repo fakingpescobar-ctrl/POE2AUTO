@@ -13,6 +13,7 @@
 ВЫСОТЫ текста постоянно при любом UI Scale.
 """
 import re
+import time
 
 import cv2
 import numpy as np
@@ -25,6 +26,13 @@ from hp_ocr import binarize, norm_glyph
 ORB_DX = -0.134
 ORB_DY = 8.284
 ORB_R = 4.051
+
+# Кэш полного скана кадра: в меню/загрузке HUD не виден и кадр почти статичен, а
+# _find_in_region по всему кадру стоит ~0.6s (read_glyph на каждом блобе). На старте
+# бот зовёт find_digits_roi до 20 раз подряд — без кэша это ~12s блокировки. Дефолтный
+# (быстрый) регион пробуем всегда, а дорогой полный fallback — не чаще раза в _FULL_SCAN_TTL.
+_FULL_SCAN_TTL = 2.0
+_last_full_scan = 0.0
 
 
 def _components(binary, min_h, max_h, min_w=1):
@@ -138,6 +146,13 @@ def find_digits_roi(frame_bgr, reader, prefer_y=None, region=(0.0, 0.55, 0.42, 0
     full = (0.0, 0.0, 1.0, 1.0)
     if region == full:
         return None
+    # Дорогой полный скан кэшируем по времени: кадр в меню/загрузке почти статичен,
+    # повторный полный проход за TTL почти наверняка снова не найдёт строку.
+    global _last_full_scan
+    now = time.monotonic()
+    if now - _last_full_scan < _FULL_SCAN_TTL:
+        return None
+    _last_full_scan = now
     return _find_in_region(frame_bgr, reader, prefer_y, full,
                            min_h_frac, max_h_frac, pad_frac)
 

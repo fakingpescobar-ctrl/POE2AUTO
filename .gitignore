@@ -20,6 +20,12 @@ bot_stderr.log
 # Project artifacts (не относятся к боту)
 graphify-out/
 
+# Сторонний код для изучения (не часть бота)
+reference/
+
+# Одноразовый дебаг-скрипт
+flame_diff_elevate.bat
+
 # C# ридер памяти (poe2-reader/) — собираемые артефакты
 # Исходники (Program.cs, *.csproj) коммитим, артефакты сборки — нет.
 # Собрать DLL: build_reader.bat (нужен .NET 8 SDK).
@@ -32,6 +38,44 @@ _debug_*.py
 _diag_*.py
 diagnostics/
 _fight_log.txt
+
+# Одноразовые probe/watch/dump/scan/flame-скрипты (диагностика памяти)
+# probe_cast.py — РАБОЧИЙ модуль (используется core_map.py), коммитим.
+probe_axes.py
+probe_axes3.py
+probe_area.py
+probe_buttons.py
+probe_controller.py
+probe_core.py
+probe_core2.py
+probe_flame_burst.py
+probe_flame_button.py
+probe_hold_r1.py
+probe_stash_pos.py
+probe_stick_move.py
+probe_terrain.py
+probe_waypoint.py
+probe_xinput.py
+probe_xinput_hold.py
+watch_*.py
+dump_*.py
+scan_*.py
+flame_*.py
+whole_*.py
+wide_*.py
+heap_*.py
+grab_*.py
+cmp_life.py
+find_portal.py
+flow_recorder.py
+joy_daemon.py
+list_comps.py
+move_to_portal.py
+precision_move.py
+read_vitals_now.py
+sampler.py
+test_nav_npc.py
+win_mouse.py
 
 # OS
 Thumbs.db

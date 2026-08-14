@@ -61,13 +61,13 @@ hp_num:
 auto_attack:
   # авто-атака: держим R1, пока в радиусе есть живой враждебный моб.
   # use_memory=reader — встроенный C# ридер (ОДИН процесс, pythonnet → PoE2ReaderLib.dll).
-  #   НЕ нужен отдельный PoE2Reader.exe / ExileCore2 / TCP. Рекомендуется.
-  # use_memory=ec2 — ExileCore2 TCP bridge (нужен Loader.exe + ключ ExileCore2).
+  #   НЕ нужен отдельный процесс / TCP. Рекомендуется.
   # use_memory=memory — старый external PROCESS_VM_READ (ломается на патчах).
   # use_memory=false — CV-детект полосы HP моба по цвету (fallback).
   enabled: true
-  use_memory: reader          # reader (Recommended) | ec2 | memory | false
+  use_memory: reader          # reader (Recommended) | memory | false
   attack_range: 55.0     # радиус атаки в grid-координатах (позиция игрока теперь из Render-компонента; мобы "рядом" = ~120-150 grid)
+  z_tolerance: 120.0     # допуск по Z-слою для reachable (наклонные арены dz=27-37, кривое Z у конструктов ~80)
   # Статичные «призраки»: моб числится живым в памяти (Life-флаг смерти == 0),
   # но НИ РАЗУ не двигался с момента появления — спящие утопленники в воде /
   # декоративные трупы. На MapPort бот держал R1 по невидимому DrownedCrewAxe на
@@ -164,7 +164,7 @@ auto_attack:
 auto_flask:
   # автофляска через чтение памяти (HP/Mana% + кол-во врагов).
   # При use_memory=false используй CV-based фляску (hp.threshold и hp.cooldown_ms).
-  # Работает с use_memory=ec2 и use_memory=memory.
+  # Работает с use_memory=reader и use_memory=memory.
   enabled: true
   rules:
     - name: "HP Critical"
@@ -185,13 +185,6 @@ auto_flask:
       enemies_nearby: 3
       enemy_radius: 30.0
       cooldown_s: 2.0
-exilecore2:
-  # Настройки подключения к ExileCore2 ShareData плагину.
-  # ShareData — C# плагин, инжектируется ВНУТРЬ PoE2 через Loader.exe,
-  # поднимает TCP-сервер и отдаёт JSON с entities/HP/позициями.
-  # Установка: см. 0_guest/ в репозитории poe_bot или discord.gg/eMmeSyqEA3
-  host: 127.0.0.1       # IP машины с запущенным PoE2+ExileCore2
-  port: 50006           # TCP порт ShareData
 hotkeys:
   toggle: f8
   diag: f7
@@ -201,6 +194,9 @@ hotkeys:
   flask: f3
   radial: f4
   quit: f12
+  nav: f1
+  stash: f11
+  map_run: f10
 radial:
   # Наглядный круг радиуса авто-атаки вокруг персонажа (F4).
   # scale_px_per_grid — сколько пикселей экрана в одном grid по горизонтали
@@ -220,3 +216,60 @@ monster_db:
   batch_size: 50                # сколько строк накапливать перед INSERT (баланс память/IO)
   flush_interval_s: 1.0         # или писать раз в N секунд (что раньше — батч или таймаут)
   keep_days: 3                  # автоочистка записей старше N дней (0 = не чистить)
+
+# ========== НАВИГАЦИЯ (Core Mapping, F1) ==========
+# Ведёт персонажа к цели из nav_target.json, обходя стены и препятствия (A*).
+# Файл-цель пишет отдельный пайплайн (напр. Telegram): {"wx":3690.2,"wy":3755.4,"active":true}
+nav:
+  enabled: false                # true = запускать NavWorker при старте бота (F1 = пауза/резюм)
+  stop_dist: 0.5                # радиус прибытия к waypoint (world units)
+  wp_max_sec: 20.0              # таймаут на один waypoint
+  obstacle_inflate: 1           # насколько расширять препятствия (клетки)
+
+# ========== MAP RUN FLOW (F10) ==========
+# Полный цикл one-shot: взять Tier N waystone из сташа → прoйти к Map Device
+# → открыть UI → Ctrl+Click waystone из инвентаря в слот → Activate.
+# Гибридная модель адаптирована из tachikoma-av/poe_bot (Mapper2.activateMap).
+# Запускается из bot.py по F10 в отдельном daemon-треде с собственным GameMemory.
+# Не конфликтует с auto_attack (на время flow авто-атака глушится).
+map_run:
+  target_tier: 16                 # какой Tier искать в сташе (1..16)
+  fallback_below: true            # если target_tier нет — брать ближайший ниже
+  enter_portal_after: false       # после Activate ждать portal и входить в мапу
+  stop_dist_device: 2.5           # радиус прибытия к MappingDevice (world units)
+  walk_max_time_s: 25.0           # max время хождения к устройству
+  activate_max_tries: 10          # сколько HSV-проверок Activate button (каждые ~250ms)
+  activate_wait_after_s: 4.0      # сколько ждать закрытия UI Map Device после клика
+  # World координаты устройств в хайдауте. Подгоняешь под свой hideout через
+  # probe_waypoint или dump_actions. TODO Phase2: auto-find entity через reader.
+  map_device_world: [4266.3, 4266.3]  # (wx, wy) ZigguratMapDevice (probe 03.08)
+  # stash_world = ТОЧКА ПОДХОДА (где игрок стоит, когда открывает сундук),
+  # НЕ точка памяти сундука (3983.7, 5081.5) — она за коллайдером, недостижима.
+  # Замерено 03.08 вручную: персонаж подведён к сундуку, сташ открывается.
+  stash_world: [3950.2, 4963.2]      # (wx, wy) точка подхода к Stash
+  # Activate button screen-region (L,T,R,B в экран КООРДЫ). Кэлибруется —
+  # в зависимости от resolution окна. Игнорируй если Known; TODO Phase2:
+  # авто-поиск через UI-tree (UIElement path contains "MappingDevice").
+  activate_region_screen: [0, 0, 0, 0]  # пустой → возврат fallback (TODO)
+
+  # --- Чистый VX360 flow (v2): тайминги и калибровка ---
+  # Валидированные bindings (03.08.2026): A=open stash/dev, R1/L1=tabs,
+  # D-pad Right/Left=Tier-subtabs, Y=move to inv, X=place in slot, B=close.
+  bindings:
+    fallback_below: true            # если target_tier нет — брать ближайший ниже
+    stop_dist_stash: 25.0           # радиус прибытия к сташу (world units): коллайдер
+                                    # сундука не пускает ближе ~20 юнитов к точке подхода
+    walk_max_time_s: 90.0           # max время хождения к объекту
+    stash_open_settle_ms: 1200      # пауза после tap(A) на сташе (открытие UI)
+    tab_settle_ms: 450              # пауза после R1/L1 переключения вкладки
+    subtab_settle_ms: 600           # пауза после D-pad переключения Tier
+    transfer_settle_ms: 600         # пауза после tap(Y) переноса waystone
+    place_settle_ms: 600            # пауза после tap(X) в слот Map Device
+    grid_cell_hold_ms: 150          # сколько держать стик для сдвига на 1 клетку
+    grid_settle_ms: 90              # пауза после каждого сдвига курсора
+    grid_start_stash: [0, 0]        # стартовая клетка курсора в сташе (калибровка)
+    grid_start_inv: [0, 0]          # стартовая клетка курсора в инвентаре (калибровка)
+    atlas_nudge_ms: 120             # шаг стика при наведении на голубую точку
+    atlas_hit_radius: 40            # px: голубая точка считается "под курсором"
+    atlas_tap_settle_ms: 1200       # пауза после tap(A) на atlas-точке
+    traverse_region_screen: [0, 0, 0, 0]  # зона TRAVERSE кнопки (L,T,R,B), 0=HSV-поиск

@@ -1,7 +1,6 @@
 """ReaderBridge — Python-обёртка над C# PoE2ReaderLib.dll через pythonnet.
 
 Один процесс: читает память PoE2 напрямую через .NET сборку, вызывается из Python.
-Полностью заменяет отдельный PoE2Reader.exe + TCP :50006.
 
 Архитектура:
     PoE2 (PathOfExileSteam.exe)
@@ -65,7 +64,6 @@ def _ensure_pydotnet():
 class ReaderBridge:
     """Прямой мост Python ↔ C# PoE2ReaderLib.
 
-    Заменяет TCP-клиент (ec2_client.py) + отдельный PoE2Reader.exe.
     Один процесс, ноль TCP.
 
     Жизненный цикл:

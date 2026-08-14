@@ -27,6 +27,17 @@ def _make_detector(**overrides):
     det._dead_track = overrides.get("_dead_track", {})
     det._player_fire_time = overrides.get("_player_fire_time", 0.0)
     det.db = overrides.get("db", None)
+    det._player_pos = overrides.get("_player_pos", (0.0, 0.0))
+    det._player_z = overrides.get("_player_z", 0.0)
+    det.z_tolerance = overrides.get("z_tolerance", 120.0)
+    det._last_proj_d = overrides.get("_last_proj_d", {})
+    det._last_proj_ts = overrides.get("_last_proj_ts", 0.0)
+    det._player_hp = overrides.get("_player_hp", None)
+    det._last_entities = overrides.get("_last_entities", [])
+    det.stats = overrides.get("stats", {})
+    det._kill_cooldown_cache = set()
+    det._kill_cooldown_cache_ts = 0.0
+    det._kill_cooldown_cache_ttl = 0.1
     return det
 
 
@@ -146,8 +157,27 @@ class TestGhostStatic:
         det._static_track = {1: {"ever_moved": False, "ever_hit": False,
                                  "first_seen": time.perf_counter() - 10.0,
                                  "last_seen": 0.0, "last": (0, 0)}}
-        e = _mob(eid=1, hp_cur=800, hp_max=1000)
+        # Вне радиуса атаки: фильтр призраков работает как раньше
+        e = _mob(eid=1, hp_cur=800, hp_max=1000, distance=100.0)
         assert det._classify_target(e) == TargetStatus.GHOST_STATIC
+
+    def test_static_in_attack_range_is_combat(self):
+        # НОВОЕ: моб в радиусе атаки — реальная цель, не ждём движения (стрелок)
+        det = _make_detector(static_grace_s=2.0, attack_range=55.0)
+        det._static_track = {1: {"ever_moved": False, "ever_hit": False,
+                                 "first_seen": time.perf_counter() - 10.0,
+                                 "last_seen": 0.0, "last": (0, 0)}}
+        e = _mob(eid=1, hp_cur=800, hp_max=1000, distance=30.0)
+        assert det._classify_target(e) == TargetStatus.COMBAT
+
+    def test_static_in_range_but_corpse_is_ghost(self):
+        # НОВОЕ: труп в радиусе атаки не становится целью
+        det = _make_detector(static_grace_s=2.0, attack_range=55.0)
+        det._static_track = {1: {"ever_moved": False, "ever_hit": False,
+                                 "first_seen": time.perf_counter() - 10.0,
+                                 "last_seen": 0.0, "last": (0, 0)}}
+        e = _mob(eid=1, alive=False, hp_cur=0, hp_max=1000, distance=30.0)
+        assert det._classify_target(e) != TargetStatus.COMBAT
 
     def test_static_within_grace_is_combat(self):
         det = _make_detector(static_grace_s=2.0)
@@ -448,3 +478,141 @@ class TestBestTargetConfidence:
         best = det.get_best_target()
         assert best is not None
         assert best.id == 2  # boss wins
+
+
+# --- Кадровые сценарии (имитация update()) ---
+# Воспроизводят реальный цикл бота: read_entities_raw → _parse_entities →
+# _update_static_track → _classify_target. Позволяет отследить, на каком кадре
+# моб становится COMBAT (и почему) — например, задержку 2-3 сек, когда стоячий
+# стрелок в радиусе атаки классифицируется как GHOST_STATIC.
+
+def _raw_mob(eid=1, gx=30.0, gy=0.0, hp_cur=1000, hp_max=1000, alive=True,
+             hostile=1, rarity=0, path="/Monsters/Picts/PictMaleAxe",
+             z=0.0, is_boss=False):
+    """Сырой словарь сущности — формат как из ReaderBridge.read_entities_raw().
+
+    По умолчанию ПОЛНЫЙ HP (hp_cur == hp_max) — «стоячий стрелок, которого
+    ещё не били». Частичное HP (hp_cur < hp_max) означает ever_hit=True.
+    """
+    return {
+        "addr": eid, "path": path,
+        "grid_pos": [gx, gy], "world_pos": [gx * 10.87, gy * 10.87, z],
+        "entity_type": "m", "hostile": hostile, "alive": alive,
+        "z": z, "life": [hp_max, hp_cur, 0, 0, 0, 0, 0, 0, 0],
+        "rarity": rarity, "is_boss": is_boss,
+    }
+
+
+class TestFrameScenario:
+    """Имитация кадрового цикла update() без .NET bridge.
+
+    Каждый вызов _frame() = один кадр: парсинг raw → трек движения → классификация.
+    Возвращает dict addr → TargetStatus для hostile-монстров.
+    """
+
+    def _frame(self, det, raws):
+        det._last_entities = det._parse_entities(raws)
+        det._update_static_track(raws)
+        det._track_projectiles(raws)
+        return {e.id: det._classify_target(e) for e in det._last_entities
+                if e.category == EntityCategory.MONSTER and not e.is_friendly}
+
+    def _age_static_track(self, det, seconds=10.0):
+        """Сдвинуть first_seen всех треков в прошлое — имитация прошедшего
+        времени (в тестах кадры идут за мс, grace=2.0 не «протухает»)."""
+        for tr in det._static_track.values():
+            tr["first_seen"] = time.perf_counter() - seconds
+
+    def test_static_shooter_in_range_combat_immediately(self):
+        """БАГ-СЦЕНАРИЙ: стоячий стрелок в радиусе атаки → COMBAT сразу.
+
+        Раньше: моб никогда не двигался (ever_moved=False) и не бит
+        (ever_hit=False) → после static_grace_s=2.0 становился GHOST_STATIC
+        → бот молчал 2-3 сек, пока моб не сделает шаг / игрок не ударит.
+        Фикс: моб в attack_range = реальная цель, не ждём движения.
+        """
+        det = _make_detector(attack_range=55.0, static_grace_s=2.0)
+        raw = _raw_mob(eid=1, gx=30.0, gy=0.0, hp_cur=1000, hp_max=1000)
+        st = self._frame(det, [raw])
+        assert st[1] == TargetStatus.COMBAT, f"кадр 1: {st}"
+        # «Прошло» >grace: моб так и не двигался, но стоит в радиусе.
+        self._age_static_track(det)
+        for i in range(2, 6):
+            st = self._frame(det, [raw])
+            assert st[1] == TargetStatus.COMBAT, f"кадр {i}: {st}"
+
+    def test_static_shooter_outside_range_stays_ghost(self):
+        """Регрессия: призрак ВНЕ радиуса по-прежнему GHOST_STATIC.
+
+        Тот же стоячий моб, но на дистанции 100 — фильтр призраков должен
+        работать как раньше (не атакуем далёких спящих утопленников).
+        """
+        det = _make_detector(attack_range=55.0, static_grace_s=2.0)
+        raw = _raw_mob(eid=1, gx=100.0, gy=0.0, hp_cur=1000, hp_max=1000)
+        st = self._frame(det, [raw])
+        assert st[1] == TargetStatus.COMBAT, f"кадр 1 (grace): {st}"
+        self._age_static_track(det)
+        st = self._frame(det, [raw])
+        assert st[1] == TargetStatus.GHOST_STATIC, f"кадр 2: {st}"
+
+    def test_mob_walks_into_range_from_far(self):
+        """Моб подходит издалека: призрак → COMBAT при входе в радиус.
+
+        Стоящий моб на 100 (GHOST_STATIC) начинает движение к игроку.
+        Как только пересекает границу радиуса — COMBAT (двигался + в радиусе).
+        """
+        det = _make_detector(attack_range=55.0, static_grace_s=2.0)
+        st = self._frame(det, [_raw_mob(eid=1, gx=100.0)])
+        self._age_static_track(det)
+        st = self._frame(det, [_raw_mob(eid=1, gx=100.0)])
+        assert st[1] == TargetStatus.GHOST_STATIC, f"кадр 2: {st}"
+        # Моб шагает: 100 → 80 → 60 → 40 (входит в радиус на 5-м кадре)
+        for i, gx in enumerate((80.0, 60.0, 40.0), start=3):
+            st = self._frame(det, [_raw_mob(eid=1, gx=gx)])
+            assert st[1] == TargetStatus.COMBAT, f"кадр {i} (gx={gx}): {st}"
+
+    def test_shooter_gets_hit_unlocks_even_far(self):
+        """ever_hit (моб получил урон) снимает призрака даже вне радиуса."""
+        det = _make_detector(attack_range=55.0, static_grace_s=2.0)
+        raw = _raw_mob(eid=1, gx=100.0, gy=0.0, hp_cur=1000, hp_max=1000)
+        self._frame(det, [raw])
+        self._age_static_track(det)
+        # Моб получил урон: hp_cur < hp_max → ever_hit=True
+        raw = _raw_mob(eid=1, gx=100.0, gy=0.0, hp_cur=500, hp_max=1000)
+        st = self._frame(det, [raw])
+        assert st[1] == TargetStatus.COMBAT, f"после урона: {st}"
+
+    def test_fire_time_unlocks_static(self):
+        """_player_fire_time (вражеский снаряд) разблокирует стоячего стрелка.
+
+        Запасной механизм: даже если стрелок вне радиуса и никто его не бьёт —
+        летящий в игрока снаряд делает его целью. (Сейчас снаряды не
+        попадают в awake-дерево — фича опциональна, но контракт живой.)
+        """
+        det = _make_detector(attack_range=55.0, static_grace_s=2.0)
+        det._player_fire_time = time.perf_counter()  # игрок «под огнём»
+        raw = _raw_mob(eid=1, gx=100.0, gy=0.0, hp_cur=1000, hp_max=1000)
+        st = self._frame(det, [raw])
+        assert st[1] == TargetStatus.COMBAT, f"под огнём: {st}"
+
+    def test_corpse_in_range_not_combat(self):
+        """Труп (alive=False) в радиусе атаки НЕ цель."""
+        det = _make_detector(attack_range=55.0, static_grace_s=2.0)
+        raw = _raw_mob(eid=1, gx=30.0, gy=0.0, alive=False, hp_cur=0, hp_max=1000)
+        st = self._frame(det, [raw])
+        assert st[1] != TargetStatus.COMBAT, f"труп: {st}"
+
+    def test_latent_zero_hp_in_range_not_combat(self):
+        """LATENT (hp_cur=0 при hp_max>0) в радиусе — НЕ цель (умирающий)."""
+        det = _make_detector(attack_range=55.0, static_grace_s=2.0)
+        raw = _raw_mob(eid=1, gx=30.0, gy=0.0, hp_cur=0, hp_max=1000)
+        st = self._frame(det, [raw])
+        assert st[1] != TargetStatus.COMBAT, f"latent: {st}"
+
+    def test_rare_in_range_combat(self):
+        """Rare в радиусе → COMBAT (significant не фильтруется)."""
+        det = _make_detector(attack_range=55.0, static_grace_s=2.0)
+        raw = _raw_mob(eid=1, gx=30.0, gy=0.0, hp_cur=1000, hp_max=1000,
+                       rarity=2)  # RARE
+        st = self._frame(det, [raw])
+        assert st[1] == TargetStatus.COMBAT, f"rare: {st}"

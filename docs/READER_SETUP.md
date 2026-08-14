@@ -30,7 +30,6 @@ ReaderMobDetector (reader_detect.py) → bot.py
 POE2AUTO/
 ├── poe2-reader/                 ← C# ридер (часть проекта)
 │   ├── Program.cs               ← единый исходник (Native, GameReader, ...)
-│   ├── PoE2Reader.csproj        ← EXE-сборка (отдельный TCP-сервер, опц.)
 │   └── lib/
 │       ├── PoE2ReaderLib.csproj ← DLL-сборка (грузится pythonnet'ом)
 │       └── bin/Release/net8.0/  ← собранная DLL (в .gitignore, собирается)
@@ -41,8 +40,8 @@ POE2AUTO/
 ```
 
 `PoE2ReaderLib.csproj` подключает корневой `Program.cs` через
-`<Compile Include="..\Program.cs" />` и флаг `READER_LIB` — тот же исходник
-компилится и как EXE (TCP-сервер), и как LIB (для pythonnet).
+`<Compile Include="..\Program.cs" />` и флаг `READER_LIB` — исходник
+компилится только как LIB (для pythonnet).
 
 ---
 
@@ -95,7 +94,6 @@ dotnet build .\poe2-reader\lib\PoE2ReaderLib.csproj -c Release
 | Режим (`use_memory`) | Бэкенд | Плюсы | Минусы |
 |----------------------|--------|-------|--------|
 | **`reader`** ⭐ | C# DLL в процессе | 1 процесс, без TCP, точные HP/поз. | Нужен .NET SDK для сборки DLL; зависит от оффсетов |
-| `ec2` | ExileCore2 + TCP | Не ломается на патчах (оффсеты — сообщество) | Нужен Loader.exe + инъекция в PoE2 |
 | `memory` | external RPM | Не нужен C# | Ломается на патчах; оффсеты править в коде |
 | `false` / `cv` | OpenCV по скриншоту | Работает везде, без памяти | Менее точный (полоса HP, а не точные поз.) |
 

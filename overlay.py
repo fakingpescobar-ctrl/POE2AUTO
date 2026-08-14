@@ -342,10 +342,7 @@ class Overlay:
                 mode_text = "MEM 🧠"
                 mode_color = C_ON
             elif s.attack_mode == "RDR":
-                mode_text = "RDR 🔌"
-                mode_color = C_ON
-            elif s.attack_mode == "EC2":
-                mode_text = "EC2 🌐"
+                mode_text = "RDR ??"
                 mode_color = C_ON
             elif s.attack_mode == "CV":
                 mode_text = "CV 👁"
@@ -368,8 +365,8 @@ class Overlay:
         self._rows["stats"].config(text=stats)
 
         # Memory-индикатор (правый Label): показывает состояние модуля памяти.
-        # Показывается только для memory-режимов (RDR/MEM/EC2), для CV — скрыт.
-        mode_tag = s.attack_mode if s.attack_mode in ("RDR", "MEM", "EC2") else ""
+        # Показывается только для memory-режимов (RDR/MEM), для CV — скрыт.
+        mode_tag = s.attack_mode if s.attack_mode in ("RDR", "MEM") else ""
         if mode_tag:
             if s.mem_connected and s.mem_reading:
                 # Всё работает: процесс подключён + память читается → зелёный.
