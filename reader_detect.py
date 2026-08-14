@@ -176,8 +176,15 @@ class ReaderMobDetector:
                 flush_interval_s=mdb.get("flush_interval_s", 1.0),
                 keep_days=mdb.get("keep_days", 3.0),
             )
+        # Телеметрия-дедуп: писать только изменившихся мобов (статус/HP%/позиция).
+        # Раньше record_frame писал полный снимок КАЖДЫЙ кадр (20 Гц × 100+ мобов =
+        # 2000+ строк/сек → БД раздувалась до 1M+ строк за сессию). Детект убийств
+        # строится на ПЕРЕХОДАХ COMBAT→DEAD — они всегда пишутся, дедуп их не теряет.
+        self._db_dedup = bool(mdb.get("dedup", True))
+        self._db_snapshot: Dict[int, tuple] = {}  # addr -> (status, hp_pct, gx, gy)
         self._static_track = {}   # addr -> {ever_moved, ever_hit, first_seen, last_seen, last}
         self._dead_track = {}       # addr -> death_timestamp
+        self._dead_track_cleanup_ts = 0.0  # периодическая чистка _dead_track
         self._last_area_hash = -1
         # Признак «игрок в бою»: вражеский снаряд, приближающийся к игроку.
         # Вражеские снаряды не лежат в awake-дереве — фича опциональна.
@@ -188,6 +195,7 @@ class ReaderMobDetector:
         # Состояние
         self._connected = False
         self._last_entities: List[EntityData] = []
+        self._status_by_id: Dict[int, str] = {}  # eid -> TargetStatus (кэш классификации на кадр)
         self._last_update = 0.0
         self._update_interval = 0.05  # 50ms = 20Hz
         self._player_pos: Tuple[float, float] = (0.0, 0.0)
@@ -285,6 +293,7 @@ class ReaderMobDetector:
             # Смена зоны → старые адреса мобов невалидны, сброс cooldown-кэша.
             self._kill_cooldown_cache = set()
             self._kill_cooldown_cache_ts = 0.0
+            self._db_snapshot = {}
 
         # Позиция игрока: из Render-компонента игрока в дереве (тот же источник,
         # что у мобов — корректна при любом патче). area+0xA90 протух (0xA90
@@ -300,16 +309,43 @@ class ReaderMobDetector:
 
         # Парсим сущности
         self._last_entities = self._parse_entities(raw_entities)
+        # Один проход по raw_entities: трек «призраков» + снарядов (P2).
         self._update_static_track(raw_entities)
-        self._track_projectiles(raw_entities)
 
-        # Статистика
-        monsters_alive = [e for e in self._last_entities
-                          if e.category == EntityCategory.MONSTER
-                          and not e.is_friendly
-                          and e.is_reachable
-                          and self._classify_target(e) in TargetStatus.ATTACKABLE]
-        in_range = [e for e in monsters_alive if e.distance <= self.attack_range]
+        # Статистика + кэш классификации. ОДИН проход по мобам: каждая сущность
+        # классифицируется ровно один раз за кадр (раньше _classify_target звался
+        # 3-5 раз на моба: в update() + в get_hostiles_in_range()/get_all_hostiles()
+        # из bot.py при каждом вызове). Результат кладётся в _status_by_id[eid],
+        # а query-методы (get_all_hostiles/get_hostiles_in_range/get_best_target)
+        # читают кэш вместо повторной дорогой классификации.
+        self._status_by_id = {}
+        monsters_alive = []
+        in_range = []
+        status_counts = {}
+        db_rows: List[Tuple[EntityData, str]] = []  # (entity, status) для телеметрии
+        for e in self._last_entities:
+            if e.category != EntityCategory.MONSTER or e.is_friendly:
+                continue
+            st = self._classify_target(e)
+            self._status_by_id[e.id] = st
+            status_counts[st] = status_counts.get(st, 0) + 1
+            if st in TargetStatus.ATTACKABLE and e.is_reachable:
+                monsters_alive.append(e)
+                if e.distance <= self.attack_range:
+                    in_range.append(e)
+            if self.db is not None:
+                if self._db_dedup:
+                    # Пишем только если у моба изменились статус/HP%/позиция.
+                    # Статичная толпа (спящие призраки, стоящие мобы) НЕ пишется
+                    # каждый кадр — БД не раздувается. Снапшот сбрасывается при
+                    # смене зоны (см. update), адреса там невалидны.
+                    key = (st, round(e.hp_ratio, 3),
+                           round(e.grid_x, 1), round(e.grid_y, 1))
+                    if self._db_snapshot.get(e.id) != key:
+                        self._db_snapshot[e.id] = key
+                        db_rows.append((e, st))
+                else:
+                    db_rows.append((e, st))
 
         self.stats["total_entities"] = len(self._last_entities)
         self.stats["hostile_in_range"] = len(in_range)
@@ -318,14 +354,6 @@ class ReaderMobDetector:
                                    if e.category == EntityCategory.CHEST)
         # Распределение статусов целей (отладка: видно сколько мобов в каждой
         # категории — COMBAT/LATENT/GHOST_STATIC/UNKNOWN/DEAD/SPIRIT).
-        status_counts = {}
-        db_rows: List[Tuple[EntityData, str]] = []  # (entity, status) для телеметрии
-        for e in self._last_entities:
-            if e.category == EntityCategory.MONSTER and not e.is_friendly:
-                st = self._classify_target(e)
-                status_counts[st] = status_counts.get(st, 0) + 1
-                if self.db is not None:
-                    db_rows.append((e, st))
         self.stats["target_status"] = status_counts
         # SQLite телеметрия: полный снимок кадра (для дебага/аналитики). Неблокирующий.
         if self.db is not None and db_rows:
@@ -356,20 +384,27 @@ class ReaderMobDetector:
         return min(hostiles, key=lambda e: e.distance)
 
     def get_all_hostiles(self) -> List[EntityData]:
-        """Все враждебные мобы (боеготовые, статус COMBAT)."""
+        """Все враждебные мобы (боеготовые, статус COMBAT).
+
+        Читает кэш классификации из последнего update() — не классифицирует
+        заново (раньше это был повторный дорогой вызов _classify_target для
+        каждого моба при каждом обращении).
+        """
+        st = self._status_by_id
         return [e for e in self._last_entities
                 if e.category == EntityCategory.MONSTER
                 and not e.is_friendly
                 and e.is_reachable
-                and self._classify_target(e) in TargetStatus.ATTACKABLE]
+                and st.get(e.id) in TargetStatus.ATTACKABLE]
 
     def get_hostiles_in_range(self) -> List[EntityData]:
         """Враждебные мобы в радиусе атаки (статус COMBAT)."""
+        st = self._status_by_id
         return [e for e in self._last_entities
                 if e.category == EntityCategory.MONSTER
                 and not e.is_friendly
                 and e.is_reachable
-                and self._classify_target(e) in TargetStatus.ATTACKABLE
+                and st.get(e.id) in TargetStatus.ATTACKABLE
                 and e.distance <= self.attack_range]
 
     def get_best_target(self) -> Optional[EntityData]:
@@ -633,35 +668,59 @@ class ReaderMobDetector:
         его уже били. Стоячий стрелок с полным HP остаётся «призраком», пока не
         шевельнётся / не получит урон / пока игрок под вражеским огнём.
         """
+        self._update_tracks(raw_entities)
+
+    def _update_tracks(self, raw_entities: list) -> None:
+        """Один проход по raw_entities: трек статики мобов + трек снарядов.
+
+        Объединяет прежние _update_static_track и _track_projectiles — раньше
+        каждый делал СВОЙ полный проход по списку сущностей (1172+/кадр), т.е.
+        два лишних прохода на каждый кадр. Теперь за один цикл собираем и
+        «призраков» (адреса в кадре → движение/урон), и снаряды
+        (приближение к игроку → признак «игрок в бою»).
+        """
+        now = time.perf_counter()
+        seen = set()       # адреса мобов в кадре (для детекта смерти)
+        proj: dict = {}    # addr -> dist (снаряды в кадре, до игрока)
+        px, py = self._player_pos
         if not self.ignore_static:
             self._static_track.clear()
-            return
-        now = time.perf_counter()
-        seen = set()
         for raw in raw_entities:
-            if raw.get("entity_type") != "m":
-                continue
-            addr = raw.get("addr", 0)
-            if not addr:
-                continue
-            seen.add(addr)
-            gp = raw.get("grid_pos") or [0, 0]
-            gx, gy = float(gp[0]), float(gp[1])
-            lc = raw.get("life") or []
-            hit = len(lc) >= 2 and 0 < lc[1] < lc[0]
-            tr = self._static_track.get(addr)
-            if tr is None:
-                self._static_track[addr] = {
-                    "ever_moved": False, "ever_hit": hit, "first_seen": now,
-                    "last_seen": now, "last": (gx, gy),
-                }
-            else:
-                tr["last_seen"] = now
-                if hit:
-                    tr["ever_hit"] = True
-                if (gx, gy) != tr["last"]:
-                    tr["ever_moved"] = True
-                    tr["last"] = (gx, gy)
+            et = raw.get("entity_type")
+            if et == "m" and self.ignore_static:
+                addr = raw.get("addr", 0)
+                if not addr:
+                    continue
+                seen.add(addr)
+                gp = raw.get("grid_pos") or [0, 0]
+                gx, gy = float(gp[0]), float(gp[1])
+                lc = raw.get("life") or []
+                hit = len(lc) >= 2 and 0 < lc[1] < lc[0]
+                tr = self._static_track.get(addr)
+                if tr is None:
+                    self._static_track[addr] = {
+                        "ever_moved": False, "ever_hit": hit, "first_seen": now,
+                        "last_seen": now, "last": (gx, gy),
+                    }
+                else:
+                    tr["last_seen"] = now
+                    if hit:
+                        tr["ever_hit"] = True
+                    if (gx, gy) != tr["last"]:
+                        tr["ever_moved"] = True
+                        tr["last"] = (gx, gy)
+            elif et == "p":
+                addr = raw.get("addr", 0)
+                if not addr:
+                    continue
+                gp = raw.get("grid_pos") or [0, 0]
+                dx = float(gp[0]) - px
+                dy = float(gp[1]) - py
+                d = math.hypot(dx, dy)
+                if d > 60.0:
+                    continue
+                proj[addr] = d
+
         # Track deaths: entity was seen before but not in this frame -> dead
         for a, tr in list(self._static_track.items()):
             if a not in seen and tr.get("ever_moved"):
@@ -672,41 +731,36 @@ class ReaderMobDetector:
         for a in stale:
             del self._static_track[a]
 
-    def _track_projectiles(self, raw_entities: list) -> None:
-        """Отметить «игрок в бою», если снаряд приближается к игроку.
+        # Чистка _dead_track: записи старше corpse_timeout_s больше не нужны
+        # (труп исчез из кадра ИЛИ адрес переиспользован под нового моба —
+        # иначе свежий моб навсегда считался бы is_corpse и не атаковался).
+        if now - self._dead_track_cleanup_ts >= max(1.0, self.corpse_timeout_s / 2):
+            self._dead_track_cleanup_ts = now
+            if self._dead_track:
+                expired = [a for a, ts in self._dead_track.items()
+                           if now - ts >= self.corpse_timeout_s]
+                for a in expired:
+                    del self._dead_track[a]
 
-        Снаряды игрока летят ОТ игрока (dist растёт), вражеские — К игроку
-        (dist падает). Работает только если снаряды попадают в awake-дерево
-        (пока не подтверждено — фича опциональна).
-        """
-        now = time.perf_counter()
-        proj = [e for e in raw_entities if e.get("entity_type") == "p"]
+        # Снаряды: если в кадре их нет — держим кэш дистанций ещё 3 сек
+        # (мерцание), потом чистим. Если есть — обновляем кэш, чистим
+        # исчезнувшие, и если снаряд приближается (d падает) → игрок в бою.
         if not proj:
             if self._last_proj_d and now - self._last_proj_ts > 3.0:
                 self._last_proj_d.clear()
-            return
-        px, py = self._player_pos
-        fired = False
-        seen = set()
-        for raw in proj:
-            addr = raw.get("addr", 0)
-            gp = raw.get("grid_pos") or [0, 0]
-            dx = float(gp[0]) - px
-            dy = float(gp[1]) - py
-            d = math.hypot(dx, dy)
-            if d > 60.0:
-                continue
-            seen.add(addr)
-            prev = self._last_proj_d.get(addr)
-            if prev is not None and d < prev - 0.3:
-                fired = True
-            self._last_proj_d[addr] = d
-        self._last_proj_ts = now
-        for a in list(self._last_proj_d):
-            if a not in seen:
-                del self._last_proj_d[a]
-        if fired:
-            self._player_fire_time = now
+        else:
+            fired = False
+            for addr, d in proj.items():
+                prev = self._last_proj_d.get(addr)
+                if prev is not None and d < prev - 0.3:
+                    fired = True
+                self._last_proj_d[addr] = d
+            for a in list(self._last_proj_d):
+                if a not in proj:
+                    del self._last_proj_d[a]
+            self._last_proj_ts = now
+            if fired:
+                self._player_fire_time = now
 
     def _parse_entities(self, raw_entities: list) -> List[EntityData]:
         """Преобразовать список raw-сущностей из ReaderBridge → список EntityData."""
@@ -781,8 +835,14 @@ class ReaderMobDetector:
         dy = grid_y - player_y
         distance = math.sqrt(dx * dx + dy * dy)
 
-        confidence = self._compute_confidence(eid, is_alive, is_reachable,
-                                             hp_max, hp_cur, significant)
+        # Confidence нужен только для hostile-мобов (get_best_target ранжирует
+        # цели по нему). Для chests/NPC/дружелюбных не считаем — это 2 dict-lookup'а
+        # (_static_track + _dead_track) на КАЖДУЮ сущность кадра (1172+/кадр).
+        if category == EntityCategory.MONSTER and not is_friendly:
+            confidence = self._compute_confidence(eid, is_alive, is_reachable,
+                                                  hp_max, hp_cur, significant)
+        else:
+            confidence = 0.0
         dead_since = self._dead_track.get(eid)
 
         return EntityData(

@@ -25,6 +25,7 @@ def _make_detector(**overrides):
     det.attack_unknown_hp = overrides.get("attack_unknown_hp", True)
     det._static_track = overrides.get("_static_track", {})
     det._dead_track = overrides.get("_dead_track", {})
+    det._dead_track_cleanup_ts = 0.0
     det._player_fire_time = overrides.get("_player_fire_time", 0.0)
     det.db = overrides.get("db", None)
     det._player_pos = overrides.get("_player_pos", (0.0, 0.0))
@@ -34,6 +35,7 @@ def _make_detector(**overrides):
     det._last_proj_ts = overrides.get("_last_proj_ts", 0.0)
     det._player_hp = overrides.get("_player_hp", None)
     det._last_entities = overrides.get("_last_entities", [])
+    det._status_by_id = overrides.get("_status_by_id", {})
     det.stats = overrides.get("stats", {})
     det._kill_cooldown_cache = set()
     det._kill_cooldown_cache_ts = 0.0
@@ -326,6 +328,30 @@ class TestDeadSince:
         det._dead_track = {1: time.perf_counter() - 10.0}
         assert det._is_recently_dead(1) is False
 
+    def test_dead_track_cleanup_removes_expired(self):
+        """Записи старше corpse_timeout_s удаляются (иначе переиспользованный
+        адрес навсегда считался бы трупом и не атаковался)."""
+        det = _make_detector(corpse_timeout_s=30.0)
+        now = time.perf_counter()
+        det._dead_track = {
+            1: now - 40.0,   # просрочен → удалить
+            2: now - 5.0,    # свежий → оставить
+        }
+        det._dead_track_cleanup_ts = 0.0
+        det._update_static_track([])  # триггерит cleanup (см. ниже)
+        # _update_static_track требует ignore_static — без raw мобов это ок
+        assert 1 not in det._dead_track
+        assert 2 in det._dead_track
+
+    def test_dead_track_cleanup_not_every_frame(self):
+        """Cleanup не должен бежать каждый кадр — только раз в corpse_timeout/2."""
+        det = _make_detector(corpse_timeout_s=30.0)
+        now = time.perf_counter()
+        det._dead_track = {1: now - 40.0}
+        det._dead_track_cleanup_ts = now  # только что чистили → пропуск
+        det._update_static_track([])
+        assert 1 in det._dead_track  # cleanup ещё не сработал
+
 
 # --- death_grace_s: don't attack mobs that died recently ---
 
@@ -464,6 +490,7 @@ class TestBestTargetConfidence:
             _mob(eid=1, hp_cur=800, hp_max=1000, distance=10.0, confidence=0.9),
             _mob(eid=2, hp_cur=800, hp_max=1000, distance=5.0, confidence=0.2),
         ]
+        det._status_by_id = {1: TargetStatus.COMBAT, 2: TargetStatus.COMBAT}
         best = det.get_best_target()
         assert best is not None
         assert best.id == 1  # high confidence wins over closer low-confidence
@@ -475,6 +502,7 @@ class TestBestTargetConfidence:
             _mob(eid=1, hp_cur=800, hp_max=1000, distance=10.0, confidence=0.9, is_boss=False),
             _mob(eid=2, hp_cur=800, hp_max=1000, distance=15.0, confidence=0.3, is_boss=True),
         ]
+        det._status_by_id = {1: TargetStatus.COMBAT, 2: TargetStatus.COMBAT}
         best = det.get_best_target()
         assert best is not None
         assert best.id == 2  # boss wins
@@ -513,7 +541,6 @@ class TestFrameScenario:
     def _frame(self, det, raws):
         det._last_entities = det._parse_entities(raws)
         det._update_static_track(raws)
-        det._track_projectiles(raws)
         return {e.id: det._classify_target(e) for e in det._last_entities
                 if e.category == EntityCategory.MONSTER and not e.is_friendly}
 
