@@ -7,7 +7,8 @@
 - **`reader`** ⭐ (рекомендуется) — встроенный C#-ридер `PoE2ReaderLib.dll`
   читает память PoE2 через `PROCESS_VM_READ` **в один процесс** с ботом
   (грузится через pythonnet). Точные позиции/HP всех мобов, мгновенная фляска
-  по реальным HP/Mana, фильтр «призраков» (спящие/декоративные мобы). Исходники
+  по реальным HP/Mana, фильтр «призраков» (спящие/декоративные мобы),
+  SQLite-телеметрия с детектом убийств и kill-cooldown. Исходники
   C# лежат прямо в проекте (`poe2-reader/`).
 - **`memory`** — старый external `PROCESS_VM_READ` (свой AOB-scan + авто-поиск
   оффсетов). Ломается при патчах PoE2, но умеет сам чинить оффсеты
@@ -57,7 +58,8 @@
 9. [Настройка (config.yaml)](#настройка-configyaml)
 10. [Диагностика HP](#диагностика-hp)
 11. [Структура файлов](#структура-файлов)
-12. [Решение проблем](#решение-проблем)
+12. [История изменений](#история-изменений)
+13. [Решение проблем](#решение-проблем)
 
 ---
 
@@ -497,8 +499,9 @@ hp_diag.bat
 | `color_detector.py` | HSV-маска лута → центры целей |
 | **Детекция мобов** | |
 | `mob_bar.py` | Детект полосы HP моба вверху (CV-режим, fallback) |
-| `reader_detect.py` | Детектор мобов через встроенный C# ридер (режим `reader`) + фильтр «призраков» |
+| `reader_detect.py` | Детектор мобов через встроенный C# ридер (режим `reader`) + фильтр «призраков» + kill-cooldown |
 | `reader_bridge.py` | Python-обёртка над C# DLL `PoE2ReaderLib.dll` (pythonnet) |
+| `monster_db.py` | **SQLite-телеметрия мобов**: история по имени/адресу, детект убийств, кулдаун между сессиями, счётчики |
 | `mem_detect.py` | Интеграция external `PROCESS_VM_READ` с авто-атакой (режим `memory`) |
 | `game_memory.py` | Read-only доступ к памяти PoE2 (NtReadVirtualMemory, AOB scan) |
 | `game_offsets.py` | Оффсеты структур PoE2 (GameState → Entity → Component) |
@@ -507,6 +510,13 @@ hp_diag.bat
 | `offset_discovery.py` | Старый value-scan жизненных пулов (Health/Mana/ES) |
 | `auto_flask.py` | Движок правил авто-фляски (по HP/Mana/врагам из памяти) |
 | `entity_overlay.py` | Оверлей сущностей (позиции мобов/игрока) |
+| **Навигация** | |
+| `core_map.py` | Core Mapping: grid-карта (walkable по Terrain), построение пути (A*), мировые/грид-координаты |
+| `nav_worker.py` | Фоновый поток навигации: читает `nav_target.json`, ведёт персонажа к waypoint'ам (через `vx.set_left_stick`) |
+| `map_run_flow.py` | Прогон карты: навигация до цели + авто-телепорт из города в бродяжку |
+| `stash_flow.py` / `stash_reader.py` / `stash_tab_browser.py` | Работа со стойкой: список вкладок, фильтр/чтение карт (по памяти) |
+| `probe_cast.py` | Поиск игрока и компонентов сущностей (используется `core_map`) |
+| `screen_capture.py` | Захват экрана (используется `map_run_flow`) |
 | **HP игрока** | |
 | `hp_ocr.py` | Чтение HP по цифрам HUD (template matching, разрез слипшихся) — CV-источник HP |
 | `hp_locate.py` | Авто-локализация строки HP и орба на старте (портативность) |
@@ -522,12 +532,60 @@ hp_diag.bat
 | `hp_digits/` | Шаблоны цифр `0-9` и `/` (результат калибровки цифр) |
 | `config.py` / `config.yaml` | Конфиг (дефолты + сохранённая калибровка) |
 | `poe2-reader/` | **C# ридер памяти** (`Program.cs`, csproj) — часть проекта, см. `docs/READER_SETUP.md` |
+| `_bench_*.py` | Бенчмарки производительности детектора (`_bench_update.py` — полный цикл, `_bench_profile.py` — поэтапно, `_bench_cprofile.py` — с обходом throttle) |
 | `*.bat` | Скрипты запуска (см. ниже) |
 
 **Батники:** `run_bot.bat` (основной бот) · `build_reader.bat` (сборка C# DLL для `reader`) ·
 `fix_offsets.bat` (авто-починка оффсетов для `memory`) ·
 `calibrate.bat` (лут) · `calibrate_hp.bat` (орб HP) · `run_calibrate.bat` (цифры HP) ·
 `hp_diag.bat` (диагностика без геймпада) · `run.bat` (тест захвата геймпада).
+
+---
+
+## История изменений
+
+### Что было сделано (последняя крупная сессия)
+
+- **SQLite-телеметрия мобов** (`monster_db.py`): полный дамп всех мобов по кадрам в `monster_telemetry.db`
+  (категория, позиции, HP, статус, timestamp) — для дебага, аналитики и **детекта убийств**.
+- **Kill-cooldown**: бот запоминает недавно убитых мобов (по адресу из телеметрии) и не тратит на них
+  авто-атаку — цель переключается на живых. Кулдаун переживает респавн сессии.
+- **Ghost-фильтр доработан**: спящий/статичный моб (не двигался и не получал урон) не считается
+  целью, пока не «оживёт»; Rare/Unique/боссы фильтром не отсекаются.
+- **Навигация (CoreMap)**: `core_map.py` (grid-карта + A* по Terrain) + `nav_worker.py`
+  (фоновый поток ведёт персонажа по waypoint'ам через левый стик) + `map_run_flow.py`
+  (авто-прогон карты с телепортом из города).
+- **Бенчмарки** (`_bench_update.py`, `_bench_profile.py`, `_bench_cprofile.py`): замер реальной
+  производительности цикла детекции — полный update, поэтапный разбор, cProfile.
+
+### Все наши ошибки (найдено и исправлено)
+
+| Ошибка | Симптом | Причина | Фикс |
+|--------|---------|---------|------|
+| **Фриз детектора на ~3 сек каждые 100 мс** | Авто-атака не успевала реагировать: update() реально 480 мс (2.1 Гц вместо 20 Гц), бот «проспал» подходящего моба | SQLite-запрос `get_recently_killed_addrs` выполнялся **3103 мс**: БД раздулась до 1.1M строк (сессия 358k) без индекса по `(session_id, status, ts)` | Составной индекс `idx_session_status_ts` в `_SCHEMA` → запрос **0.6 мс** (в 5000× быстрее) |
+| **Кэш кулдауна убийств чистился слишком часто** | Ридер «вставал» каждые 100 мс на пересоздание кэша из SQLite | `_kill_cooldown_cache_ttl = 0.1` сек — обновление кэша блокировало цикл | TTL поднят до **2.0 сек** — частота запросов к БД упала в 20 раз |
+| **Атака «призраков»** | Бот держал R1 на мобе, который не двигался и был невидим (утопленник/декор) | Живой (по данным) статичный моб считался целью | Ghost-фильтр: `distance <= attack_range and is_alive and hp_current > 0` → цель; статичных пропускает, пока не зашевелятся |
+| **Ошибка формата в диагностиках** | `_diag_5min.py` / `_diag_live.py` падали при появлении первого монстра | Лишний `%s` в format-строке списка мобов (10 плейсхолдеров на 9 аргументов) | Убран лишний плейсхолдер — снимки пишутся стабильно |
+
+### Что изменили
+
+- `monster_db.py`: индекс `(session_id, status, ts)` в схеме БД; запросы по сессии/статусу/времени.
+- `reader_detect.py`: TTL кэша kill-cooldown `0.1 → 2.0 сек`; доработан ghost-фильтр
+  (`_check_static`); kill-cooldown теперь не блокирует update-цикл.
+- `bot.py`: интеграция NavWorker, map-run-flow, stash-флоу; запуск по `run_bot.bat`.
+- Удалён **EC2-код** (`ec2_client.py`, `ec2_detect.py`, `bot_ec2_lite.py`, `setup_ec2.bat` и
+  `tests/test_ec2_detect.py`) — вынос детекции на облако больше не нужен, всё локально.
+- `tests/test_reader_detect.py`: +170 строк тестов (сценарии TestFrameScenario — ghost-фильтр,
+  kill-cooldown, классификация мобов).
+
+### Что добавили (новые файлы)
+
+- `monster_db.py` — SQLite-телеметрия и детект убийств.
+- `core_map.py`, `nav_worker.py`, `map_run_flow.py`, `probe_cast.py` — навигация (CoreMap).
+- `stash_flow.py`, `stash_reader.py`, `stash_tab_browser.py`, `screen_capture.py` — работа со стойкой
+  и захват для map-run.
+- `_bench_update.py`, `_bench_profile.py`, `_bench_cprofile.py` — бенчмарки.
+- `AGENTS.md` — локальные правила проекта.
 
 ---
 
@@ -538,6 +596,7 @@ hp_diag.bat
 | В логе «откат на CV» / оверлей показывает режим `CV` вместо `READER` | Для `reader`: собрана ли DLL (`build_reader.bat`, нужен .NET 8 SDK)? Есть ли `poe2-reader/lib/bin/.../PoE2ReaderLib.dll`? Запущен ли PoE2? Бот от админа? |
 | `MemoryError`/`FileNotFound: PoE2ReaderLib.dll` | Пересобери DLL: `build_reader.bat`. Если `dotnet` не найден — установи .NET 8 SDK. Путь к DLL можно переопределить переменной окружения `POE2READER_DLL`. |
 | Бот держит R1 по невидимому мобу (вода/декор) | Это «призрак»: фильтр включён (`auto_attack.ignore_static_mobs: true`) — подними `static_grace_s`, чтобы дать мобу больше времени шевельнуться. Rare/Unique/боссы фильтром не отсекаются. См. `docs/READER_SETUP.md`. |
+| Бот «тормозит» / авто-атака не успевает на моба | Разросшаяся `monster_telemetry.db` (индекс `(session_id, status, ts)` отсутствует в старой БД). Проверка: `EXPLAIN QUERY PLAN` на `get_recently_killed_addrs` должен показывать `SEARCH USING INDEX idx_session_status_ts`; если нет — создай индекс вручную (`CREATE INDEX idx_session_status_ts ON monster_events(session_id, status, ts)`). |
 | После патча PoE2 мобы не детектятся (`memory`-режим) | Оффсеты устарели — запусти `fix_offsets.bat` (авто-поиск). Или переключись на `reader` (меньше риск на патчах). |
 | `vgamepad` не создаёт геймпад | Установлен ли **ViGEmBus**? Запущен ли бот **от администратора**? |
 | Игра не реагирует на геймпад | Настроен ли **HidHide** (DualSense скрыт, `python.exe` в whitelist)? Запущен ли бот **до** игры? |
