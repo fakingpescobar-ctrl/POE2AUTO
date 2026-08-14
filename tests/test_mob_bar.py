@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 import time
 
@@ -19,22 +20,33 @@ def _bright_frame(fh=600, fw=800):
 
 
 class TestDarkZone:
+    """_is_dark_zone принимает готовый HSV-кроп ROI (после оптимизации:
+    убрана двойная HSV-конверсия в present)."""
+
     def test_bright_frame_not_dark(self):
         det = MobBarDetector({"dark_zone": {"enabled": True, "brightness_thr": 40.0}})
-        assert not det._is_dark_zone(_bright_frame())
+        assert not det._is_dark_zone(cv2.cvtColor(_bright_frame(), cv2.COLOR_BGR2HSV))
 
     def test_dark_frame_is_dark(self):
         det = MobBarDetector({"dark_zone": {"enabled": True, "brightness_thr": 40.0}})
-        assert det._is_dark_zone(_dark_frame())
+        assert det._is_dark_zone(cv2.cvtColor(_dark_frame(), cv2.COLOR_BGR2HSV))
 
     def test_disabled_never_dark(self):
         det = MobBarDetector({"dark_zone": {"enabled": False}})
-        assert not det._is_dark_zone(_dark_frame())
+        assert not det._is_dark_zone(cv2.cvtColor(_dark_frame(), cv2.COLOR_BGR2HSV))
 
     def test_empty_frame_not_dark(self):
         det = MobBarDetector({})
         empty = np.array([], dtype=np.uint8).reshape(0, 0, 3)
         assert not det._is_dark_zone(empty)
+
+    def test_present_uses_hsv_consistency(self):
+        """present() с тёмным кадром: dark-режим активируется через тот же hsv,
+        что считается для маски — не должно быть двойной cvtColor (регрессия)."""
+        det = MobBarDetector({"dark_zone": {"enabled": True, "brightness_thr": 40.0}})
+        frame = _dark_frame()
+        # просто не падает и возвращает bool
+        assert isinstance(det.present(frame), bool)
 
 
 class TestFrameCounter:

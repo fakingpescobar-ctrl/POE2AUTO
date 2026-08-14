@@ -203,3 +203,32 @@ class TestHPNumReaderParse:
         result = r._parse("500/1000")
         assert result is not None
         assert result[2] == pytest.approx(0.5)
+
+
+class TestEmptyTemplates:
+    """HPNumReader без файлов шаблонов (hp_digits/ пуст): конструктор не падает,
+    ready=False, _best деградирует на (None, -1) — читатель не используется."""
+
+    def _make_reader(self, monkeypatch):
+        from hp_ocr import HPNumReader
+        monkeypatch.setattr("hp_ocr.load_templates", lambda: {})
+        cfg = {"roi": {"x1": 0.0, "y1": 0.0, "x2": 0.1, "y2": 0.1},
+               "bin_thr": 130, "match_min": 0.55, "min_glyph_h": 10, "max_hp": 0}
+        return HPNumReader(cfg)
+
+    def test_constructs_without_crash(self, monkeypatch):
+        r = self._make_reader(monkeypatch)
+        assert not r.ready
+
+    def test_best_returns_none(self, monkeypatch):
+        r = self._make_reader(monkeypatch)
+        import numpy as np
+        glyph = np.zeros((28, 18), np.uint8)
+        ch, sc = r._best(glyph)
+        assert ch is None and sc == -1.0
+
+    def test_read_string_no_crash(self, monkeypatch):
+        r = self._make_reader(monkeypatch)
+        import cv2, numpy as np
+        frame = np.zeros((60, 300, 3), np.uint8)
+        assert r.read_string_crop(frame) == ""

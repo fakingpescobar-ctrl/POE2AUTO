@@ -29,6 +29,19 @@ class ZoneDetector:
         if self._template is None:
             _log.warning("Zone template not found: %s — zone detection disabled", TPL_PATH)
         self.last_score = 0.0
+        # кэш пиксельных границ ROI — пересчёт только при смене разрешения кадра
+        self._geom_key = None
+        self._geom = None
+
+    def _roi_px(self, fw, fh):
+        """(x1, y1, x2, y2) ROI в пикселях. Кэш по (fw, fh) — разрешение
+        не меняется между кадрами, а in_hideout зовётся каждый кадр."""
+        key = (fw, fh)
+        if self._geom_key != key:
+            self._geom = (int(self.roi["x1"] * fw), int(self.roi["y1"] * fh),
+                          int(self.roi["x2"] * fw), int(self.roi["y2"] * fh))
+            self._geom_key = key
+        return self._geom
 
     def in_hideout(self, frame_bgr):
         """True, если в кадре виден заголовок «Убежище» панели заданий."""
@@ -36,8 +49,7 @@ class ZoneDetector:
             return False
 
         fh, fw = frame_bgr.shape[:2]
-        x1, y1 = int(self.roi["x1"] * fw), int(self.roi["y1"] * fh)
-        x2, y2 = int(self.roi["x2"] * fw), int(self.roi["y2"] * fh)
+        x1, y1, x2, y2 = self._roi_px(fw, fh)
         crop = frame_bgr[y1:y2, x1:x2]
 
         th, tw = self._template.shape[:2]

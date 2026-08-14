@@ -72,19 +72,15 @@ class MobBarDetector:
         self._boot_box = None   # (x, y, w, h) текущего бутстрап-кандидата
         self._boot_since = 0.0  # когда кандидат впервые появился на этом месте
 
-    def _is_dark_zone(self, frame_bgr):
-        """Определить тёмную зону по средней яркости ROI (V-канал HSV)."""
-        if not self.dark_zone_enabled:
+    def _is_dark_zone(self, hsv_sub):
+        """Тёмная зона по средней яркости V уже посчитанного HSV кропа ROI.
+
+        Раньше вызывалась с frame_bgr и заново резала ROI + cvtColor + np.mean —
+        двойная HSV-конверсия каждый кадр. Теперь принимает готовый hsv из present().
+        """
+        if not self.dark_zone_enabled or hsv_sub is None or hsv_sub.size == 0:
             return False
-        fh, fw = frame_bgr.shape[:2]
-        x1, y1 = int(self.roi["x1"] * fw), int(self.roi["y1"] * fh)
-        x2, y2 = int(self.roi["x2"] * fw), int(self.roi["y2"] * fh)
-        sub = frame_bgr[y1:y2, x1:x2]
-        if sub.size == 0:
-            return False
-        hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
-        mean_v = float(np.mean(hsv[:, :, 2]))
-        return mean_v < self.dark_zone_brightness_thr
+        return float(cv2.mean(hsv_sub)[2]) < self.dark_zone_brightness_thr
 
     def present(self, frame_bgr):
         """True, если в ROI есть красная компонента ФОРМЫ полосы HP (моб жив)."""
@@ -103,7 +99,7 @@ class MobBarDetector:
         self.last_mask = mask
 
         # dark zone: средняя яркость ROI — в тёмных зонах (caves) поднимаем порог
-        is_dark = self._is_dark_zone(frame_bgr)
+        is_dark = self._is_dark_zone(hsv)
         effective_min_aspect = self.dark_zone_min_aspect if is_dark else self.min_aspect
 
         min_w = max(8, int(self.min_w_frac * fw))

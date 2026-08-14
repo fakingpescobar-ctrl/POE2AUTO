@@ -50,6 +50,9 @@ class ColorDetector:
 
     def detect(self, frame_bgr):
         """Возвращает (points, mask), points = [(cx, cy, area), ...] по убыванию площади."""
+        if not self.bounds or frame_bgr is None or frame_bgr.size == 0:
+            h, w = frame_bgr.shape[:2] if frame_bgr is not None and frame_bgr.size else (0, 0)
+            return [], np.zeros((h, w), np.uint8)
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         mask: Optional[np.ndarray] = None
         for ranges in self.bounds:

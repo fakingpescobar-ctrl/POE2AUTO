@@ -58,6 +58,34 @@ class HPDetector:
         self.min_valid_ratio = cfg.get("min_valid_ratio", 0.10)
         # мин. яркость залитой части (V): тусклый орб в меню отсекаем
         self.valid_val = cfg.get("valid_val", 90)
+        # кэш геометрии орба (circle/usable/row_usable и пр.) — пересчёт только при
+        # смене разрешения кадра. Раньше пересоздавалось каждый кадр (np.ogrid,
+        # суммы по строкам) — заметная цена в 60 FPS цикле.
+        self._geom_key = None   # (fw, fh)
+        self._geom = None       # dict с готовой геометрией
+
+    def _get_geometry(self, fw, fh, cx, cy, r, x1, y1):
+        """Маски орба и агрегаты по строкам. Кэш на (fw, fh) — геометрия
+        орба задана в долях кадра и не меняется между кадрами."""
+        key = (fw, fh)
+        if self._geom_key != key:
+            x2, y2 = min(fw, cx + r), min(fh, cy + r)
+            H, W = y2 - y1, x2 - x1
+            ccx, ccy = cx - x1, cy - y1
+            rune_half = int(self.rune_frac * r)
+            yy, xx = np.ogrid[:H, :W]
+            circle = (xx - ccx) ** 2 + (yy - ccy) ** 2 <= r * r
+            usable = (circle & (np.abs(xx - ccx) > rune_half)) if rune_half > 0 else circle
+            row_usable = usable.sum(axis=1)
+            valid_row = row_usable >= max(3, int(0.12 * r))
+            self._geom = {
+                "H": H, "W": W, "ccx": ccx, "ccy": ccy,
+                "usable": usable, "row_usable": row_usable, "valid_row": valid_row,
+                "bottom_trim": int(self.bottom_trim_frac * r),
+                "gap_tol": max(1, int(self.gap_tol_frac * r)),
+            }
+            self._geom_key = key
+        return self._geom
 
     def measure(self, frame_bgr):
         """Вернуть dict: ratio (0..1 или None), surface_y, thr_y, trip_below, orb(cx,cy,r)."""
@@ -79,29 +107,23 @@ class HPDetector:
         m2 = cv2.inRange(hsv, (160, self.sat_min, self.val_min), (179, 255, 255))
         mask = cv2.bitwise_or(m1, m2)
         V = hsv[:, :, 2]
-        H, W = mask.shape
-        ccx, ccy = cx - x1, cy - y1  # центр орба в координатах кропа
 
-        # маска круга орба + исключение центральной полосы с руной-механикой:
-        # символ по центру не красный и ломал бы скан узкой центральной полоски.
-        yy, xx = np.ogrid[:H, :W]
-        circle = (xx - ccx) ** 2 + (yy - ccy) ** 2 <= r * r
-        rune_half = int(self.rune_frac * r)
-        usable = (circle & (np.abs(xx - ccx) > rune_half)) if rune_half > 0 else circle
+        # геометрия орба — кэш по (fw, fh): маски/агрегаты не пересчитываем каждый кадр
+        g = self._get_geometry(fw, fh, cx, cy, r, x1, y1)
+        H, W = g["H"], g["W"]
+        usable, row_usable, valid_row = g["usable"], g["row_usable"], g["valid_row"]
 
         redpx = (mask > 0) & usable
-        row_usable = usable.sum(axis=1)              # ширина «рабочей» части орба в строке
         row_red = redpx.sum(axis=1)
         # доля красного в строке относительно ширины орба в этой строке (не всего кропа)
         row_fill = np.divide(row_red, np.maximum(1, row_usable), dtype=float)
         # строки со слишком узким сечением круга (самый верх/низ) ненадёжны — пропускаем
-        valid_row = row_usable >= max(3, int(0.12 * r))
         filled = (row_fill > self.row_fill_frac) & valid_row
 
         # высота «жидкости» снизу вверх. Нижний обод орба + край панели задач — тёмные,
         # поэтому пропускаем нижние bottom_trim строк, чтобы они не оборвали скан.
-        bottom_trim = int(self.bottom_trim_frac * r)
-        gap_tol = max(1, int(self.gap_tol_frac * r))
+        bottom_trim = g["bottom_trim"]
+        gap_tol = g["gap_tol"]
         height = 0
         gap = 0
         for i in range(H - 1 - bottom_trim, -1, -1):

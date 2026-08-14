@@ -19,6 +19,10 @@ import numpy as np
 from hp_detector import _red_mask
 
 EVT_DIR = os.path.join(os.path.dirname(__file__), "_debug", "hp_events")
+ATK_DIR = os.path.join(os.path.dirname(__file__), "_debug", "attack_events")
+# папки создаём ОДИН раз при импорте — раньше os.makedirs звался на каждый дамп
+os.makedirs(EVT_DIR, exist_ok=True)
+os.makedirs(ATK_DIR, exist_ok=True)
 log = logging.getLogger("poe2auto.diag")
 
 # не заваливать диск во время долгого «потерянного» состояния
@@ -48,7 +52,6 @@ def classify(crop_bgr, mask, m, foreground):
 
 def dump_event(tag, n, frame, det, m, foreground):
     """Сохранить улику по уже посчитанному measure-результату m (frame и det — те же)."""
-    os.makedirs(EVT_DIR, exist_ok=True)
     ts = datetime.now().strftime("%H%M%S_%f")[:-3]
     base = os.path.join(EVT_DIR, f"{ts}_{n:04d}_{tag}")
 
@@ -84,7 +87,6 @@ def dump_loot(n, frame, det, engine, foreground, center=None):
     """Снимок лут-детекции: что детектор принял за лут (для отладки ложных целей).
     Сохраняет full/mask/vis (точки обведены, радиус подбора — жёлтый круг).
     center — центр персонажа в координатах кадра (для ROI-кропа)."""
-    os.makedirs(EVT_DIR, exist_ok=True)
     ts = datetime.now().strftime("%H%M%S_%f")[:-3]
     base = os.path.join(EVT_DIR, f"{ts}_{n:04d}_loot")
 
@@ -113,13 +115,9 @@ def dump_loot(n, frame, det, engine, foreground, center=None):
     log.info("       файлы: %s_{full,mask,vis}.png", os.path.basename(base))
 
 
-ATK_DIR = os.path.join(os.path.dirname(__file__), "_debug", "attack_events")
-
-
 def dump_attack_trigger(n, frame, mob_det, foreground):
     """Снимок улики в момент, когда авто-атака НАЖАЛА R1 (передний фронт детекта полосы).
     Сохраняет full/roi_mask/vis — по ним видно, что детектор принял за HP-бар моба."""
-    os.makedirs(ATK_DIR, exist_ok=True)
     ts = datetime.now().strftime("%H%M%S_%f")[:-3]
     base = os.path.join(ATK_DIR, f"{ts}_{n:04d}_attack")
 
