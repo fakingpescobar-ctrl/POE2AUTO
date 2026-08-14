@@ -32,7 +32,7 @@ for i in range(N):
     t0 = time.perf_counter()
     raw = mob_det.bridge.read_entities_raw()
     t1 = time.perf_counter()
-    mob_det._parse_entities(raw)
+    mob_det._parse_and_track(raw)   # единый проход: парсинг + треки
     t2 = time.perf_counter()
     mob_det.update()   # полный цикл (throttle может пропустить часть, но bridge уже тёплый)
     t3 = time.perf_counter()

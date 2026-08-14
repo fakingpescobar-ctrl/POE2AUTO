@@ -338,8 +338,9 @@ class TestDeadSince:
             2: now - 5.0,    # свежий → оставить
         }
         det._dead_track_cleanup_ts = 0.0
-        det._update_static_track([])  # триггерит cleanup (см. ниже)
-        # _update_static_track требует ignore_static — без raw мобов это ок
+        det._parse_and_track([])  # триггерит cleanup (см. ниже)
+        # _parse_and_track с пустым кадром: цикл пуст, _finalize_tracks
+        # выполняет чистки — для этого теста достаточно
         assert 1 not in det._dead_track
         assert 2 in det._dead_track
 
@@ -349,7 +350,7 @@ class TestDeadSince:
         now = time.perf_counter()
         det._dead_track = {1: now - 40.0}
         det._dead_track_cleanup_ts = now  # только что чистили → пропуск
-        det._update_static_track([])
+        det._parse_and_track([])
         assert 1 in det._dead_track  # cleanup ещё не сработал
 
 
@@ -509,10 +510,11 @@ class TestBestTargetConfidence:
 
 
 # --- Кадровые сценарии (имитация update()) ---
-# Воспроизводят реальный цикл бота: read_entities_raw → _parse_entities →
-# _update_static_track → _classify_target. Позволяет отследить, на каком кадре
-# моб становится COMBAT (и почему) — например, задержку 2-3 сек, когда стоячий
-# стрелок в радиусе атаки классифицируется как GHOST_STATIC.
+# Воспроизводят реальный цикл бота: read_entities_raw → _parse_and_track
+# (единый проход: парсинг + треки) → _classify_target. Позволяет отследить,
+# на каком кадре моб становится COMBAT (и почему) — например, задержку
+# 2-3 сек, когда стоячий стрелок в радиусе атаки классифицируется
+# как GHOST_STATIC.
 
 def _raw_mob(eid=1, gx=30.0, gy=0.0, hp_cur=1000, hp_max=1000, alive=True,
              hostile=1, rarity=0, path="/Monsters/Picts/PictMaleAxe",
@@ -534,13 +536,12 @@ def _raw_mob(eid=1, gx=30.0, gy=0.0, hp_cur=1000, hp_max=1000, alive=True,
 class TestFrameScenario:
     """Имитация кадрового цикла update() без .NET bridge.
 
-    Каждый вызов _frame() = один кадр: парсинг raw → трек движения → классификация.
-    Возвращает dict addr → TargetStatus для hostile-монстров.
+    Каждый вызов _frame() = один кадр: единый проход парсинг+треки →
+    классификация. Возвращает dict addr → TargetStatus для hostile-монстров.
     """
 
     def _frame(self, det, raws):
-        det._last_entities = det._parse_entities(raws)
-        det._update_static_track(raws)
+        det._last_entities = det._parse_and_track(raws)
         return {e.id: det._classify_target(e) for e in det._last_entities
                 if e.category == EntityCategory.MONSTER and not e.is_friendly}
 

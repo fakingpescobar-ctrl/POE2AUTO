@@ -1148,16 +1148,24 @@ def main() -> int:
                                  _nd_s, mob_det.attack_range)
                         if isinstance(mob_det, ReaderMobDetector):
                             _ts = getattr(mob_det, "stats", {}).get("target_status", {})
+                            # _player_fire_time пишется через time.perf_counter()
+                            # (см. reader_detect._finalize_tracks) — сравнивать
+                            # только с perf_counter, иначе мусорный «возраст»
+                            # (был 1.7e9 c при time.time() - perf_counter()).
                             _fire = getattr(mob_det, "_player_fire_time", 0.0)
-                            _age = (time.time() - _fire) if _fire else -1
+                            _age = (time.perf_counter() - _fire) if _fire else -1
                             log.info("ENTD: status=%s fire_age=%.1fs player=%s",
                                      _ts, _age, getattr(mob_det, "_player_pos", None))
                             _near = [e for e in mob_det._last_entities
                                      if e.category == EntityCategory.MONSTER and not e.is_friendly
                                      and e.distance < 70]
                             _near.sort(key=lambda e: e.distance)
+                            _st_by_id = getattr(mob_det, "_status_by_id", {})
                             for e in _near[:6]:
-                                _st = mob_det._classify_target(e)
+                                # Классификация уже посчитана в update() и лежит
+                                # в _status_by_id — не зовём дорогой _classify_target
+                                # повторно (это и есть смысл кэша).
+                                _st = _st_by_id.get(e.id, "?")
                                 _tr = mob_det._static_track.get(e.id, {})
                                 log.info("ENTD   d=%5.1f st=%-11s hp=%d/%d reach=%s | %s",
                                          e.distance, _st, e.hp_current, e.hp_max,

@@ -185,7 +185,14 @@ class MonsterDB:
             _log.warning("MonsterDB write failed (%d rows): %s", len(full), e)
 
     def _maybe_cleanup(self) -> None:
-        """Периодически удалять записи старше keep_days."""
+        """Периодически удалять записи старше keep_days и сжимать файл БД.
+
+        DELETE оставляет в файле «дыры» — размер БД не уменьшается, пока не
+        выполнить VACUUM (проверено: 462 МБ после сессий с purge). VACUUM
+        дорогой (пересборка всей БД), поэтому бежим только если реально
+        удалили записи, и не чаще раза в час. В WAL/autocommit режиме безопасен:
+        writer-поток — единственный пишущий, транзакции не открыты.
+        """
         if self.keep_days <= 0:
             return
         now = time.time()
@@ -195,8 +202,17 @@ class MonsterDB:
         cutoff = now - self.keep_days * 86400
         try:
             assert self._conn is not None
+            before = self._conn.total_changes
             self._conn.execute("DELETE FROM monster_events WHERE ts < ?", (cutoff,))
-            _log.debug("MonsterDB cleanup: удалены записи старше %.1f дн", self.keep_days)
+            deleted = self._conn.total_changes - before
+            if deleted:
+                _log.debug("MonsterDB cleanup: удалены записи старше %.1f дн "
+                           "(%d строк)", self.keep_days, deleted)
+                try:
+                    self._conn.execute("VACUUM")
+                    _log.debug("MonsterDB cleanup: VACUUM выполнен, файл сжат")
+                except sqlite3.Error as ve:
+                    _log.warning("MonsterDB VACUUM failed (повтор через час): %s", ve)
         except sqlite3.Error as e:
             _log.warning("MonsterDB cleanup failed: %s", e)
 

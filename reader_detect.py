@@ -307,10 +307,13 @@ class ReaderMobDetector:
         else:
             self._player_pos = self.bridge.get_player_grid_pos()
 
-        # Парсим сущности
-        self._last_entities = self._parse_entities(raw_entities)
-        # Один проход по raw_entities: трек «призраков» + снарядов (P2).
-        self._update_static_track(raw_entities)
+        # Один проход по raw_entities: парсинг сущностей + треки «призраков»
+        # и снарядов (P2+P4). Раньше были два полных прохода по списку
+        # сущностей кадра (1172+/кадр при 20 Гц) — _parse_entities() +
+        # _update_tracks(). Порядок семантики сохранён: каждая сущность
+        # парсится по состоянию треков конца ПРОШЛОГО кадра, обновление её
+        # трека идёт сразу после парсинга (см. _parse_and_track).
+        self._last_entities = self._parse_and_track(raw_entities)
 
         # Статистика + кэш классификации. ОДИН проход по мобам: каждая сущность
         # классифицируется ровно один раз за кадр (раньше _classify_target звался
@@ -657,36 +660,41 @@ class ReaderMobDetector:
 
     # --- Parsing (internal) ---
 
-    def _update_static_track(self, raw_entities: list) -> None:
-        """Трекать позиции монстров, чтобы отличать живых от статичных «призраков».
+    def _parse_and_track(self, raw_entities: list) -> List[EntityData]:
+        """ОДИН проход по raw_entities: парсинг сущностей + треки «призраков»/снарядов.
 
-        «Призрак» = моб, который с момента появления в дереве НИ РАЗУ не сдвинулся
-        с места (спящий утопленник в воде, декоративный труп). Реальный враг почти
-        всегда начинает движение/атаку — и остаётся валидной целью навсегда
-        (ever_moved сохраняется, даже если потом встанет в упор и бьёт на месте).
-        Дополнительный признак «в бою» — ever_hit: моб получал урон (hp_cur < hp_max),
-        его уже били. Стоячий стрелок с полным HP остаётся «призраком», пока не
-        шевельнётся / не получит урон / пока игрок под вражеским огнём.
-        """
-        self._update_tracks(raw_entities)
+        Раньше это были два полных прохода по списку сущностей кадра
+        (1172+/кадр при 20 Гц): _parse_entities() + _update_tracks().
+        Теперь за один цикл сущность и парсится, и попадает в трек
+        движения/урона (для детекта «призраков»), и в трек снарядов
+        (признак «игрок под вражеским огнём»).
 
-    def _update_tracks(self, raw_entities: list) -> None:
-        """Один проход по raw_entities: трек статики мобов + трек снарядов.
+        Семантика сохранена: парсинг сущности видит треки, собранные на
+        ПРОШЛОМ кадре (свой трек сущность обновляет ПОСЛЕ своего парсинга),
+        а детект смерти (исчезнувшие мобы) и чистки выполняются в
+        _finalize_tracks — после полного прохода, как и раньше.
 
-        Объединяет прежние _update_static_track и _track_projectiles — раньше
-        каждый делал СВОЙ полный проход по списку сущностей (1172+/кадр), т.е.
-        два лишних прохода на каждый кадр. Теперь за один цикл собираем и
-        «призраков» (адреса в кадре → движение/урон), и снаряды
-        (приближение к игроку → признак «игрок в бою»).
+        Возвращает список EntityData (как прежний _parse_entities).
         """
         now = time.perf_counter()
-        seen = set()       # адреса мобов в кадре (для детекта смерти)
-        proj: dict = {}    # addr -> dist (снаряды в кадре, до игрока)
         px, py = self._player_pos
+        entities: List[EntityData] = []
+        seen: set = set()       # адреса мобов в кадре (для детекта смерти)
+        proj: dict = {}         # addr -> dist (снаряды в кадре, до игрока)
         if not self.ignore_static:
             self._static_track.clear()
+
         for raw in raw_entities:
+            if not isinstance(raw, dict):
+                continue
             et = raw.get("entity_type")
+
+            # --- Парсинг сущности (по трекам прошлого кадра) ---
+            entity = self._parse_entity(raw, px, py)
+            if entity is not None:
+                entities.append(entity)
+
+            # --- Треки: мобы («призраки») и снаряды ---
             if et == "m" and self.ignore_static:
                 addr = raw.get("addr", 0)
                 if not addr:
@@ -721,6 +729,15 @@ class ReaderMobDetector:
                     continue
                 proj[addr] = d
 
+        self._finalize_tracks(seen, proj, now)
+        return entities
+
+    def _finalize_tracks(self, seen: set, proj: dict, now: float) -> None:
+        """Завершить кадр треков: детект смерти, чистки, кэш снарядов.
+
+        Вызывается из _parse_and_track после полного прохода по сущностям
+        (и отдельно в тестах для проверки cleanup'ов).
+        """
         # Track deaths: entity was seen before but not in this frame -> dead
         for a, tr in list(self._static_track.items()):
             if a not in seen and tr.get("ever_moved"):
@@ -761,20 +778,6 @@ class ReaderMobDetector:
             self._last_proj_ts = now
             if fired:
                 self._player_fire_time = now
-
-    def _parse_entities(self, raw_entities: list) -> List[EntityData]:
-        """Преобразовать список raw-сущностей из ReaderBridge → список EntityData."""
-        entities: List[EntityData] = []
-        px, py = self._player_pos
-
-        for raw in raw_entities:
-            if not isinstance(raw, dict):
-                continue
-            entity = self._parse_entity(raw, px, py)
-            if entity is not None:
-                entities.append(entity)
-
-        return entities
 
     def _parse_entity(self, raw: dict,
                       player_x: float, player_y: float) -> Optional[EntityData]:

@@ -17,7 +17,7 @@ for _ in range(3):
 
 N = 10
 t = {k: [] for k in ("in_game", "game_state", "area_info", "read_raw",
-                     "parse", "static_track", "classify", "hostiles", "db_record")}
+                     "parse", "classify", "hostiles", "db_record")}
 
 for i in range(N):
     t0 = time.perf_counter()
@@ -37,12 +37,12 @@ for i in range(N):
     t["read_raw"].append((time.perf_counter() - t0) * 1000)
 
     t0 = time.perf_counter()
-    ents = mob_det._parse_entities(raw)
+    ents = mob_det._parse_and_track(raw)   # единый проход: парсинг + треки
     t["parse"].append((time.perf_counter() - t0) * 1000)
 
     t0 = time.perf_counter()
-    mob_det._update_static_track(raw)
-    t["static_track"].append((time.perf_counter() - t0) * 1000)
+    # треки «призраков»/снарядов теперь внутри _parse_and_track —
+    # отдельного прохода нет (был _update_static_track)
 
     t0 = time.perf_counter()
     for e in ents:
