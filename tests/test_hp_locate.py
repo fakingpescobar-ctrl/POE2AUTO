@@ -125,3 +125,26 @@ class TestFindInRegion:
         reader = FakeReader()
         assert _find_in_region(frame, reader, None, (0.0, 0.55, 0.42, 0.99),
                                0.010, 0.060, 0.30) is None
+
+    def test_verify_accepts_split_glyph_question_mark(self):
+        """'4' разбита обводкой на палочку+диагональ → в reread лишний '?'.
+        Верификация сравнивает без '?': '508/14?66' == '508/1466' → находим."""
+        frame = _make_frame()
+        # 8 прямоугольных «глифов» 508/1466 в зоне поиска (y 330..594, x 0..336)
+        _stamp_glyphs(frame, (20, 400, 120, 27), "508/1466")
+        glyph_results = {0: "5", 1: "0", 2: "8", 3: "/", 4: "1", 5: "4", 6: "6", 7: "6"}
+        reader = FakeReader(read_result="508/14?66", glyph_results=glyph_results)
+        res = _find_in_region(frame, reader, None, (0.0, 0.55, 0.42, 0.99),
+                              0.010, 0.060, 0.30)
+        assert res is not None
+        assert (res["cur"], res["max"]) == (508, 1466)
+
+    def test_verify_rejects_lost_digit(self):
+        """'?' ВМЕСТО цифры (потеряна) → '508/146' ≠ '508/1466' → отклоняем."""
+        frame = _make_frame()
+        _stamp_glyphs(frame, (20, 400, 120, 27), "508/1466")
+        glyph_results = {0: "5", 1: "0", 2: "8", 3: "/", 4: "1", 5: "4", 6: "6", 7: "6"}
+        reader = FakeReader(read_result="508/146", glyph_results=glyph_results)
+        res = _find_in_region(frame, reader, None, (0.0, 0.55, 0.42, 0.99),
+                              0.010, 0.060, 0.30)
+        assert res is None

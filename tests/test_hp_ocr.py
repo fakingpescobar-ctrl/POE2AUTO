@@ -150,9 +150,11 @@ class TestHPNumReaderParse:
         r = self._make_reader()
         assert r._parse("1640") is None
 
-    def test_question_mark(self):
+    def test_question_mark_split_glyph(self):
+        """'?' от разрыва '4' (палочка+диагональ, светлый фон) — лишний символ:
+        убираем и парсим. '508/14?66' → '508/1466'."""
         r = self._make_reader()
-        assert r._parse("164?/1640") is None
+        assert r._parse("508/14?66") == (508, 1466, 508 / 1466)
 
     def test_zero_max(self):
         r = self._make_reader()

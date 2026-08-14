@@ -123,7 +123,13 @@ def _find_in_region(frame_bgr, reader, prefer_y, region,
     pad = int(pad_frac * th)
     px1, py1 = max(0, bx1 - pad), max(0, by1 - pad)
     px2, py2 = min(fw, bx2 + pad), min(fh, by2 + pad)
-    if reader.read_string_crop(frame_bgr[py1:py2, px1:px2]) != f"{best['cur']}/{best['max']}":
+    # Верификация. '4' в шрифте PoE2 состоит из палочки+диагонали, разделённых
+    # чёрной обводкой: на светлом фоне (хайдаут/город) палочка читается как
+    # лишний '?' ("508/14?66" при реальной "508/1466"). Сравниваем без '?' —
+    # разрыв только добавляет символ; '?' вместо потерянной цифры даёт другое
+    # число и всё равно не совпадёт с ожидаемым.
+    reread = reader.read_string_crop(frame_bgr[py1:py2, px1:px2]).replace("?", "")
+    if reread != f"{best['cur']}/{best['max']}":
         return None
     best["roi"] = {"x1": px1 / fw, "y1": py1 / fh, "x2": px2 / fw, "y2": py2 / fh}
     return best

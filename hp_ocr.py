@@ -204,8 +204,15 @@ class HPNumReader:
         return self.read_string_crop(frame_bgr[y1:y2, x1:x2])
 
     def _parse(self, s):
-        if "?" in s or "/" not in s:
+        if "/" not in s:
             return None
+        # '4' в шрифте PoE2 — палочка+диагональ с чёрной обводкой: на светлом фоне
+        # (хайдаут/город) палочка даёт лишний '?' ("508/14?66" при "508/1466").
+        # Убираем '?' — разрыв ДОБАВЛЯЕТ символ, а не теряет цифру: длина строки
+        # не меняется, cur/max остаются теми же числами. Случай '?' вместо
+        # потерянной цифры (длина сохраняется) даёт искажённые числа и отсеется
+        # проверкой mx <= 0 / cur > mx ниже.
+        s = s.replace("?", "")
         cur_s, _, max_s = s.partition("/")
         if not cur_s or not max_s or not cur_s.isdigit() or not max_s.isdigit():
             return None
