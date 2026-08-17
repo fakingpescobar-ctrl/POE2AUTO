@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
-import queue
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,158 +46,39 @@ from nav_worker import NavWorker
 from game_memory import GameMemory as _GM
 from stash_flow import open_maps_tab as _open_maps_tab, summarize_items as _summarize, list_stash_tabs as _list_stash_tabs, filter_maps as _filter_maps, read_all_maps as _read_all_maps
 from map_run_flow import run_map_flow as _run_map_flow
+from workers import LootWorker, AttackWorker
 
 LOG_PATH = os.path.join(os.path.dirname(__file__), "bot.log")
 
 _fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S")
-_root = logging.getLogger()
-_root.setLevel(logging.INFO)
-# консоль
-_sh = logging.StreamHandler()
-_sh.setFormatter(_fmt)
-_root.addHandler(_sh)
-# файл (ротация: 3 файла × 1 МБ — не теряем старые логи, но не засоряем диск)
-_fh = logging.handlers.RotatingFileHandler(
-    LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-_fh.setFormatter(_fmt)
-_root.addHandler(_fh)
+
+
+def _setup_logging() -> None:
+    """Настроить корневой логгер: консоль + файл (ротация 3 × 1 МБ).
+
+    Вызывается из main() — импорт bot.py не создаёт файл лога (чистый импорт).
+    Повторные вызовы безопасны (handlers уже настроены — пропускаем).
+    """
+    _root = logging.getLogger()
+    if _root.handlers:
+        return
+    _root.setLevel(logging.INFO)
+    # консоль
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(_fmt)
+    _root.addHandler(_sh)
+    # файл (ротация: 3 файла × 1 МБ — не теряем старые логи, но не засоряем диск)
+    _fh = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    _fh.setFormatter(_fmt)
+    _root.addHandler(_fh)
+
 
 log = logging.getLogger("poe2auto.bot")
 
 
-class LootWorker(threading.Thread):
-    """Детект лута в отдельном потоке. Не блокирует главный цикл."""
-
-    def __init__(self, detector, engine, pickup_mask, hold_ms, vx, bridge):
-        super().__init__(daemon=True)
-        self._cfg_lock = threading.Lock()
-        self.detector = detector
-        self.engine = engine
-        self.pickup_mask = pickup_mask
-        self.hold_ms = hold_ms
-        self.vx = vx
-        self.bridge = bridge
-        self._frame_q: queue.Queue = queue.Queue(maxsize=1)
-        self._result: Optional[Tuple[list, list]] = None
-        self._result_lock = threading.Lock()
-        self._stop_event = threading.Event()
-
-    def update_config(self, detector, engine):
-        """Обновить детектор и движок потокобезопасно."""
-        with self._cfg_lock:
-            self.detector = detector
-            self.engine = engine
-
-    def submit(self, loot_frame, loot_ctr, foreground):
-        """Отправить кадр на обработку (неблокирующе). Старый кадр отбрасывается."""
-        try:
-            self._frame_q.put_nowait((loot_frame, loot_ctr, foreground))
-        except queue.Full:
-            pass
-
-    def get_result(self) -> Optional[Tuple[list, list]]:
-        """Взять последний результат (неблокирующе). None = ещё не обработан."""
-        with self._result_lock:
-            r = self._result
-            self._result = None
-            return r
-
-    def stop(self):
-        self._stop_event.set()
-
-    def run(self):
-        while not self._stop_event.is_set():
-            try:
-                loot_frame, loot_ctr, foreground = self._frame_q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                with self._cfg_lock:
-                    detector = self.detector
-                    engine = self.engine
-                points, _mask = detector.detect(loot_frame)
-                in_radius = engine.targets_in_radius(points, loot_frame.shape, center=loot_ctr)
-                with self._result_lock:
-                    self._result = (points, in_radius)
-            except Exception:
-                # Защита от молчаливой гибели потока: падение в детекте лута
-                # не должно убивать LootWorker (пикап бы молча умер).
-                log.exception("LootWorker: ошибка детекта лута")
-
-
-class AttackWorker(threading.Thread):
-    """Детект мобов в отдельном потоке. Поддерживает CV (MobBarDetector) и память (MemoryMobDetector)."""
-
-    def __init__(self, mob_det, zone_det=None, use_memory=False, cv_det=None):
-        super().__init__(daemon=True)
-        self._cfg_lock = threading.Lock()
-        self.mob_det = mob_det
-        self.zone_det = zone_det
-        self.use_memory = use_memory
-        self.cv_det = cv_det
-        self._frame_q: queue.Queue = queue.Queue(maxsize=1)
-        self._result: Optional[Dict[str, Any]] = None
-        self._result_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self.last_cv: Optional[bool] = None  # последний результат CV-подтверждения
-
-    def update_config(self, mob_det, zone_det, use_memory, cv_det=None):
-        """Обновить конфигурацию потокобезопасно."""
-        with self._cfg_lock:
-            self.mob_det = mob_det
-            self.zone_det = zone_det
-            self.use_memory = use_memory
-            self.cv_det = cv_det
-
-    def submit(self, full_frame=None, foreground=True):
-        """Отправить кадр на обработку (неблокирующе). Для memory-детекта frame не нужен."""
-        try:
-            self._frame_q.put_nowait((full_frame, foreground))
-        except queue.Full:
-            pass
-
-    def get_result(self) -> Optional[Dict[str, Any]]:
-        """Взять последний результат (неблокирующе). None = ещё не обработан."""
-        with self._result_lock:
-            r = self._result
-            self._result = None
-            return r
-
-    def stop(self):
-        self._stop_event.set()
-
-    def run(self):
-        while not self._stop_event.is_set():
-            try:
-                full_frame, foreground = self._frame_q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                with self._cfg_lock:
-                    mob_det = self.mob_det
-                    zone_det = self.zone_det
-                    use_memory = self.use_memory
-                mob_present = False
-                in_hideout = False
-                if use_memory and mob_det is not None:
-                    mob_det.update()
-                    in_hideout = mob_det.in_hideout()
-                    if not in_hideout:
-                        # «Живость» мобов определяется в reader_detect по Life-vtable
-                        # (трупы/латентные сущности отсекаются на уровне парсинга),
-                        # поэтому CV-подтверждение не нужно.
-                        mob_present = mob_det.present()
-                elif mob_det is not None and foreground:
-                    in_hideout = zone_det is not None and zone_det.in_hideout(full_frame)
-                    if not in_hideout:
-                        mob_present = mob_det.present(full_frame)
-                with self._result_lock:
-                    self._result = {"mob_present": mob_present, "in_hideout": in_hideout}
-            except Exception as e:
-                log.error("AttackWorker error: %s", e, exc_info=True)
-
-
 def main() -> int:
+    _setup_logging()
     cfg: Dict[str, Any] = load_config()
     loot: Dict[str, Any] = cfg["loot"]
 
@@ -521,7 +401,7 @@ def main() -> int:
     k_diag = cfg["hotkeys"].get("diag", "f7")
     k_shot = cfg["hotkeys"].get("snapshot", "f9")
     k_overlay = cfg["hotkeys"].get("overlay", "f6")
-    k_attack = cfg["hotkeys"].get("attack", "f10")
+    k_attack = cfg["hotkeys"].get("attack", "f2")
     k_flask = cfg["hotkeys"].get("flask", "f3")
     k_radial = cfg["hotkeys"].get("radial", "f4")
     k_reload = "f5"

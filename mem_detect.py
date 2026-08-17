@@ -112,8 +112,15 @@ class MemoryMobDetector:
             return False
         self._last_update = now
 
-        # Переподключение при потере
-        if not self.mem.connected:
+        # Переподключение при потере процесса.
+        # ВАЖНО: OpenProcess хендл НЕ закрывается при смерти PoE2 — mem.connected
+        # остаётся True, а read'ы тихо фейлятся (None). Поэтому кроме connected
+        # проверяем живость процесса через check_alive(), иначе reconnect
+        # после перезапуска игры никогда не произойдёт.
+        if not self.mem.connected or not self.mem.check_alive():
+            if self.mem.connected:
+                _log.warning("PoE2 процесс мёртв — переподключение...")
+                self.disconnect()
             self.connect()
             if not self.mem.connected:
                 return False

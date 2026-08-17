@@ -518,11 +518,14 @@ class ReaderMobDetector:
 
         Returns:
             (hp_pct, mana_pct) — доли 0..1, или (None, None) если данных нет.
-            HP читается из Life.HEALTH VitalStruct (см. reader_bridge._read_life_hp).
+            HP/Mana читаются из Life VitalStruct'ов (см. reader_bridge._read_life_hp):
+            life=[hp_max, hp_cur, mp_max, mp_cur, ...].
         """
         lc = self._player_hp or []
-        if len(lc) >= 2 and lc[0] > 0:
-            return (lc[1] / lc[0]), None
+        if len(lc) >= 4 and lc[0] > 0:
+            hp_pct = lc[1] / lc[0]
+            mana_pct = (lc[3] / lc[2]) if lc[2] > 0 else None
+            return hp_pct, mana_pct
         return None, None
 
     def _classify_target(self, entity: EntityData) -> str:

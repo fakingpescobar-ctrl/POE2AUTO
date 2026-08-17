@@ -265,6 +265,42 @@ class TestUpdate:
         result = det.update()
         assert result is False
 
+    def test_reconnect_when_process_dead_but_handle_open(self):
+        """Хендл OpenProcess остаётся открытым после смерти PoE2 (read'ы тихо
+        фейлятся) — reconnect должен сработать через check_alive()."""
+        det = MemoryMobDetector()
+        det._connected = True
+        det._area_instance = 0x12345
+        det.mem = MagicMock()
+        det.mem.connected = True          # хендл ещё "открыт"
+        det.mem.check_alive.return_value = False  # но процесс мёртв
+        det.mem.connect.return_value = False      # новая игра ещё не запущена
+        det.disconnect = MagicMock(side_effect=lambda: setattr(det.mem, "connected", False))  # хендл закрыт
+        det._last_update = 0.0
+        result = det.update()
+        assert result is False
+        det.disconnect.assert_called_once()  # старый хендл закрыт
+        det.mem.connect.assert_called_once()  # попытка переподключения была
+
+    def test_alive_process_no_reconnect(self):
+        """Живой процесс с открытым хендлом — reconnect не должен срабатывать."""
+        det = MemoryMobDetector()
+        det._connected = True
+        det._area_instance = 0x12345
+        det.mem = MagicMock()
+        det.mem.connected = True
+        det.mem.check_alive.return_value = True
+        det._last_update = 0.0
+        # reader mocks — чтобы update() не упал на реальном чтении
+        det.reader = MagicMock()
+        det.reader.read_local_player.return_value = None
+        det.reader.read_entities.return_value = []
+        det.reader._resolve_components.return_value = {}
+        det.mem.read_pointer.return_value = None
+        result = det.update()
+        assert result is True
+        det.mem.connect.assert_not_called()
+
     def test_no_area_instance(self):
         det = MemoryMobDetector()
         det._connected = True

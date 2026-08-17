@@ -153,3 +153,33 @@ grid_y = worldY / WORLD_TO_GRID_RATIO   # ← из Y, НЕ из Z
 - Путь обходит синтетическую стену (A*)
 - ASCII-карта хайдаута показывает реальные стены (###), NPC и объекты (o)
 - Игрок в хайдауте: world (3690.2, 3755.4) → grid (339, 345), walkable=1
+
+---
+
+# СВОДКА ДЛЯ АССИСТЕНТА (обновлено 16.08.2026)
+
+> **ПОЛНЫЙ анализ проекта (архитектура, модули, БД, оффсеты, ввод, навигация, HP-стек, риски, рейтинг модулей): `Full_Analise_Project.md` в корне проекта.** Начинать с него, а не с чтения кода.
+
+## Быстрый старт
+- Запуск: `run_bot.bat` (admin для ViGEmBus), Python из `%USERPROFILE%\anaconda3` с pythonnet. **Обычный Python 3.14 НЕ подходит.**
+- Три режима детекта мобов (`auto_attack.use_memory`): `reader` (⭐ C# PoE2ReaderLib.dll) / `memory` (legacy) / `false`/`cv` (fallback). Авто-откат при падении.
+- Хоткеи (config.yaml): F1 nav, **F2 attack**, F3 flask, F4 radial, F5 reload (зашит), F6 overlay, F7 diag, F8 подбор, F9 snapshot, **F10 map_run**, F11 stash, F12 quit.
+
+## Ключевые факты
+- Главный цикл ~11.8 Гц (было 2.1 Гц), reader update 87 Гц, 1172–1328 сущностей/кадр.
+- Классификация TargetStatus: DEAD→SPIRIT→LATENT→GHOST_STATIC→UNKNOWN→COMBAT; атака только COMBAT; `kill_cooldown_s=5.0` через MonsterDB (EXISTS-подзапрос combat→dead), `death_grace_s=2.0`, Z-tolerance 120.
+- monster_db: WAL, dedup (10–20×), индекс `(session_id,status,ts)`, VACUUM 1/час, keep_days=3.
+- Ввод: VirtualXbox360 (ViGEmBus, heartbeat 20 Гц) + DualSenseBridge (HID, suppress_triggers, реконнект после 5 ошибок).
+- Навигация: CoreMap (RATIO=250/23, A*), NavWorker (nav_target.json), map run F10, stash F11.
+- Тесты: `python -m pytest tests/` — 81/59/188+ passed в разных наборах.
+
+## Известные баги (топ)
+1. **CRITICAL: мана не читается** — `reader_detect.read_player_vitals()` (строка ~525) возвращает `(hp_pct, None)` → правило «Mana Low» авто-фляги мертво. MANA offset 0x208 уже есть в game_offsets.py — фикс дешёвый.
+2. `entity_reader.py` grid_y берёт Z вместо Y (см. раздел Core Mapping выше).
+3. БД ~556 МБ — периодический ручной VACUUM не помешает.
+4. Конфликт хоткеев: attack=f2 в конфиге, но дефолт кода f10, и f10 занят map_run.
+5. Оффсеты захардкожены — после каждого патча PoE2 прогонять `fix_offsets.bat` (последний сдвиг +0x20, 16.07.2026).
+6. Монолит bot.py 1213 строк; устаревшие докстринги (read_entities_raw); мусор в корне (nul, ~100 разовых скриптов).
+
+## Память
+Полная сводка и список багов сохранены в supermemory (user scope, ключ поиска «POE2AUTO») — при необходимости делать recall.

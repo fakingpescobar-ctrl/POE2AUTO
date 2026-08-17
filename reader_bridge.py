@@ -230,12 +230,14 @@ class ReaderBridge:
         return hp_max, hp_cur
 
     def _read_life_hp(self, addr: int) -> tuple:
-        """Прочитать (hp_max, hp_cur) сущности через Life.HEALTH VitalStruct.
+        """Прочитать (hp_max, hp_cur, mp_max, mp_cur) сущности через Life VitalStruct.
 
-        Оффсеты: Life+0x1B0 → VitalStruct {Max@0x2C, Current@0x30} (game_offsets).
+        Оффсеты: Life+0x1B0 → VitalStruct {Max@0x2C, Current@0x30} (HP),
+        Life+0x208 → VitalStruct (Mana). Оба читаются ОДНИМ куском 0x98 байт
+        (MANA+0x34 - HEALTH = 0x98) — 1 вызов ReadBytes вместо 2.
         Кэшируется ТОЛЬКО адрес Life-компонента (ResolveComponents дорог), а сами
-        значения HP читаются каждый вызов — чтобы смерть моба (hp_cur→0) виделась
-        сразу, а не через TTL кэша.
+        значения HP/Mana читаются каждый вызов — чтобы смерть моба (hp_cur→0)
+        виделась сразу, а не через TTL кэша.
         """
         now = time.monotonic()
         life = self._life_cache.get(addr)
@@ -243,23 +245,27 @@ class ReaderBridge:
             try:
                 cdict = self._reader.ResolveComponents(addr)
                 if "Life" not in cdict.Keys:
-                    return (0, 0)
+                    return (0, 0, 0, 0)
                 life = int(cdict["Life"])
                 self._life_cache[addr] = life
                 self._life_cache_ts[addr] = now
             except Exception:
-                return (0, 0)
+                return (0, 0, 0, 0)
         try:
             base = life + _LifeOff.HEALTH
-            bts = bytes(self._reader.Reader.ReadBytes(base, 0x40))
+            # 0x98 = MANA(0x208) + SIZE(0x34) - HEALTH(0x1B0)
+            bts = bytes(self._reader.Reader.ReadBytes(base, 0x98))
             hp_max = int.from_bytes(bts[_VitalOff.MAX: _VitalOff.MAX + 4], "little")
             hp_cur = int.from_bytes(bts[_VitalOff.CURRENT: _VitalOff.CURRENT + 4], "little")
+            mana_rel = _LifeOff.MANA - _LifeOff.HEALTH  # 0x58
+            mp_max = int.from_bytes(bts[mana_rel + _VitalOff.MAX: mana_rel + _VitalOff.MAX + 4], "little")
+            mp_cur = int.from_bytes(bts[mana_rel + _VitalOff.CURRENT: mana_rel + _VitalOff.CURRENT + 4], "little")
         except Exception:
-            return (0, 0)
+            return (0, 0, 0, 0)
         if len(self._life_cache) > 2048:
             self._life_cache.clear()
             self._life_cache_ts.clear()
-        return (hp_max, hp_cur)
+        return (hp_max, hp_cur, mp_max, mp_cur)
 
     def _read_mob_meta(self, addr: int) -> tuple:
         """Прочитать мету моба: (life_addr, rarity, is_boss).
@@ -323,8 +329,8 @@ class ReaderBridge:
             rarity = 0
             is_boss = False
             if etype == "Player":
-                hm, hc = self._read_life_hp(int(ent.Item1))
-                life = [hm, hc, 0, 0, 0, 0, 0, 0, 0]
+                hm, hc, mp_m, mp_c = self._read_life_hp(int(ent.Item1))
+                life = [hm, hc, mp_m, mp_c, 0, 0, 0, 0, 0]
             elif etype == "m":
                 life_addr, rarity, is_boss = self._read_mob_meta(int(ent.Item1))
                 if life_addr:

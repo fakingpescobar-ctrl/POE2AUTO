@@ -11,7 +11,7 @@
 Адаптировано из POE2GPS (Sikaka/POE2Radar, MIT).
 """
 import logging
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Optional, Dict, List, NamedTuple
 from enum import IntEnum
 
@@ -43,8 +43,8 @@ class EntityData(NamedTuple):
     category: EntityCategory
     metadata: str
     x: float           # мировая координата X
-    y: float           # мировая координата Z (вертикаль в PoE2)
-    z: float           # мировая координата Y (глубина)
+    y: float           # мировая координата Y (долгота)
+    z: float           # мировая координата Z (высота)
     grid_x: float      # сетевая координата
     grid_y: float      # сетевая координата
     hp_current: int
@@ -59,6 +59,26 @@ class EntityData(NamedTuple):
     is_corpse: bool = False
     confidence: float = 0.0   # 0..1 — уверенность в классификации
     dead_since: Optional[float] = None  # timestamp смерти (perf_counter), None если жив
+
+
+class _BoundedCache(OrderedDict):
+    """Dict с ограничением размера (FIFO eviction).
+
+    Кэши адресов сущностей растут бесконечно по мере переиспользования
+    адресов областью — без лимита утекает память. FIFO достаточно:
+    старые адреса уже не встретятся (пул адресов цикличен).
+    """
+
+    def __init__(self, maxsize: int = 2048):
+        super().__init__()
+        self.maxsize = maxsize
+
+    def __setitem__(self, key, value):
+        if key in self:
+            del self[key]
+        elif len(self) >= self.maxsize:
+            self.popitem(last=False)  # вытеснить самую старую запись
+        super().__setitem__(key, value)
 
 
 class EntityReader:
@@ -80,9 +100,10 @@ class EntityReader:
 
     def __init__(self, mem: GameMemory):
         self._mem = mem
-        self._component_cache: Dict[int, Dict[str, int]] = {}  # entity_addr → {name → comp_addr}
-        self._name_cache: Dict[int, str] = {}  # entity_addr → metadata path
-        self._id_cache: Dict[int, int] = {}  # entity_addr → last entity id (recycle guard)
+        self._component_cache: _BoundedCache = _BoundedCache(2048)  # entity_addr → {name → comp_addr}
+        self._comp_name_cache: _BoundedCache = _BoundedCache(512)  # name_ptr → short component name
+        self._name_cache: _BoundedCache = _BoundedCache(2048)  # entity_addr → metadata path
+        self._id_cache: _BoundedCache = _BoundedCache(4096)  # entity_addr → last entity id (recycle guard)
         # Self-healing vital offsets (fallback)
         self._health_off = off.Life.HEALTH
         self._mana_off = off.Life.MANA
@@ -234,9 +255,11 @@ class EntityReader:
             if pos:
                 x, y, z = pos
 
-        # Grid coordinates
+        # Grid coordinates: grid_x = worldX / RATIO, grid_y = worldY / RATIO.
+        # ВАЖНО: раньше было grid_y = z / RATIO (брал высоту Z вместо Y) —
+        # ломало расстояния/навигацию. Y — мировая долгота (см. core_map).
         grid_x = x / off.WORLD_TO_GRID_RATIO
-        grid_y = z / off.WORLD_TO_GRID_RATIO  # Z = глубина = grid Y
+        grid_y = y / off.WORLD_TO_GRID_RATIO
 
         # HP (from Life component)
         hp_cur, hp_max = 0, 0
@@ -315,7 +338,12 @@ class EntityReader:
         return name
 
     def _resolve_components(self, entity_ptr: int) -> Dict[str, int]:
-        """Найти адреса нужных компонентов через ComponentLookUp."""
+        """Найти адреса нужных компонентов через ComponentLookUp.
+
+        Оптимизация: весь bucket (до 256 записей × 0x10) читается ОДНИМ
+        read_bytes(4096) вместо 256 поштучных + имена компонентов кэшируются
+        по name_ptr (стабильны между сущностями) — не перечитываются.
+        """
         cached = self._component_cache.get(entity_ptr)
         if cached is not None:
             return cached
@@ -343,6 +371,13 @@ class EntityReader:
         if not bucket_ptr:
             return comps
 
+        # Весь bucket одним чтением: 256 записей × stride 0x10 = 4096 байт
+        import struct
+        stride = off.ComponentLookUp.ENTRY_STRIDE
+        bucket_data = self._mem.read_bytes(bucket_ptr, 256 * stride)
+        if not bucket_data:
+            return comps
+
         # Read bucket entries: {NamePtr(8), Index(4), pad(4)} stride=0x10
         target_names = {
             off.COMPONENT_RENDER, off.COMPONENT_LIFE,
@@ -350,25 +385,22 @@ class EntityReader:
             off.COMPONENT_MONSTER, off.COMPONENT_TARGETABLE,
         }
 
-        # Read first few entries (budget)
-        max_entries = 256
+        max_entries = min(256, len(bucket_data) // stride)
         for i in range(max_entries):
-            entry_addr = bucket_ptr + i * off.ComponentLookUp.ENTRY_STRIDE
-            entry_data = self._mem.read_bytes(entry_addr, off.ComponentLookUp.ENTRY_STRIDE)
-            if entry_data is None:
-                break
-
-            import struct
-            name_ptr = struct.unpack("<Q", entry_data[0:8])[0]
-            index = struct.unpack("<i", entry_data[8:12])[0]
+            o = i * stride
+            name_ptr = struct.unpack("<Q", bucket_data[o:o + 8])[0]
+            index = struct.unpack("<i", bucket_data[o + 8:o + 12])[0]
 
             if not name_ptr or index < 0:
                 continue
 
-            # Read component name (UTF-8 in bucket entries)
-            comp_name = self._mem.read_string_utf8(name_ptr)
-            if not comp_name:
-                continue
+            # Кэш имён компонентов по name_ptr — имена стабильны между сущностями
+            comp_name = self._comp_name_cache.get(name_ptr)
+            if comp_name is None:
+                comp_name = self._mem.read_string_utf8(name_ptr)
+                if not comp_name:
+                    continue
+                self._comp_name_cache[name_ptr] = comp_name
 
             # Check if it's one of our targets
             short_name = comp_name.rsplit("/", 1)[-1] if "/" in comp_name else comp_name
@@ -384,6 +416,7 @@ class EntityReader:
                 break
 
         self._component_cache[entity_ptr] = comps
+        return comps
         return comps
 
     def _read_vital(self, address: int) -> tuple:

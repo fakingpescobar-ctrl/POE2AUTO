@@ -99,6 +99,10 @@ psapi.GetModuleInformation.argtypes = [
 ]
 psapi.GetModuleInformation.restype = wintypes.BOOL
 
+# GetExitCodeProcess — проверка живости процесса (STILL_ACTIVE = 259)
+kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
 
 class GameMemory:
     """Read-only reader for PoE2 process memory."""
@@ -150,6 +154,21 @@ class GameMemory:
             self._base = 0
             self._size = 0
             self._pid = 0
+
+    def check_alive(self) -> bool:
+        """True если подключённый процесс ещё жив.
+
+        OpenProcess хендл остаётся валидным после смерти процесса — все
+        read'ы просто начинают фейлиться. По одному фейлу не понять, жив ли
+        процесс, поэтому проверяем GetExitCodeProcess (STILL_ACTIVE = 259).
+        """
+        if not self._handle:
+            return False
+        code = wintypes.DWORD(0)
+        ok = kernel32.GetExitCodeProcess(self._handle, ctypes.byref(code))
+        if not ok:
+            return False
+        return code.value == 259  # STILL_ACTIVE
 
     def read_bytes(self, address: int, size: int) -> Optional[bytes]:
         """Read raw bytes from game memory."""
