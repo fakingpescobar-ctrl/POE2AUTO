@@ -1,65 +1,100 @@
 # POE2AUTO — Документация проекта
 
-> **Path of Exile 2 Auto-Bot** — Python-автоматизация для PoE2 с поддержкой DualSense контроллера.
-> 
-> **Версия:** 2.4.0 | **Дата создания:** 2026-07-24 | **Статус:** Активная разработка
+> **Path of Exile 2 Auto-Bot** — Python-автоматизация для PoE2 с поддержкой DualSense/DualShock контроллера.
+>
+> **Последнее обновление:** 2026-09-07 | **Статус:** Активная разработка
 
 ---
 
 ## 📋 Оглавление
 
 1. [Обзор проекта](#обзор-проекта)
-2. [Архитектура](#архитектура)
-3. [Установка и зависимости](#установка-и-зависимости)
-4. [Запуск](#запуск)
-5. [Горячие клавиши](#горячие-клавиши)
-6. [Структура модулей](#структура-модулей)
-7. [Конфигурация](#конфигурация)
-8. [Известные проблемы и решения](#известные-проблемы-и-решения)
-9. [План улучшений](#план-улучшений)
-10. [История изменений](#история-изменений)
+2. [Режимы детекции](#режимы-детекции)
+3. [Архитектура](#архитектура)
+4. [Установка и зависимости](#установка-и-зависимости)
+5. [Запуск](#запуск)
+6. [Горячие клавиши](#горячие-клавиши)
+7. [Структура модулей](#структура-модулей)
+8. [Конфигурация](#конфигурация)
+9. [Известные проблемы и решения](#известные-проблемы-и-решения)
+10. [План улучшений](#план-улучшений)
+11. [История изменений](#история-изменений)
+12. [Структура файлов](#структура-файлов)
+13. [Безопасность](#безопасность)
 
 ---
 
 ## Обзор проекта
 
-POE2AUTO — это полноценный бот для автоматизации(Path of Exile 2), который:
+POE2AUTO — полноценный бот для автоматизации Path of Exile 2:
 
-- Управляет персонажем через **Sony DualSense** контроллер
-- Создаёт **виртуальный Xbox 360** через ViGEmBus для стабильной работы с PoE2
-- Автоматически подбирает лут, атакует мобов, использует фляги
-- Поддерживает **3 режима детекции**: Memory (рекомендуется), CV (fallback), Reader (C# pythonnet)
-- Ведёт **SQLite телеметрию** для аналитики и отладки
+- Управляет персонажем через **Sony DualSense / DualShock** (raw HID) → виртуальный Xbox 360 (ViGEmBus)
+- Автоматически подбирает лут, атакует мобов, пьёт фляги
+- Детекция мобов из **памяти игры** (C# DLL) — быстрее и точнее любой CV
+- Ведёт **SQLite телеметрию** убийств мобов (kill cooldown, статистика)
+- Click-through оверлей: статусы, HP-пулы (LIFE/ES/Ward), счётчики сущностей, причина fallback
 
-**Ключевая философия:** Игрок управляет персонажем как обычно, бот добивает автоматические действия (pickup, attack, flask).
+**Ключевая философия:** игрок управляет персонажем как обычно, бот автоматизирует рутину (pickup, attack, flask).
+
+---
+
+## Режимы детекции
+
+Ключ конфигурации: `auto_attack.use_memory`.
+
+| Режим | Значение | Описание |
+|---|---|---|
+| **RDR** ⭐ | `reader` | **Рекомендуется.** C# `PoE2ReaderLib.dll` через pythonnet: ECS-дерево awake, Life-vtable, позиции, зоны, снаряды. 20 Гц обновление, кэши классификации. |
+| MEM | `memory` | Legacy: OpenProcess + NtReadVirtualMemory, AOB-скан оффсетов, self-healing цепочки. |
+| CV | `false` / `cv` | Fallback: детект полосы HP моба по цвету (`mob_bar.py` strict/narrow/low_hp_lock). |
+
+### Авто-реконнект RDR (фикс 07.09.2026)
+
+- Бота можно запускать **до** старта PoE2: читалка не откатывается насовсем, а ждёт процесс (проверка каждые ~2 с) и подключается сама, как только персонаж окажется в зоне.
+- Пока читалка не готова — работает **CV fallback** (с проверкой hideout через `zone_detector`).
+- Причина fallback показывается в оверлее **постоянно** (жёлтая строка уведомлений): `RDR: PoE2 не запущен…`, `RDR: OpenProcess failed (нет admin?)…`, `RDR: GSO AOB pattern не найден (патч сдвинул оффсеты? нужна пересборка DLL)…`.
+- После подключения строка исчезает, режим возвращается на `Reader 📡 (mem✓)`.
+
+**После патча PoE2** при появлении «GSO AOB pattern не найден» — пересобрать DLL:
+
+```
+poe2_scope.bat    # мастер скана оффсетов и пересборки DLL (poe2-scope-ui + poe2_scope)
+```
 
 ---
 
 ## Архитектура
 
 ```
-┌─────────────────────────────────────────────┐
-│               bot.py (Оркестратор)           │
-│         1186 строк — главный цикл            │
-└─────────────────────────────────────────────┘
-         │           │               │
-         ▼           ▼               ▼
-┌──────────────┐ ┌──────────── ┐ ┌──────────────┐
-│  Input Layer │ │ Memory Lay  │ │ Auto Systems │
-├──────────────┤ ├──────────── ┤ ├──────────────┤
-│ virtual_xbox │ │reader_detect│ │ loot_engine  │
-│ dualsense_br │ │game_memory  │ │ auto_flask   │
-│ XUSB mapping │ │entity_read  │ │ hp_engine    │
-└──────────────┘ └──────────── ┘ └──────────────┘
+┌──────────────────────────────────────────────┐
+│              bot.py → bot/ пакет              │
+│  main_loop (главный цикл) · overlay_sync      │
+│  reload (F5) · state · hotkeys · hp           │
+└──────────────────────────────────────────────┘
+         │            │              │
+         ▼            ▼              ▼
+┌──────────────┐ ┌────────────┐ ┌──────────────┐
+│  Input Layer │ │  Detect    │ │ Auto Systems │
+├──────────────┤ ├────────────┤ ├──────────────┤
+│ virtual_xbox │ │reader_bridge││ loot_engine  │
+│ dualsense_br │ │reader_detect││ auto_flask   │
+│ XUSB mapping │ │mem_detect  │ │ hp_engine    │
+│              │ │mob_bar(CV) │ │ monster_db   │
+└──────────────┘ └────────────┘ └──────────────┘
+                      │
+              ┌───────┴────────┐
+              ▼                ▼
+       poe2-reader (C# DLL)   workers.py
+       PoE2ReaderLib.dll      AttackWorker (гибрид memory+CV fallback)
 ```
 
-### Слои архитектуры
+### Слои
 
-1. **Input Layer** — обработка ввода геймпада
-2. **Memory Layer** — чтение памяти игры (3 режима)
-3. **Telemetry** — SQLite база данных телеметрии
-4. **Auto Systems** — автоматический подбор лута, фляг, атаки
-5. **Config Layer** — YAML конфигурация и валидация
+1. **Input** — обработка ввода геймпада (виртуальный Xbox через vgamepad/ViGEmBus)
+2. **Detect** — детекция мобов/зон: RDR (C#), MEM (legacy), CV (fallback)
+3. **Auto Systems** — подбор, фляги, атака, телеметрия, навигация
+4. **Config** — YAML-конфигурация с типизированной валидацией
+5. **UI** — tkinter click-through оверлей
 
 ---
 
@@ -67,10 +102,11 @@ POE2AUTO — это полноценный бот для автоматизац�
 
 ### Системные требования
 
-- **OS:** Windows 10/11 (требуется для ViGEmBus)
+- **OS:** Windows 10/11 (ViGEmBus)
 - **Python:** 3.9+ (Anaconda preferred)
-- **Права:** Администратор (для ViGEmBus)
-- **Игра:** Path of Exile 2 запущена
+- **Права:** Администратор (ViGEmBus + OpenProcess)
+- **Игра:** Path of Exile 2 (Steam) запущена до входа в зону
+- **.NET 8 SDK** — только для сборки DLL читалки
 
 ### Установка зависимостей
 
@@ -87,11 +123,11 @@ pip install pynput
 # Configuration
 pip install pyyaml
 
-# C# bridge (optional, recommended)
+# C# bridge (для RDR режима)
 pip install pythonnet>=3.0
 ```
 
-### C# DLL сборка (для Reader режима)
+### C# DLL — сборка (RDR режим)
 
 ```bash
 cd poe2-reader
@@ -99,329 +135,235 @@ dotnet build lib/PoE2ReaderLib.csproj -c Release
 # → lib/bin/Release/net8.0/PoE2ReaderLib.dll
 ```
 
+**Или мастером со сканом актуальных оффсетов** (рекомендуется после каждого патча игры):
+
+```bash
+poe2_scope.bat
+# check → find → verify → apply: сканирует AOB-цепочку в живой игре
+# и пересобирает DLL со свежими оффсетами
+```
+
 ---
 
 ## Запуск
 
-### Стандартный запуск
+### Стандартный
 
 ```batch
 run_bot.bat
 ```
 
-Этот файл автоматически:
-1. Проверяет права администратора (`net session`)
-2. Elevates через `Start-Process RunAs`
-3. Запускает `python bot.py` с Anaconda Python path
+Лаунчер: проверка admin (`net session`) → elevate (RunAs) → `python bot.py` (Anaconda Python).
 
-### Ручной запуск
+### Ручной
 
 ```bash
 python bot.py
 ```
 
-**Важно:** Бот нужно запускать **ДО** входа в игру PoE2!
+**Важно:** бота можно запускать **ДО** входа в игру PoE2 — RDR-читалка подключится сама, когда персонаж окажется в зоне. CV-fallback на это время подхватит атаку.
 
 ---
 
 ## Горячие клавиши
 
+(из `config.yaml → hotkeys`)
+
 | Клавиша | Функция | Описание |
-|---------|---------|----------|
-| **F2** | Auto-Attack | Вкл/выкл автоатаку |
-| **F3** | Auto-Flask | Вкл/выкл автофляжки |
-| **F6** | Overlay | Показать/скрыть оверлей |
-| **F8** | Auto-Pickup | Вкл/выкл подбор лута |
-| **F9** | Auto-Map | Движение по карте |
-| **F12** | Exit | Полностью выйти из бота |
+|---|---|---|
+| **F1** | Навигация | Авто-движение (map run / waypoint) |
+| **F2** | Авто-атака | Вкл/выкл |
+| **F3** | Авто-фляска | Вкл/выкл |
+| **F4** | Радиус | Показать/скрыть круг атаки |
+| **F6** | Оверлей | Показать/скрыть |
+| **F7** | Диагностика | Дамп HP-данных |
+| **F8** | Авто-подбор | Вкл/выкл |
+| **F9** | Снимок | Скриншот-дамп |
+| **F10** | Map run | Прогон карт |
+| **F11** | Stash | Операции со сташем (Maps) |
+| **F12** | Выход | Полный выход из бота |
 
 ---
 
 ## Структура модулей
 
-### 🎮 Input Layer (Управление геймпадом)
+### 🎮 Input Layer
 
-**`virtual_xbox.py`** — Виртуальный Xbox 360 через vgamepad
-- Heartbeat-поток (20Hz) для поддержания активности XInput
-- Потокобезопасный через `threading.Lock()`
-- Поддержка ViGEmBus
+**`virtual_xbox.py`** — виртуальный Xbox 360 (vgamepad/ViGEmBus), heartbeat 20 Гц, потокобезопасность.
+**`dualsense_bridge.py`** — raw HID DualSense, маппинг Cross→A/Circle→B/Square→X/Triangle→Y, подавление триггеров при действиях бота.
 
-**`dualsense_bridge.py`** — Мост DualSense → Xbox
-- Raw HID парсинг репортов
-- Маппинг кнопок: Cross→A, Circle→B, Square→X, Triangle→Y
-- Подавление триггеров когда бот сам жмёт кнопки
+### 🧠 Detect Layer
 
-### 💾 Memory Layer (Чтение памяти)
+**Режим RDR (рекомендуется)**
+- `reader_bridge.py` — Python ↔ C# pythonnet мост: OpenProcess, AOB-скан GSO, чтение ECS
+- `reader_detect.py` — детекция мобов: parse+track за один проход, Life-vtable «живость», кэш классификации, снаряды
 
-**Режим A: Reader (Рекомендуется)**
-- `reader_bridge.py` — Python ↔ C# pythonnet мост
-- `reader_detect.py` — Детекция мобов через прямой доступ к памяти
-- `entity_reader.py` — ECS walking (StdMap → Life → Positioned)
+**Режим MEM (legacy)**
+- `mem_detect.py` — self-healing цепочка AOB → GameState → AreaInstance → Player
+- `offset_discovery.py` — AOB + value-scan + runtime validation оффсетов
 
-**Режим B: Memory (Прямое чтение)**
-- `game_memory.py` — OpenProcess + NtReadVirtualMemory
-- `offset_discovery.py` — AOB паттерны + value-scan
-- `game_offsets.py` — Памятные оффсеты игры
+**Режим CV (fallback)**
+- `mob_bar.py` — детект HP-полосы (strict/narrow/low_hp_lock/bootstrap)
+- `zone_detector.py` — hideout-детект по кадру
 
-**Режим C: CV (Fallback)**
-- `mob_bar.py` — CV обнаружение HP бара (strict/narrow/low_hp_lock)
-- `color_detector.py` — HSV цветовые маски для лута
+### ⚙️ Workers
+
+**`workers.py`** — фоновые потоки:
+- `LootWorker` — CV-подбор лута
+- `AttackWorker` — **гибрид**: память готова → `update()/present()`; не готова → CV fallback c проверкой зоны
 
 ### 📊 Auto Systems
 
-**`loot_engine.py`** — Логика подбора лута
-- Radius-based detection
-- Priority mode: size/distance
-- Cooldown management
+- `loot_engine.py` — логика подбора (радиус, приоритеты, кулдауны)
+- `auto_flask.py` — правила фляг: HP%, мана, враги рядом, кулдауны
+- `hp_engine.py` + `bot/hp.py` — OCR цифр HUD + fallback по орбу, дебаунс, слепота орба
+- `monster_db.py` — SQLite телеметрия: batch-insert, фоновый writer, индексы
 
-**`auto_flask.py`** — Система автофляжек
-- FlaskRule с cooldown management
-- Правила: HP%, Mana%, Enemies nearby
-- Configurable thresholds
+### 🔧 Остальное
 
-**`hp_engine.py`** — Движок HP решения
-- Grace fallback для орба слепоты
-- Debounce и debounce grace periods
-- Decision logic: num vs orb detection
-
-### 🔧 Configuration
-
-**`config.py`** — YAML загрузка и валидация
-- Deep merge конфигураций
-- Schema validation
-- Default values system
-
-**`config.yaml`** — Полная конфигурация (278 строк)
-- Loot rules и thresholds
-- Auto-attack настройки
-- Flask rules и cooldowns
-- Navigation parameters
-
-### 📈 Telemetry
-
-**`monster_db.py`** — SQLite телеметрия мобов
-- Batch inserts через executemany()
-- Фоновый daemon writer thread
-- Оптимизированные индексы
-
-### 🛠️ Utilities
-
-**`utils.py`** — Toggle класс и builder функции
-**`screen.py`** — DXCam захват с MSS fallback
-**`window.py`** — Win32 окно + фокус проверка
-**`overlay.py`** — tkinter click-through оверлей
-**`diag_dump.py`** — HP evidence dumper
+- `config.py` / `config.yaml` — конфигурация и валидация
+- `overlay.py` / `bot/overlay_sync.py` — оверлей и синк состояния
+- `screen_capture.py` — dxcam + mss fallback
+- `poe2-reader/` — C# исходники PoE2ReaderLib
+- `poe2-scope-ui/` + `poe2_scope/` — мастер скана оффсетов и пересборки DLL
 
 ---
 
 ## Конфигурация
 
-### Ключевые параметры config.yaml
+Ключевые секции `config.yaml`:
 
 ```yaml
-# Loot settings
 loot:
-  pickup_button: "a"           # Кнопка подбора
-  pickup_hold_ms: 80           # Длительность нажатия (мс)
-  cooldown_ms: 300            # Кулдаун подбора
-  radius_frac: 0.15           # Доля от размера кадра
-  priority_mode: "size"       # size/distance
+  pickup_button: "a"
+  pickup_hold_ms: 60
+  cooldown_ms: 100
+  pickup_radius_px: 400
+  priority_mode: "distance"      # size | distance
 
-# HP Flask settings
 hp:
   enabled: true
-  threshold: 0.88             # Порог срабатывания
-  cooldown_ms: 333            # Кулдаун фляги
-  flask_hold_ms: 120          # Длительность нажатия
-  confirm_frames: 2           # Подтверждение frames
+  threshold: 0.88
+  cooldown_ms: 333
+  flask_hold_ms: 120
+  confirm_frames: 2
+  fallback_red_frac_min: 0.04    # порог «слепого» орба
 
-# Auto Attack settings
 auto_attack:
   enabled: true
-  target_status: "combat"     # COMBAT/dead/spirit
-  min_hp_percent: 0.1         # Минимальный HP для атаки
+  use_memory: "reader"           # reader | memory | false/cv
+  attack_range: 15.0
+  button: "right_bumper"
+  min_hp_percent: 0.1
+
+hotkeys:
+  toggle: f8    # подбор
+  attack: f2
+  flask: f3
+  overlay: f6
+  quit: f12
 ```
 
-### Schema Validation
-
-config.py обеспечивает:
-- Типизированную валидацию параметров
-- Graceful fallback при отсутствующих значениях
-- Deep merge при нескольких конфигурациях
+Типизированная валидация (`config.py`): schema-проверка типов, deep merge, graceful fallback на defaults.
 
 ---
 
 ## Известные проблемы и решения
 
-### 🐛 Критические баги (исправлены)
+### 🐛 Исправлено (кратко)
 
-**1. IndentationError bot.py:193**
-- **Симптом:** Бот не запускался вообще
-- **Решение:** Убран лишний отступ перед `DualSenseBridge(vx)`
-- **Статус:** ✅ Исправлено
+| Проблема | Решение |
+|---|---|
+| RDR не работал, если бот запущен до PoE2 — вечный откат на CV | **Авто-реконнект**: читалка ждёт процесс (2 с), CV временный fallback, причина в оверлее (07.09.2026) |
+| F5 (reload) в reader-режиме пересоздавал MemoryMobDetector | reload.py выбирает класс по `detect_mode`, `zone_det` создаётся всегда (07.09.2026) |
+| IndentationError bot.py:193 | Убран лишний отступ |
+| reload_cfg() nonlocal scope | hp_engine добавлен в nonlocal |
+| Flask right inversion (L2/R2) | Исправлен маппинг кнопок |
+| Фляга поздно / ложные срабатывания | Fallback red-лужа, guard `last_good_ratio`, дебаунс |
+| SQLite 1.1M строк тормозил | Составной индекс `idx_session_status_ts` (5000x) |
+| Kill cooldown кэш блокировал цикл | TTL 0.1 → 2.0 c |
+| «Стоп» в poe2-scope-ui не снимал состояние | taskkill /T /F + watchdog (05.09.2026) |
 
-**2. reload_cfg() nonlocal scope**
-- **Симптом:** F5 перезагрузка не обновляла hp_engine параметры
-- **Решение:** Добавлен `hp_engine` в nonlocal declaration
-- **Статус:** ✅ Исправлено
-
-**3. Flask right inversion (L2/R2)**
-- **Симптом:** Левая/правая фляги поменяны местами
-- **Решение:** Исправлена проверка `flask_button` mapping
-- **Статус:** ✅ Исправлено
-
-### 🩪 HP Flask Issues (Journal)
-
-**Проблема:** Фляга жмётся поздно, HP проседает до 70-78%
-- **Причина:** Орб "слепнет" от эффектов → ratio=None
-- **Решение:** Fallback red luge + cooldown_ms снижение
-- **Статус:** ✅ Исправлено
-
-**Проблема:** Fallback не срабатывал
-- **Причина:** low_streak оставался 0 при pass()
-- **Решение:** Счётчик от итогового low_now решения
-- **Статус:** ✅ Исправлено
-
-**Проблема:** Ложные фляги на полном HP
-- **Причина:** Effects на orb дают false negative
-- **Решение:** Guard by last_good_ratio threshold
-- **Статус:** ✅ Исправлено
-
-### ⚡ Performance Issues
-
-**SQLite 1.1M строк тормозил**
-- **Проблема:** Полное сканирование сессии на каждый get_recently_killed_addrs
-- **Решение:** Составной индекс idx_session_status_ts (5000x ускорение!)
-- **Статус:** ✅ Исправлено
-
-**_kill_cooldown_cache_ttl = 0.1 сек**
-- **Проблема:** Обновление кэша блокировало цикл
-- **Решение:** Поднят до 2.0 сек
-- **Статус:** ✅ Исправлено
+Полный журнал — в `ОБНОВЛЕНИЯ.md` и `ПРОБЛЕМЫ_И_РЕШЕНИЯ.md`.
 
 ---
 
 ## План улучшений
 
-### 📍 hp_locate.py — Авто-локализация HUD
-1. **always_fallback:** Поиск по `re.finditer(r"\d+/\d+")` во всём кадре
-2. **Barrier check:** Если prefer_y известен, но строка не N/N — искать вторую
-3. **Self-check:** Повторная бинаризация свежим кадром
-
-### 🔤 hp_ocr.py — Разрез слипшихся цифр
-1. **Morphing guard:** Проверка соседних glyph'ов
-2. **Context validation:** N/N формат валидация
-3. **Template refinement:** Adaptive template matching
-
-### 📊 mob_bar.py — HP Bar Detection
-1. **Bootstrap mode:** Auto-calibrate on first boot
-2. **Confidence scoring:** Weighted score by color + position
-3. **Cache warming:** Предварительная загрузка template'ов
-
-### 🎯 loot_engine.py — Pickup Logic
-1. **Dynamic radius:** Adaptive radius по плотности лута
-2. **Predictive pickup:** Pre-fetch based on movement trajectory
-3. **Priority weighting:** Combo size × distance × rarity score
-
-### 🧪 hp_diag.py — Diagnostics
-1. **Auto-screenshot:** Periodic evidence capture
-2. **Heatmap generation:** Visual HP detection accuracy
-3. **Export to CSV:** For external analysis
+1. **Pathfinding (A*)** — проходимость terrain для движения к целям
+2. **Entity persistence** — кэш NPC/сундуков между сессиями
+3. **MinimapIcon** — определение waypoints/encounters по иконкам миникарты
+4. **CV: bootstrap-калибровка** — авто-подбор порогов при первом запуске
+5. **Predictive pickup** — пред-подбор по траектории движения
 
 ---
 
 ## История изменений
 
-### Сессия 27.07.2026
+- **07.09.2026** — авто-реконнект RDR (CV fallback вместо вечного отката), причина fallback в оверлее, фикс reload для reader, корневой README
+- **05.09.2026** — poe2-scope-ui: фикс «Стоп», сегментная шкала прогресса; разбивка `bot.py` → пакет `bot/`
+- **27.07.2026** — 165 тестов, 7 коммитов, разборка монолита, HP-фиксы, SQLite-индексы
 
-**Всего:** 7 коммитов, 165 тестов (все проходят), 5 новых модулей, 24 пофикшенных бага
-
-#### Критические исправления (3)
-- IndentationError bot.py:193
-- reload_cfg() nonlocal scope
-- Flask right inversion (L2/R2)
-
-#### HP Engine улучшения (5)
-- Fallback не срабатывал
-- Ложные фляги на полном HP
-- Спам фляги в меню
-- Задержка на критической просадке
-- SQLite индекс optimization
-
-#### Performance fixes (4)
-- Kill cooldown cache TTL (0.1→2.0 сек)
-- SQLite 5000x ускорение
-- Mob detection frame optimization
-- Loot engine radius calculation
-
-#### Новый функционал (5)
-- Auto-map navigation (F9)
-- Entity overlay visualization
-- Hideout detection optimization
-- Multi-target attack strategy
-- Dynamic radius adaptation
+Детально — в `ОБНОВЛЕНИЯ.md`.
 
 ---
 
-## 📁 Структура файлов проекта
+## Структура файлов
 
 ```
 POE2AUTO/
-├── bot.py                 # Главный оркестратор (1186 строк)
-├── run_bot.bat            # Лаунчер с авто-элевацией
-├── config.yaml            # Полная конфигурация (278 строк)
-├── config.py              # YAML loading + validation
-├── requirements.txt       # Список зависимостей
+├── bot.py                   # Точка входа
+├── run_bot.bat              # Лаунчер с авто-элевацией
+├── config.yaml              # Основная конфигурация
+├── README.md                # Этот файл (корневой, на GitHub)
 │
-├── poe2-reader/          # C# DLL source
-│   ├── Program.cs        # MemoryReader, PatternScanner
-│   ├── build_reader.bat  # Build script
-│   └── lib/              # Compiled DLLs
+├── bot/                     # Пакет оркестратора
+│   ├── main_loop.py         #   главный цикл
+│   ├── overlay_sync.py      #   синк оверлея (живая причина fallback)
+│   ├── reload.py            #   hot-reload F5
+│   ├── state.py             #   BotState
+│   ├── hotkeys.py / hp.py   #   клавиши / HP-движок
+│   └── __main__.py
 │
-├── archive/              # Архивные debug модули
-│   ├── _debug_*.py       # Отладочные скрипты
-│   └── _diag_*.py        # Диагностические утилиты
+├── workers.py               # LootWorker + AttackWorker (гибрид)
+├── reader_bridge.py         # Python ↔ C# мост
+├── reader_detect.py         # RDR детектор
+├── mem_detect.py            # MEM legacy детектор
+├── mob_bar.py               # CV fallback
+├── zone_detector.py         # Hideout-детект (CV)
+├── dualsense_bridge.py      # Raw HID DualSense
+├── virtual_xbox.py          # Виртуальный Xbox 360
 │
-├── tests/                # Пакет тестов (165 тестов)
-│   ├── test_*.py         # Модульные тесты
-│   └── conftest.py       # Pytest fixtures
+├── poe2-reader/             # C# PoE2ReaderLib (Program.cs, csproj)
+├── poe2-scope-ui/           # Electron-мастер скана/пересборки DLL
+├── poe2_scope/              # Python-движок скана оффсетов
 │
-├── diagnostics/          # Текущая диагностика
-│   ├── diag_*.py         # Live diagnostics
-│   └── test_*.py         # Test suites
-│
-├── _debug/               # Текущая отладка
-│   ├── analyze_*.py      # Analysis tools
-│   └── test_*.py         # Debug scripts
-│
-└── Documentation
-    ├── README.md          # Этот файл
-    ├── ANALYSIS.md        # Полный анализ проекта
-    ├── ОБНОВЛЕНИЯ.md      # Update log (786+ строк)
-    ├── ПРОБЛЕМЫ_И_РЕШЕНИЯ.md # Bug fix journal
-    └── УЛУЧШЕНИЯ.md       # Improvement plans
+├── tests/                   # Юнит- + integration-тесты (170+)
+├── docs/                    # Полная документация (README, ОБНОВЛЕНИЯ,
+│                            #  ПРОБЛЕМЫ_И_РЕШЕНИЯ, УЛУЧШЕНИЯ, ANALYSIS)
+└── assets/                  # Ресурсы оверлея
 ```
 
 ---
 
-## 🔐 Безопасность
+## Безопасность
 
-- **Read-only memory access:** Только PROCESS_VM_READ, ноль записи
-- **No external network:** Бот не выходит в интернет
-- **Admin rights required:** Только для ViGEmBus и OpenProcess
-- **Config validation:** Schema checking предотвращает malicious config
+- **Read-only память:** только `PROCESS_VM_READ`, ноль записи в процесс игры
+- **Нет сети:** бот не делает внешних сетевых вызовов
+- **Admin:** нужен только для ViGEmBus и OpenProcess
+- **Валидация конфига:** schema-проверка предотвращает битые настройки
 
 ---
 
 ## 📞 Поддержка
 
-Для вопросов, баг-репортов или предложений:
-- Проверить **ОБНОВЛЕНИЯ.md** для известной проблемы
-- Посмотреть **ПРОБЛЕМЫ_И_РЕШЕНИЯ.md** для журналов багов
-- Прочитать **УЛУЧШЕНИЯ.md** для плана развития
+- `docs/ОБНОВЛЕНИЯ.md` — журнал изменений
+- `docs/ПРОБЛЕМЫ_И_РЕШЕНИЯ.md` — баг-журнал
+- `docs/УЛУЧШЕНИЯ.md` — планы
+- `docs/ANALYSIS.md`, `docs/DEPENDENCY_ANALYSIS.md` — анализ архитектуры/зависимостей
 
-**Статус разработки:** Активный | **Тесты:** 165 passing | **Модулей:** 40+ | **Файлов:** 200+
+**Статус:** Активный | **Тесты:** pytest `tests/` (170+) | **Режимы:** RDR ⭐ / MEM / CV
 
 ---
 
-*Документ создан: 2026-07-27 | Версия документации: 1.0*
+*Документ обновлён: 2026-09-07 | Ранее: 2026-07-27 (v1.0)*
