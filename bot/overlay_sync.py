@@ -104,10 +104,24 @@ def sync_overlay(s: BotState) -> None:
                   and s.mob_det.available)
         ov.memory_status = "ok" if mem_ok else "fallback"
         if mem_ok:
-            # Авто-реконнект удался — убираем RDR-fallback из оверлея.
-            if getattr(s, "_atk_fallback_reason", "").startswith("RDR"):
-                s._atk_fallback_reason = ""
+            # Авто-реконнект удался — убираем fallback-причину из оверлея.
+            s._atk_fallback_reason = ""
             ov.atk_fallback = ""
+        else:
+            # Живая причина fallback (ставится и в рантайме: патч сдвинул оффсеты,
+            # PoE2 закрыт/перезапущен, нет admin). Строка в оверлее видна постоянно,
+            # пока читалка не переподключится.
+            _reason = getattr(s, "_atk_fallback_reason", "") or ""
+            if not _reason:
+                _det = s.mob_det
+                if isinstance(_det, ReaderMobDetector):
+                    _err = getattr(getattr(_det, "bridge", None), "_last_err", "") or "bridge не готов"
+                    _reason = f"RDR: {_err} — CV fallback"
+                elif isinstance(_det, MemoryMobDetector):
+                    _reason = "MEM не готов — CV fallback"
+                if _reason:
+                    s._atk_fallback_reason = _reason
+            ov.atk_fallback = _reason
         if s.mob_det is not None and isinstance(s.mob_det, (MemoryMobDetector, ReaderMobDetector)):
             ov.mem_connected = bool(getattr(s.mob_det, "_connected", False))
             ov.mem_reading = bool(s.mob_det.available)
@@ -137,6 +151,7 @@ def sync_overlay(s: BotState) -> None:
         ov.memory_status = "off"
         ov.mem_connected = False
         ov.mem_reading = False
+        ov.atk_fallback = ""
         ov.ent_total = 0
         ov.ent_hostile = 0
         ov.ent_in_range = 0

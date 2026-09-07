@@ -451,7 +451,11 @@ class Overlay:
             self._rows["stats_ent"].config(text="", fg=C_DIM)
 
         import time as _time
-        if s.notification and _time.time() < s.notification_until:
+        # Причина fallback (RDR/MEM → CV) держится на строке уведомлений постоянно,
+        # пока читалка не переподключится. Обычные уведомления перекрывают её на своё время.
+        if s.atk_fallback:
+            self._rows["notif"].config(text=s.atk_fallback, fg=C_WARN)
+        elif s.notification and _time.time() < s.notification_until:
             self._rows["notif"].config(text=s.notification, fg=C_WARN)
         else:
             self._rows["notif"].config(text="")
