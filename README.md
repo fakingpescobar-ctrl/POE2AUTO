@@ -82,11 +82,24 @@ RDR: GSO не резолвится в игру (персонаж не в зон�
 
 - После подключения строка исчезает, режим возвращается на `Reader 📡 (mem✓)`.
 
-**После патча PoE2** при появлении «GSO AOB pattern не найден» — пересобрать DLL:
+**После патча PoE2** при появлении «GSO AOB pattern не найден» — **оффсеты сдвинулись**, нужно пересобрать DLL.
 
-```bash
-poe2_scope.bat    # мастер: check → find → verify → apply (сканирует AOB в живой игре и пересобирает DLL)
-```
+> ### 🔧 Инструмент poe2-scope (скачать и запустить!)
+>
+> **poe2-scope** — отдельный инструмент: мастер AOB-скана оффсетов и пересборки `PoE2ReaderLib.dll`.
+> Он **не входит** в этот репозиторий — его надо **скачать**:
+>
+> ```bash
+> git clone https://github.com/fakingpescobar-ctrl/poe2-scope.git
+> cd poe2-scope
+> poe2_scope.bat        # Electron-GUI мастер (первый запуск сам поставит зависимости)
+> # или ядро из консоли:
+> python poe2_scope/scope_main.py --auto --yes --tests
+> ```
+>
+> Конвейер `check → find → verify → apply` сам найдёт актуальные оффсеты в живой игре
+> и пересоберёт DLL. Запускай **при каждой смене оффсетов / после каждого патча PoE2**,
+> пока в оверлее бота не исчезнет жёлтая строка «GSO AOB pattern не найден».
 
 ---
 
@@ -194,7 +207,7 @@ OCR цифр HUD (`hp_ocr.py`/`hp_locate.py`) → если орб «слепне
                 │reader_bridge│◀───▶│poe2-reader (C# DLL)  │
                 │reader_detect│     │ PoE2ReaderLib        │
                 │mem_detect   │     │ (built via dotnet /  │
-                │zone_detector│     │  poe2_scope.bat)     │
+                │zone_detector│     │  poe2-scope repo)   │
                 └─────────────┘     └──────────────────────┘
 ```
 
@@ -248,11 +261,7 @@ dotnet build lib/PoE2ReaderLib.csproj -c Release
 # → lib/bin/Release/net8.0/PoE2ReaderLib.dll
 ```
 
-**Или мастером со сканом актуальных оффсетов** (рекомендуется после каждого патча игры):
-```bash
-poe2_scope.bat
-# check → find → verify → apply: сканирует AOB-цепочку в живой игре и пересобирает DLL
-```
+**Или отдельным инструментом [poe2-scope](https://github.com/fakingpescobar-ctrl/poe2-scope)** (рекомендуется после каждого патча игры) — мастер AOB-скана и пересборки DLL: `poe2_scope.bat` (Electron GUI) → конвейер `check → find → verify → apply`.
 
 ---
 
@@ -334,7 +343,7 @@ python bot.py
 - **`bot/main_loop.py`**, **`bot/overlay_sync.py`** (живая причина fallback), **`bot/reload.py`** (F5), **`bot/state.py`**, **`bot/hotkeys.py`**, **`bot/hp.py`**.
 - **`screen_capture.py`** / **`screen.py`** — dxcam + mss fallback; **`window.py`** — Win32 окно/фокус.
 - **`calibrate_hp.py` / `calibrate_hp_digits.py` / `calibrate.py`** — калибровка HP-OCR.
-- **`poe2-reader/`** — C# исходники PoE2ReaderLib; **`poe2-scope-ui/` + `poe2_scope/`** — мастер скана оффсетов и пересборки DLL.
+- **`poe2-reader/`** — C# исходники PoE2ReaderLib; AOB-скан и пересборка DLL — отдельный инструмент **[poe2-scope](https://github.com/fakingpescobar-ctrl/poe2-scope)**.
 
 ---
 
@@ -526,8 +535,7 @@ POE2AUTO/
 ├── utils.py / diag_dump.py
 │
 ├── poe2-reader/              # C# PoE2ReaderLib (Program.cs, lib/PoE2ReaderLib.csproj)
-├── poe2-scope-ui/            # Electron-мастер скана/пересборки DLL
-├── poe2_scope/               # Python-движок скана оффсетов (chain AOB)
+│                             # (AOB-скан/пересборка DLL → отдельный репо: fakingpescobar-ctrl/poe2-scope)
 │
 ├── tests/                    # Юнит- и integration-тесты (22 файла, 400+ функций)
 ├── docs/                     # Полная документация (README, ОБНОВЛЕНИЯ,

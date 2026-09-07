@@ -33,9 +33,8 @@ poe2-reader/**/bin/
 poe2-reader/**/obj/
 poe2-reader/**/*.user
 
-# poe2-scope-ui (Electron мастер скана/пересборки DLL) — зависимости не коммитим,
-# только исходники (main.js/renderer.js/package.json/etc).
-poe2-scope-ui/node_modules/
+# JS (electron etc)
+node_modules/
 
 # Research / scratch скрипты (диагностика памяти — не часть рантайма бота)
 _debug_*.py

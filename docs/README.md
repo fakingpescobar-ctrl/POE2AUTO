@@ -55,11 +55,22 @@ POE2AUTO — полноценный бот для автоматизации Pat
 - Причина fallback показывается в оверлее **постоянно** (жёлтая строка уведомлений): `RDR: PoE2 не запущен…`, `RDR: OpenProcess failed (нет admin?)…`, `RDR: GSO AOB pattern не найден (патч сдвинул оффсеты? нужна пересборка DLL)…`.
 - После подключения строка исчезает, режим возвращается на `Reader 📡 (mem✓)`.
 
-**После патча PoE2** при появлении «GSO AOB pattern не найден» — пересобрать DLL:
+**После патча PoE2** при появлении «GSO AOB pattern не найден» — **оффсеты сдвинулись**, нужно пересобрать DLL.
 
-```
-poe2_scope.bat    # мастер скана оффсетов и пересборки DLL (poe2-scope-ui + poe2_scope)
-```
+> ### 🔧 Инструмент poe2-scope (скачать и запустить!)
+>
+> **poe2-scope** — отдельный инструмент (не входит в этот репо): мастер AOB-скана оффсетов и пересборки `PoE2ReaderLib.dll`.
+>
+> ```bash
+> git clone https://github.com/fakingpescobar-ctrl/poe2-scope.git
+> cd poe2-scope
+> poe2_scope.bat        # Electron-GUI мастер (первый запуск сам поставит зависимости)
+> # или ядро из консоли:
+> python poe2_scope/scope_main.py --auto --yes --tests
+> ```
+>
+> Конвейер `check → find → verify → apply`. Запускай **при каждой смене оффсетов / после каждого патча PoE2**,
+> пока не исчезнет жёлтая строка «GSO AOB pattern не найден».
 
 ---
 
@@ -135,13 +146,7 @@ dotnet build lib/PoE2ReaderLib.csproj -c Release
 # → lib/bin/Release/net8.0/PoE2ReaderLib.dll
 ```
 
-**Или мастером со сканом актуальных оффсетов** (рекомендуется после каждого патча игры):
-
-```bash
-poe2_scope.bat
-# check → find → verify → apply: сканирует AOB-цепочку в живой игре
-# и пересобирает DLL со свежими оффсетами
-```
+**Или отдельным инструментом [poe2-scope](https://github.com/fakingpescobar-ctrl/poe2-scope)** (рекомендуется после каждого патча игры) — мастер AOB-скана и пересборки DLL: `poe2_scope.bat` (Electron GUI) → конвейер `check → find → verify → apply`.
 
 ---
 
@@ -225,7 +230,7 @@ python bot.py
 - `overlay.py` / `bot/overlay_sync.py` — оверлей и синк состояния
 - `screen_capture.py` — dxcam + mss fallback
 - `poe2-reader/` — C# исходники PoE2ReaderLib
-- `poe2-scope-ui/` + `poe2_scope/` — мастер скана оффсетов и пересборки DLL
+- AOB-скан/пересборка DLL — отдельный инструмент [poe2-scope](https://github.com/fakingpescobar-ctrl/poe2-scope)
 
 ---
 
@@ -335,8 +340,7 @@ POE2AUTO/
 ├── virtual_xbox.py          # Виртуальный Xbox 360
 │
 ├── poe2-reader/             # C# PoE2ReaderLib (Program.cs, csproj)
-├── poe2-scope-ui/           # Electron-мастер скана/пересборки DLL
-├── poe2_scope/              # Python-движок скана оффсетов
+│                            # (AOB-скан/пересборка DLL → отдельный репо: fakingpescobar-ctrl/poe2-scope)
 │
 ├── tests/                   # Юнит- + integration-тесты (170+)
 ├── docs/                    # Полная документация (README, ОБНОВЛЕНИЯ,
