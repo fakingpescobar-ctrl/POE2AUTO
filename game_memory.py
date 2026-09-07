@@ -23,7 +23,9 @@ MEM_IMAGE = 0x1000000
 MEM_MAPPED = 0x40000
 MEM_PRIVATE = 0x20000
 PAGE_EXECUTE_FLAGS = 0xF0  # any execute bit
-ERROR_NO_PARTIAL_ACCESS = 0x63E
+# NTSTATUS: чтение пересекло границу страниц с разными правами —
+# вернулись частичные данные (n_read > 0), а не ошибка.
+STATUS_PARTIAL_COPY = 0x8000000D
 
 # Process names to search
 PROC_NAMES = [
@@ -180,6 +182,16 @@ class GameMemory:
             self._handle, ctypes.c_void_p(address),
             buf, size, ctypes.byref(n_read),
         )
+        # STATUS_PARTIAL_COPY (0x8000000D): NTSTATUS, возвращается напрямую
+        # NtReadVirtualMemory (не Win32 GetLastError!) когда буфер пересекает
+        # страницу с другими правами доступа — возвращаем частично прочитанные
+        # байты, а не теряем их целиком. ВАЖНО: это НЕ Win32 ERROR_PARTIAL_COPY
+        # (170) — тот относится к kernel32.ReadProcessMemory, который здесь не
+        # используется (путь — чистый ntdll API, restype=NTSTATUS).
+        if status == STATUS_PARTIAL_COPY:
+            if n_read.value > 0:
+                return bytes(buf[:n_read.value])
+            return None
         if status != 0:
             return None
         return bytes(buf[:n_read.value])
@@ -291,7 +303,13 @@ class GameMemory:
 
     def aob_scan(self, pattern: bytes, wildcards: Optional[set] = None,
                  start: int = None, size: int = None) -> list:
-        """Scan for byte pattern in game memory. Returns list of addresses."""
+        """Scan for byte pattern in game memory. Returns list of addresses.
+
+        Fast path: сканирование через C-реализацию bytes.find — ищется фиксированный
+        префикс паттерна (до первого wildcard), затем проверяется остаток паттерна
+        только на найденных позициях (раньше: двойной Python-цикл по каждому байту
+        модуля — ~8-9 сек на 100МБ, превращало find в «зависание» без вывода).
+        """
         if start is None:
             start = self._base
         if size is None:
@@ -304,6 +322,16 @@ class GameMemory:
         end = start + size
         overlap = len(pattern) - 1
 
+        # фиксированный префикс (до первого wildcard) — минимум 1 байт
+        head_len = 0
+        for j, byte in enumerate(pattern):
+            if j in wildcards:
+                break
+            head_len += 1
+        if head_len == 0:
+            head_len = 1  # паттерн начинается с wildcard — берём один байт
+        head = pattern[:head_len]
+
         for chunk_start in range(start, end, step):
             scan_start = max(start, chunk_start - overlap)
             chunk_end = min(chunk_start + step, end)
@@ -311,17 +339,20 @@ class GameMemory:
             if chunk is None:
                 continue
 
-            # Find pattern in chunk
-            for i in range(len(chunk) - len(pattern) + 1):
-                match = True
-                for j, byte in enumerate(pattern):
-                    if j in wildcards:
-                        continue
-                    if chunk[i + j] != byte:
-                        match = False
-                        break
-                if match:
-                    results.append(scan_start + i)
+            pos = chunk.find(head)
+            while pos != -1:
+                # позиция должна давать полный паттерн в чанке
+                if pos + len(pattern) <= len(chunk):
+                    match = True
+                    for j in range(head_len, len(pattern)):
+                        if j in wildcards:
+                            continue
+                        if chunk[pos + j] != pattern[j]:
+                            match = False
+                            break
+                    if match:
+                        results.append(scan_start + pos)
+                pos = chunk.find(head, pos + 1)
 
         return results
 
@@ -364,40 +395,31 @@ class GameMemory:
 
     def _find_pid(self) -> Optional[int]:
         """Find PoE2 process ID."""
-        try:
-            import subprocess
-            output = subprocess.check_output(
-                ["tasklist", "/FI", "IMAGENAME eq PathOfExile.exe", "/FO", "CSV", "/NH"],
-                text=True, stderr=subprocess.DEVNULL,
-            )
-            for line in output.strip().split("\n"):
-                if not line.strip():
-                    continue
-                parts = line.strip('"').split('","')
-                if len(parts) >= 2:
-                    name = parts[0].strip('"')
-                    pid = int(parts[1].strip('"'))
-                    return pid
-        except Exception:
-            pass
-
-        # Try other names
-        for name in ["PathOfExileSteam.exe", "PathOfExile_x64.exe"]:
+        import re
+        # tasklist в русской локали пишет в cp866 — text=True ломается (0xFF в поле памяти).
+        # Берём байты и декодируем с запасом; ASCII-часть (имя+pid) корректна при любой кодировке.
+        csv_re = re.compile(r'"([^"]+)","(\d+)"')
+        for name in (["PathOfExile.exe"] + ["PathOfExileSteam.exe", "PathOfExile_x64.exe"]):
             try:
                 import subprocess
-                output = subprocess.check_output(
+                raw = subprocess.check_output(
                     ["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
-                    text=True, stderr=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
-                for line in output.strip().split("\n"):
-                    if not line.strip():
-                        continue
-                    parts = line.strip('"').split('","')
-                    if len(parts) >= 2:
-                        return int(parts[1].strip('"'))
             except Exception:
                 continue
-
+            for enc in ("utf-8", "cp866", "latin-1"):
+                try:
+                    out = raw.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                out = raw.decode("latin-1", errors="replace")
+            for line in out.split("\n"):
+                m = csv_re.search(line)
+                if m:
+                    return int(m.group(2))
         return None
 
     def _resolve_module(self) -> bool:

@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:;" />
+<title>poe2_scope — offset suite</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="grain"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">◆</span>
+      <div class="brand-text">
+        <h1>poe2_scope</h1>
+        <p>offset discovery suite · патч-контроль</p>
+      </div>
+    </div>
+    <div class="top-status">
+      <div class="chip" id="chip-python" title="Интерпретатор python, которым запускаются команды">
+        <span class="chip-dot"></span><span id="chip-python-text">python: …</span>
+      </div>
+      <div class="chip" id="chip-game" title="Идентификация игрового процесса из последнего --check">
+        <span class="chip-dot dim"></span><span id="chip-game-text">игра: не проверялась</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- Левая панель: шаги -->
+    <aside class="steps">
+      <p class="steps-caption">ПОРЯДОК ДЕЙСТВИЙ — сверху вниз</p>
+
+      <button class="step" data-step="check" id="step-check">
+        <span class="step-idx">1</span>
+        <span class="step-body">
+          <span class="step-name">Проверить цепочку</span>
+          <span class="step-hint">жив ли бот после патча</span>
+        </span>
+        <span class="step-state" id="st-check">○</span>
+      </button>
+
+      <button class="step" data-step="find" id="step-find">
+        <span class="step-idx">2</span>
+        <span class="step-body">
+          <span class="step-name">Найти оффсеты</span>
+          <span class="step-hint">если check показал поломку</span>
+        </span>
+        <span class="step-state" id="st-find">○</span>
+      </button>
+
+      <button class="step" data-step="verify" id="step-verify">
+        <span class="step-idx">3</span>
+        <span class="step-body">
+          <span class="step-name">Проверить легаси</span>
+          <span class="step-hint">жив ли ctypes-путь</span>
+        </span>
+        <span class="step-state" id="st-verify">○</span>
+      </button>
+
+      <button class="step" data-step="apply" id="step-apply">
+        <span class="step-idx">4</span>
+        <span class="step-body">
+          <span class="step-name">Применить</span>
+          <span class="step-hint">записать оффсеты + сборка DLL</span>
+        </span>
+        <span class="step-state" id="st-apply">○</span>
+      </button>
+
+      <button class="step" data-step="tests" id="step-tests" title="Прогон юнит-тестов модулей бота (pytest, без интеграционных)">
+        <span class="step-idx">🩺</span>
+        <span class="step-body">
+          <span class="step-name">Тесты модулей</span>
+          <span class="step-hint">pytest — здоровье до/после чинки</span>
+        </span>
+        <span class="step-state">»</span>
+      </button>
+
+      <button class="step step-report" data-step="report" id="step-report">
+        <span class="step-idx">⧉</span>
+        <span class="step-body">
+          <span class="step-name">Отчёт</span>
+          <span class="step-hint">report.md / report.json</span>
+        </span>
+        <span class="step-state">»</span>
+      </button>
+
+      <button class="step step-auto" data-step="auto" id="step-auto" title="Одна кнопка: диагностика → если найдена поломка → поиск оффсетов → легаси-проверка → автопатч и сборка DLL (без вопросов)">
+        <span class="step-idx">⚡</span>
+        <span class="step-body">
+          <span class="step-name">АВТО‑ЧИНКА</span>
+          <span class="step-hint">check → find → verify → apply без вопросов</span>
+        </span>
+        <span class="step-state">»</span>
+      </button>
+
+      <div class="steps-footer">
+        <p id="advice-text">Начни с шага 1 — проверь, жив ли бот.</p>
+      </div>
+    </aside>
+
+    <!-- Основная область -->
+    <main class="main">
+      <!-- Карточка текущего действия -->
+      <section class="action-card" id="action-card">
+        <div class="action-head">
+          <h2 id="action-title">Шаг 1 · Проверить цепочку</h2>
+          <span class="badge" id="action-badge">ОЖИДАЕТ ДЕЙСТВИЯ</span>
+        </div>
+        <p class="action-desc" id="action-desc">
+          Резолвит GSO → GameState → InGameState → Area → Player и прогоняет валидаторы V1-V6.
+          Если score/verdict зелёные — патча нет, останавливайся.
+        </p>
+        <div class="action-controls">
+          <button class="btn btn-primary" id="btn-run">
+            <span class="btn-icon">▶</span><span id="btn-run-text">Запустить проверку</span>
+          </button>
+          <div class="force-row" id="force-row" hidden>
+            <label class="force-tog">
+              <input type="checkbox" id="tog-force" />
+              <span>--force (искать даже если цепочка жива)</span>
+            </label>
+            <button class="help-icon" id="help-force" title="Что делает --force?" aria-label="Подсказка про --force">?</button>
+          </div>
+          <button class="btn btn-auto" id="btn-auto" title="Авто-чинка по тестам: юнит-тесты → check → поиск → verify → apply (с подтверждениями). DLL собираешь сам — шаг 4.">
+            ⚡ АВТО‑ЧИНКА
+          </button>
+          <button class="btn btn-danger" id="btn-stop" hidden>■ Стоп</button>
+        </div>
+        <div class="help-pop" id="help-pop" hidden>
+          <button class="help-close" id="help-close" title="Закрыть">✕</button>
+          <h4>Что делает --force?</h4>
+          <p>Обычный поиск сначала делает быстрый health-check: игрок и камера на месте &#8594; решает, что искать нечего. <b>Force</b> заставляет искать <b>всё равно</b>, игнорируя проверку.</p>
+          <p>Нужно, когда:</p>
+          <ul>
+            <li>бот косит частично (сломан, но check зелёный) — сдвинулся второстепенный оффсет: awake-дерево, terrain, area-инфо;</li>
+            <li>вышел хотфикс от GGG без объявления;</li>
+            <li>хочешь полную ревизию всех оффсетов перед релизом.</li>
+          </ul>
+          <p class="help-note">Обычно не нужна — в 9 из 10 случаев оставляй выключенной.</p>
+        </div>
+        <div class="prompt-box" id="prompt-box" hidden>
+          <p id="prompt-text">Применить эту правку?</p>
+          <div>
+            <button class="btn btn-primary btn-sm" id="prompt-yes">Да / применить</button>
+            <button class="btn btn-ghost btn-sm" id="prompt-no">Нет / пропустить</button>
+            <button class="btn btn-danger btn-sm" id="prompt-abort">Прервать прог‌рамму</button>
+          </div>
+        </div>
+        <div class="stages" id="stages" hidden>
+          <div class="stages-label">
+            <span id="stages-label-text">Подключение…</span>
+            <span class="stages-info" id="stages-info">0/9</span>
+          </div>
+          <div class="stages-bar" id="stages-bar"></div>
+        </div>
+      </section>
+
+      <!-- Результат последнего шага -->
+      <section class="result-strip" id="result-strip" hidden>
+        <div class="result-verdict" id="result-verdict">—</div>
+        <div class="result-meta" id="result-meta"></div>
+      </section>
+
+      <!-- Лог / отчёт -->
+      <section class="panes">
+        <div class="pane-tabs">
+          <button class="pane-tab active" data-pane="log">Лог команды</button>
+          <button class="pane-tab" data-pane="report">Отчёт</button>
+        </div>
+        <div class="pane pane-log active" id="pane-log">
+          <pre id="term">» Добро пожаловать в poe2_scope.
+» Игра должна быть запущена и стоять в зоне (не в меню).
+» Жми «Запустить проверку» — подсказки по шагам слева.</pre>
+        </div>
+        <div class="pane pane-report" id="pane-report">
+          <div class="report-toolbar">
+            <button class="btn btn-ghost btn-sm" id="btn-report-md">report.md</button>
+            <button class="btn btn-ghost btn-sm" id="btn-report-json">report.json (сырой)</button>
+          </div>
+          <div class="report-body" id="report-body"><p class="muted">Отчёт появится после --check / --find / --verify / --apply (--dump-md).</p></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Подсказка при клике на заблокированный шаг -->
+  <div class="step-tip" id="step-tip" hidden>
+    <button class="step-tip-close" id="step-tip-close" title="Закрыть">✕</button>
+    <h4 id="step-tip-title">Шаг недоступен</h4>
+    <p id="step-tip-text"></p>
+    <button class="btn btn-primary btn-sm" id="step-tip-action" hidden></button>
+  </div>
+
+  <footer class="footbar">
+    <label class="py-row">
+      <span>python:</span>
+      <input type="text" id="py-path" spellcheck="false" />
+      <button class="btn btn-ghost btn-sm" id="btn-py-pick" title="Выбрать python.exe вручную">…</button>
+    </label>
+    <span class="foot-note" id="foot-note">проект: C:\Projects\POE2AUTO\poe2_scope</span>
+  </footer>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

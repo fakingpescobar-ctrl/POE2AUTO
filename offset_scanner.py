@@ -225,11 +225,30 @@ class OffsetScanner:
             if not game_state or game_state < 0x10000:
                 continue
 
-            # GameState → InGameState
+            # GameState → InGameState (пост-патч 2026-09-04: States[]-перебор)
+            # КАЖДЫЙ кандидат валидируется по metadata (как C# ValidateIgs):
+            # vec-deref может дать ненулевой МУСОР — тогда берётся States[i].
+            in_game = 0
+            _cands = []
             vec_ptr = self._mem.read_pointer(game_state + off.GameState.CURRENT_STATE_PTR)
-            if not vec_ptr:
-                continue
-            in_game = self._mem.read_pointer(vec_ptr)
+            if vec_ptr:
+                _cands.append(self._mem.read_pointer(vec_ptr))
+            for _i in range(off.GameState.STATES_COUNT):
+                _cands.append(self._mem.read_pointer(
+                    game_state + off.GameState.STATES_ARRAY + _i * off.GameState.STATES_STRIDE))
+            for _cand in _cands:
+                if not _cand or _cand < 0x10000:
+                    continue
+                _ai = self._mem.read_pointer(_cand + off.InGameState.AREA_INSTANCE)
+                if not _ai or _ai < 0x10000:
+                    continue
+                _pl = self._mem.read_pointer(_ai + off.AreaInstance.LOCAL_PLAYER)
+                if not _pl or _pl < 0x10000:
+                    continue
+                _meta = self._read_metadata(_pl)
+                if _meta and "Metadata/" in _meta:
+                    in_game = _cand
+                    break
             if not in_game:
                 continue
 
@@ -1046,14 +1065,30 @@ class OffsetScanner:
     # ── Helpers ─────────────────────────────────────────────────────────────
 
     def _read_metadata(self, entity_ptr: int) -> Optional[str]:
-        """Прочитать metadata path сущности."""
+        """Прочитать metadata path сущности.
+
+        ВАЖНО: name_ptr из details+0x08 — это УЖЕ указатель на wchar_t данные,
+        НЕ структура std::wstring (deref давал мусор; фикс 05.09.2026).
+        Копия C# ReadEntityPath: UTF-16 напрямую, печатный ASCII."""
         details = self._mem.read_pointer(entity_ptr + off.Entity.DETAILS_PTR)
         if not details:
             return None
         name_ptr = self._mem.read_pointer(details + off.EntityDetails.NAME)
-        if not name_ptr:
+        if not name_ptr or name_ptr < 0x100000000:
             return None
-        return self._read_std_wstring(name_ptr)
+        buf = self._mem.read_bytes(name_ptr, 256)
+        if not buf:
+            return None
+        out = []
+        for i in range(0, min(len(buf), 512) - 1, 2):
+            c = (buf[i] | (buf[i + 1] << 8)) & 0xFFFF
+            if c == 0:
+                break
+            if 0x20 <= c <= 0x7E:
+                out.append(chr(c))
+            else:
+                break
+        return "".join(out) if out else None
 
     def _read_std_wstring(self, address: int) -> Optional[str]:
         """Прочитать std::wstring."""

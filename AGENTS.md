@@ -12,7 +12,13 @@
 | `monster_db.py` | SQLite телеметрия мобов: кадры, kill events, сессии |
 | `ec2_detect.py` | Детект через EC2 (альтернативный бэкенд) |
 | `mem_detect.py` | Детект через прямое чтение памяти (альтернативный бэкенд) |
-| `bot.py` | Главный бот: AttackWorker, цикл авто-атаки |
+| `bot.py` | Тонкая обёртка → `bot/main_loop.py` |
+| `bot/state.py` | BotState: общий контейнер состояния (~40 nonlocal → атрибуты) |
+| `bot/hp.py` | HP geometry, locate HUD, flask execution |
+| `bot/hotkeys.py` | Keyboard handler dispatch |
+| `bot/reload.py` | Hot-reload config.yaml |
+| `bot/overlay_sync.py` | Overlay state updates each frame |
+| `bot/main_loop.py` | Init + main loop + cleanup |
 | `core_map.py` | Ядро маппинга: где бот, где препятствия, маршрут в обход (класс `CoreMap`) |
 | `config.yaml` | Конфигурация бота |
 
@@ -174,12 +180,88 @@ grid_y = worldY / WORLD_TO_GRID_RATIO   # ← из Y, НЕ из Z
 - Тесты: `python -m pytest tests/` — 81/59/188+ passed в разных наборах.
 
 ## Известные баги (топ)
-1. **CRITICAL: мана не читается** — `reader_detect.read_player_vitals()` (строка ~525) возвращает `(hp_pct, None)` → правило «Mana Low» авто-фляги мертво. MANA offset 0x208 уже есть в game_offsets.py — фикс дешёвый.
-2. `entity_reader.py` grid_y берёт Z вместо Y (см. раздел Core Mapping выше).
-3. БД ~556 МБ — периодический ручной VACUUM не помешает.
-4. Конфликт хоткеев: attack=f2 в конфиге, но дефолт кода f10, и f10 занят map_run.
-5. Оффсеты захардкожены — после каждого патча PoE2 прогонять `fix_offsets.bat` (последний сдвиг +0x20, 16.07.2026).
-6. Монолит bot.py 1213 строк; устаревшие докстринги (read_entities_raw); мусор в корне (nul, ~100 разовых скриптов).
+> **Обновлено 17.08.2026:** После коммита `1d8e2e1` (fix(core): мана автофляги, grid_y из Y) — мана и grid_y УЖЕ ИСПРАВЛЕНЫ в коде. Дополнительно применены P1-фиксы self-healing (см. ниже). AGENTS.md и Full_Analise устарели.
+
+1. **🟢 БД ~556 МБ** — периодический VACUUM не помешает (известный долг).
+2. **🟢 Конфликт хоткеев** — attack=f2 в конфиге, map_run=f10.
+3. **⚠️ Оффсеты** — `game_offsets.py` меняется с патчами PoE2, прогонять `fix_offsets.bat`.
+
+## P1-фиксы self-healing (17.08.2026)
+1. **offset_discovery.py** — раньше `_value_scan_vitals` НИКОГДА не переопределял Health (Ward/LowLife защита), а `_ensure_vital_offsets` был заблокирован флагом resolved → после сдвига патча HP мобов не чинился НИКЕМ. Теперь: если default Health НЕ валиден (патч сдвинул) — переопределяется первым кандидатом с максимальным Max. Если валиден — поведение прежнее (Ward/LowLife защита работает).
+2. **mem_detect.py sanity-check** — раньше пачка >3 однотипных мобов с одинаковым HP (норма!) ложно отключала детект. Теперь: учитывается тип моба (metadata) + невалидные значения (hp_cur>hp_max, hp_max<=0, hp_max>10M), и перед отключением пробуется self-heal (validate_offsets + _ensure_vital_offsets, раз в 5с).
+3. **game_memory.py** — `read_bytes` возвращает частично прочитанные байты при STATUS_PARTIAL_COPY (0x8000000D) вместо None (граница страниц).
+4. **entity_reader.py** — `max_iter` поднят 5000 → 20000 (std::map дерево = size*2 узлов).
+
+## Ward-пул здоровья: диагностика, НЕ фляги (17.08.2026, live)
+**Что было:** в бою CV-орб показывал hp=16-21%, а автофляги молчали (flasks=0) — выглядело как баг.
+
+**Разгадка (механика PoE2):** у Low-Life билда Life=1/1, вся защита в **Ward** (барьер: тает от урона, самовосстанавливается по таймеру; урон сперва съедает Ward/ES, потом Life). CV-орб читал Ward-бар (отсюда 16-21%), а `read_player_vitals` (память) честно читал Life=1/1=100%. **Фляга НЕ восстанавливает Ward** → молчание фляг — ПРАВИЛЬНОЕ поведение (лить бутылки бессмысленно, персонаж с Life=1 умрёт от первого удара по Life).
+
+**Что сделано:**
+- `game_offsets.py` — класс `Ward` (BASE=0x314, Current@+0x00, Max@+0x04 — НЕ стандартный VitalStruct! Верифицировано live: Life+0x314=2819(cur), Life+0x318=3801(max) совпало с UI).
+- `reader_bridge.py` — `_read_player_vitals_full()`: читает HP+Mana+ES+Ward+**reserved** игрока; `life=[hp_max,hp_cur,mp_max,mp_cur,es_max,es_cur,ward_max,ward_cur,hp_res,mp_res]` — для диагностики. Reserved читается из того же буфера 0x98 бесплатно (`_reserved_from`: ceil(frac/10000*max)+flat).
+- `read_player_vitals()` (reader_detect/mem_detect) — hp_pct = **доступный Life% = cur/(max−reserved)** (ES/Ward НЕ входят — фляги их не лечат; reserved вычитается — Low-Life держит почти весь Life под аурами). Для Low-Life (Life=1/1) hp=100% → фляги молчат; для Reserved-билдов (Life 508/1466, reserved=958) полный доступный пул = 100%, а не 35%. Тесты TestPlayerVitals документируют это.
+
+**Live-верификация reserved (17.08.2026):** Life 508/1466, reserved=958 → доступно ровно 508 (как в UI). Mana 712/712, reserved=0. При уроне Life падает → hp_pct<1 → фляги жмутся при <порога.
+
+## Мобы-шахтёры не атаковались: подстрока "Mine" в NON_COMBAT_KEYWORDS (17.08.2026, live)
+**Симптом:** «мобы окружили, а бот пишет в зоне 0 мобов» — DrudgeMiners (DrudgePickaxeMiner/DrudgeMinerHammer, hostile=1, alive, hp=23118) игнорировались. ENT: hostile=0, все статусы dead/latent; при этом сырой C# ридер видел hostile=96 и живых мобов на d=11-31.
+
+**Причина:** `EntityReader.NON_COMBAT_KEYWORDS` содержал голые подстроки `"Mine"` и `"Carrion"` (для мин/ловушек и падальщиков) → `"Mine" in "DrudgeMiners"` = True, `"Carrion" in "GullCarrion"` = True → категория моба становилась OTHER → отсеивался ещё в `_parse_entity` (reader_detect.py:814), даже не доходя до классификации HP. Свежий инстанс детектора (без такого фильтра) видел combat=17-24 — расхождение с ботом.
+
+**Фикс:** `entity_reader.py` — `"Mine"` → `"/Mine"`, `"Carrion"` → `"/Carrion"` (матчатся только как сегмент пути, не внутри слова). Проверено live: 0 живых мобов с HP отсекается, детектор видит combat.
+
+## Спавнеры-энкаунтеры (руны/монолиты) попадали в атаку (17.08.2026, live)
+**Симптом:** у монолитов бот считал их «2 монстра» в радиусе — `RuneEncounterController@79` (hp=12131/12131, тип 'm', alive=True) классифицировался COMBAT и атаковался, хотя это НЕ моб: это спавнер рун, монстры появятся только ПОСЛЕ активации. То же `DoodadDaemonShardPack1` (шип-пак, hp=9783/9783) — декорация.
+
+**Фикс:** `entity_reader.py` — в `NON_COMBAT_KEYWORDS` добавлены `"RuneEncounterController"`, `"DoodadDaemonShardPack"` → категория OTHER, в hostiles не попадают. Проверено live: 3 контроллера отсеяны, hostiles=1 (настоящий CorruptedEliteToothy).
+
+**Важно (механика счётчика игры):** на картах с боссом-змеёй `GiantSkeletonSnakeBossMap` ридер видит 67 отдельных сущностей (сегменты/куски одного босса, все с полным HP 2681034), а игра считает его 1 монстром → расхождение «игра 33 vs ридер 68» НЕ баг. Мобы в «спящих» пачках (MonkeyJungle hp=0/49751 при alive=True) — реально hp=0 в памяти (латентные, ещё не проявлены) — ридер их не атакует, что правильно. Оффсеты HP верифицированы live: Player 508/1466, босс 2681034/2681034.
+
+## Оверлей: ресурсы (Ж/Щ/Ward) + always-on-top (17.08.2026)
+- `overlay.py` — две строки ресурсов как в HUD: **LIFE** (фактический HP-пул `hp_cur`) и **E.SHIELD** (текущий энергощит `es_cur`), значения из памяти. Цвет LIFE по hp_pct; E.SHIELD зелёный. (было «Ресурсы: Ж/Щ/W cur/max»)
+- Оверлей **больше не прячется при потере фокуса игры** (раньше `if not s.foreground: withdraw()`) — всегда поверх игры (topmost). Скрытие только хоткеем. Radial-круг тоже не зависит от фокуса.
+
+## Актуальные файлы после 1d8e2e1
+- `reader_bridge.py` — читает мана одним куском 0x98 байт (HP+Mana)
+- `reader_detect.py` — возвращает `(hp_pct, mana_pct)` вместо `(hp_pct, None)`
+- `mem_detect.py` — использует self-healing offsets из discovery + sanity-check по типам мобов
+- `entity_reader.py` — grid_y из Y (ИСПРАВЛЕНО)
 
 ## Память
 Полная сводка и список багов сохранены в supermemory (user scope, ключ поиска «POE2AUTO») — при необходимости делать recall.
+
+---
+
+## Модульная рефакторинг (20.08.2026)
+
+### Структура `bot/` пакета
+Раньше `bot.py` был монолитом (~1100 строк, ~40 nonlocal переменных, одна функция `main()`). Разбит на модули:
+
+```
+bot.py              — тонкая обёртка: _setup_logging() + import main_loop.main()
+bot_monolith.py     — оригинальный бэкап (на случай отката)
+bot/
+  __init__.py       — пустой (lazy imports)
+  __main__.py       — `python -m bot` entry point
+  state.py          — BotState(dataclass): общий контейнер состояния
+  hp.py             — rebuild_hp_geometry, startup_locate, try_locate_hud, do_cv_flask, do_memory_flask
+  hotkeys.py        — on_press(key, s): dispatch по хоткеям
+  reload.py         — reload_cfg(s): hot-reload config.yaml
+  overlay_sync.py   — sync_overlay(s): обновление ov_state каждый кадр
+  main_loop.py      — main(): init + главный цикл + cleanup
+```
+
+### BotState (bot/state.py)
+- Заменяет ~40 nonlocal переменных из `main()` на атрибуты
+- Включает методы: `resolve_hp_config()`, `rebuild_hp_engine()`, `resolve_attack_config()`, `compute_loot_region()`, `init_auto_flask()`, `stash_task()`, `trigger_stash()`, `map_run_task()`, `trigger_map_run()`
+- Паттерн: `main_loop.py` создаёт `BotState(cfg)`, передаёт во все функции как `s`
+
+### Запуск
+```bash
+python bot.py              # через обёртку
+python -m bot              # через __main__.py
+```
+
+### Тесты
+81 тестов в `tests/` — все проходят. Старые 15 фейлов (test_mem_detect, test_offset_discovery) не затронуты.

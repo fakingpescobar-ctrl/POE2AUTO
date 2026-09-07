@@ -53,6 +53,14 @@ class OverlayState:
         self.flask_on = True         # авто-фляска включена (хоткей flask в config.yaml, F3)
         self.diag = False
         self.hp_pct = None          # 0..1 или None
+        # Точные пулы здоровья из памяти (жизнь/энергосчёт/ward) для отображения.
+        # None = данные недоступны (не memory-режим или ридер не читается).
+        self.hp_cur = None
+        self.hp_max = None
+        self.es_cur = None
+        self.es_max = None
+        self.ward_cur = None
+        self.ward_max = None
         self.flasks = 0
         self.presses = 0
         self.fps = 0.0
@@ -68,6 +76,9 @@ class OverlayState:
         self.memory_status = "off"  # "ok" | "fallback" | "off" — memory-режим атаки/фляги
         self.attack_mode = ""      # "MEM" | "CV" | "" — текущий режим детекции автоатаки
         self.atk_fallback = ""     # причина фолбэка memory→CV, пусто если нет
+        # Модули ядра: [(имя, ok, деталь)] — зелёная/красная точка в оверлее.
+        # ok=True — модуль подключен и работает; ok=False — не подключен/ошибка.
+        self.modules = []
         # Индикаторы модуля памяти (для нижней строки оверлея).
         # mem_connected — процесс PoE2 найден и подключён (OpenProcess handle есть)
         # mem_reading   — память реально читается (game_state != 0, данные идут)
@@ -188,9 +199,21 @@ class Overlay:
         self._rows["attack"] = self._status_row(pad, "Авто-атака", k_attack)
         self._rows["attack_mode"] = self._status_row(pad, "Режим", "")
         self._rows["flask"] = self._status_row(pad, "Авто-фляска", k_flask)
+        # Ресурсы: две строки как в HUD — LIFE (фактический HP-пул) и E.SHIELD
+        # (текущее количество энергощита). Значения из памяти (оверлей всегда честный).
+        self._rows["vitals_hp"] = self._status_row(pad, "LIFE", "")
+        self._rows["vitals_es"] = self._status_row(pad, "E.SHIELD", "")
         self._rows["locate"] = self._status_row(pad, "Калибровка HUD", "")
         self._rows["diag"] = self._status_row(pad, "Диагностика", k_diag)
         self._rows["radial"] = self._status_row(pad, "Радиус", k_radial)
+
+        # Модули ядра: динамические строки с зелёной/красной точкой
+        tk.Label(pad, text="МОДУЛИ ЯДРА", bg=C_PANEL, fg=C_DIM,
+                 font=("Segoe UI", 8)).pack(anchor="w", pady=(6, 0))
+        self._mods_frame = tk.Frame(pad, bg=C_PANEL)
+        self._mods_frame.pack(fill="x")
+        self._module_rows = []   # [row_dict] — строки модулей (пересоздаются при смене списка)
+        self._module_names = []  # имена модулей, для которых созданы строки
 
         tk.Frame(pad, bg="#2a2a34", height=1).pack(fill="x", pady=(8, 6))
 
@@ -266,7 +289,7 @@ class Overlay:
                      font=("Segoe UI", 8)).pack(side="right")
         val = tk.Label(row, text="OFF", bg=C_PANEL, fg=C_OFF, font=("Segoe UI Semibold", 9))
         val.pack(side="right", padx=(0, 8))
-        return {"dot": dot, "val": val}
+        return {"dot": dot, "val": val, "frame": row}
 
     def _make_click_through(self):
         if not _HAS_CTYPES:
@@ -318,6 +341,17 @@ class Overlay:
             hp = "—" if s.hp_pct is None else f"{s.hp_pct*100:.0f}%"
             self._set(self._rows["flask"], True, hp, _hp_color(s.hp_pct))
 
+        # Ресурсы: LIFE — фактический HP-пул, E.SHIELD — текущий энергощит.
+        # Значения из памяти (reader/memory-режим); в CV — прочерк.
+        if s.hp_cur is not None:
+            self._set(self._rows["vitals_hp"], True, f"{s.hp_cur}", _hp_color(s.hp_pct))
+        else:
+            self._set(self._rows["vitals_hp"], False, "—", C_DIM)
+        if s.es_cur is not None:
+            self._set(self._rows["vitals_es"], True, f"{s.es_cur}", C_ON)
+        else:
+            self._set(self._rows["vitals_es"], False, "—", C_DIM)
+
         if s.locate_state == "ok":
             self._set(self._rows["locate"], True,
                       f"захват ✓ {s.locate_info}".rstrip(), C_ON)
@@ -339,13 +373,13 @@ class Overlay:
         # Режим детекции автоатаки
         if s.attack_enabled and s.attack_on:
             if s.attack_mode == "MEM":
-                mode_text = "MEM 🧠"
+                mode_text = "Memory 🧠"
                 mode_color = C_ON
             elif s.attack_mode == "RDR":
-                mode_text = "RDR ??"
+                mode_text = "Reader 📡"
                 mode_color = C_ON
             elif s.attack_mode == "CV":
-                mode_text = "CV 👁"
+                mode_text = "Computer Vision 👁"
                 mode_color = C_ACCENT
             else:
                 mode_text = "—"
@@ -358,6 +392,22 @@ class Overlay:
             self._set(self._rows["attack_mode"], True, s.attack_mode or "—", C_DIM)
         else:
             self._set(self._rows["attack_mode"], False, "—", C_DIM)
+
+        # Модули ядра: строки создаём/пересоздаём только при смене состава имён
+        names = [m[0] for m in s.modules]
+        if names != self._module_names:
+            self._module_names = names
+            for r in self._module_rows:
+                try:
+                    r["frame"].destroy()
+                except Exception:
+                    pass
+            self._module_rows = []
+            for name in names:
+                self._module_rows.append(self._status_row(self._mods_frame, name, ""))
+        for row, (_name, ok, detail) in zip(self._module_rows, s.modules):
+            row["dot"].config(fg=C_ON if ok else C_WARN)
+            row["val"].config(text=detail, fg=C_ON if ok else C_WARN)
 
         self._rows["focus"].config(fg=C_ON if s.foreground else C_OFF)
         # Основной stats (левый Label): фляги/подбор/fps — без индикаторов памяти.
@@ -415,12 +465,9 @@ class Overlay:
             self._rows["debug_mob"].config(text="")
             self._rows["debug_zone"].config(text="")
 
-        # скрывать оверлей когда игра не в фокусе (если пользователь не скрыл вручную)
-        if self._visible and not s.foreground:
-            self._root.withdraw()
-        elif self._visible and s.foreground:
-            self._root.deiconify()
-
+        # Оверлей ВСЕГДА поверх игры: не прячем при потере фокуса (юзер хочет
+        # видеть панель, даже когда кликнул в другое окно). Топмост выставлен
+        # в _run; скрытие только вручную (хоткей скрыть).
         self._update_radial(s)
 
         try:
@@ -432,7 +479,8 @@ class Overlay:
         """Круг радиуса авто-атаки вокруг персонажа (хоткей radial, F4)."""
         if self._rad is None:
             return
-        want = bool(s.radial_visible) and bool(s.foreground)
+        # Круг виден пока включён (F4) — не зависит от фокуса игры.
+        want = bool(s.radial_visible)
         if not want:
             if self._rad.winfo_viewable():
                 self._rad.withdraw()

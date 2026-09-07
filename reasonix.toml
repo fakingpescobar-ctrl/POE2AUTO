@@ -1,0 +1,80 @@
+# Reasonix configuration for POE2AUTO project
+# Docs: https://reasonix.dev
+
+[project]
+name = "POE2AUTO"
+description = "Autobot for Path of Exile 2 - HP detection, auto attack, loot, navigation"
+
+[agent]
+model = "qwen3.6-35b-a3b-apex-mtp"
+permission_mode = "yolo"
+context_window = 32768  # Reduced - be selective with context!
+
+[system_prompt]
+# System prompt is loaded from REASONIX_MEMORY.md
+# Reasonix reads this file at startup to understand the project
+path = "REASONIX_MEMORY.md"
+
+# CRITICAL: How to work without hitting context limits
+rules = """
+IMPORTANT RULES FOR CONTEXT MANAGEMENT:
+
+1. NEVER read multiple large files at once. Read ONE file at a time, max 500 lines.
+2. Use codebase-memory-mcp tools INSTEAD of reading files:
+   - search_graph: find functions, classes, routes
+   - trace_path: find who calls what
+   - get_code_snippet: read specific function/class
+   - get_architecture: high-level overview
+3. When you need to understand a module:
+   - First: search_graph to find relevant symbols
+   - Then: get_code_snippet for specific functions only
+   - Only read full file if absolutely necessary
+4. Keep responses short. Don't dump entire file contents.
+5. If context is getting full, STOP and summarize what you found.
+
+ANTI-LOOP RULES (CRITICAL):
+6. NEVER repeat the same information. If you listed something once, don't list it again.
+7. When listing items (bugs, files, functions), deduplicate BEFORE outputting.
+8. Maximum 20 items in any list. If more exist, summarize the rest.
+9. If you notice you're repeating yourself, STOP immediately and output a summary.
+10. Each commit hash should appear AT MOST ONCE in your output.
+"""
+
+[context]
+# Only include essential files - don't load everything at once!
+# Use codebase-memory-mcp for code exploration instead of reading files.
+include = [
+    "REASONIX_MEMORY.md",
+]
+
+# Files to exclude from context
+exclude = [
+    "*.log",
+    "*.db",
+    "*.db-shm",
+    "*.db-wal",
+    "__pycache__/",
+    ".git/",
+    "Full_Analise_Project.md",
+    "FULL_ANALYSIS.md",
+    "DEPENDENCY_ANALYSIS.md",
+    "ANALYSIS.md",
+]
+
+[memory]
+# Memory settings for long-term context
+enabled = true
+# Maximum tokens for memory injection - keep small to avoid context overflow
+max_tokens = 8192
+
+[tools]
+# Enable file operations
+read = true
+write = true
+edit = true
+bash = true
+grep = true
+glob = true
+
+# MCP servers configured via: reasonix mcp add codebase-memory-mcp
+# See: reasonix mcp list

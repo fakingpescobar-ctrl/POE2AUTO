@@ -51,6 +51,7 @@ class MemoryMobDetector:
         self._resolve_failures = 0
         self._max_resolve_failures = 3  # после 3 неудач — откат на CV
         self._last_resolve = 0.0
+        self._last_heal_attempt = 0.0  # guard для self-heal попыток (раз в 5с)
         self._igs_ptr = 0  # кеш AOB-цепочки
         self._hideout_cache = None  # (area_instance, result)
         self._hideout_cache_ts = 0.0
@@ -158,18 +159,55 @@ class MemoryMobDetector:
                           and not e.is_friendly
                           and e.hp_current > 0]
 
-        # Sanity: если >80% живых монстров имеют одинаковый HP — оффсет Vital сломан
-        # (билды с Ward/LowLife, плейсхолдеры после патча)
+        # Sanity: проверка на сломанный Vital offset.
+        # Одинаковый HP у ОДНОТИПНЫХ мобов — НОРМА (пачка зомби). Подозрительно:
+        # (а) невалидные значения (hp_cur > hp_max, hp_max <= 0, hp_max > 10M),
+        # (б) одинаковый HP у мобов РАЗНЫХ типов, покрывающий >80% всех живых.
         hp_counts = {}
         for e in monsters_alive:
             key = (e.hp_current, e.hp_max)
             hp_counts[key] = hp_counts.get(key, 0) + 1
         most_common_hp = max(hp_counts, key=hp_counts.get) if hp_counts else None
         most_common_count = hp_counts.get(most_common_hp, 0) if most_common_hp else 0
-        hp_broken = (len(monsters_alive) > 3
-                     and most_common_count > len(monsters_alive) * 0.8)
+
+        invalid_values = any(e.hp_max <= 0 or e.hp_current > e.hp_max
+                             or e.hp_max > 10_000_000 for e in monsters_alive)
+        hp_broken = invalid_values
+        if len(monsters_alive) > 3 and most_common_count > len(monsters_alive) * 0.8:
+            # Сколько разных типов мобов в самой частой группе HP
+            group_types = set()
+            for e in monsters_alive:
+                if (e.hp_current, e.hp_max) == most_common_hp:
+                    group_types.add(e.metadata.split("/")[-1] if e.metadata else "?")
+            hp_broken = hp_broken or len(group_types) > 1
+
+        # Single-type спавн (одни зомби): тип не различает. Сильный признак
+        # сломанного оффсета — hp_max мобов == hp_max ИГРОКА (все читают одну
+        # структуру). У живых мобов пулы почти всегда отличаются от игрока.
+        if (not hp_broken and most_common_hp and self._player_hp
+                and isinstance(self._player_hp[1], (int, float))
+                and self._player_hp[1] > 0
+                and most_common_count >= 5
+                and most_common_hp[1] == self._player_hp[1]):
+            hp_broken = True
+            _log.debug("hp_broken: %d mobs share player hp_max=%d (offset points to player vitals)",
+                       most_common_count, self._player_hp[1])
 
         if hp_broken:
+            # Сначала пробуем self-heal (пере-скан оффсетов) — отключаем только
+            # если после этого HP всё ещё подозрителен.
+            now_h = time.monotonic()
+            if self.reader and now_h - self._last_heal_attempt > 5.0:
+                self._last_heal_attempt = now_h
+                player_ptr = self.mem.read_pointer(
+                    self._area_instance + off.AreaInstance.LOCAL_PLAYER)
+                if player_ptr:
+                    comps = self.reader._resolve_components(player_ptr)
+                    life_addr = comps.get("Life")
+                    if life_addr:
+                        self.reader.validate_offsets(life_addr)
+                        self.reader._vital_offsets_resolved = False
+                        self.reader._ensure_vital_offsets(life_addr)
             hostile = []
             _log.warning("HP offset похоже сломан: %d/%d монстров имеют hp=%s — отключаю memory детект",
                          most_common_count, len(monsters_alive), most_common_hp)
@@ -247,12 +285,22 @@ class MemoryMobDetector:
 
     def read_player_vitals(self) -> tuple:
         """Прочитать HP% и Mana% игрока из памяти.
-        Возвращает (hp_pct, mana_pct) или (None, None)."""
+
+        Возвращает (hp_pct, mana_pct) или (None, None).
+
+        hp_pct = ТОЛЬКО доступный Life% = cur / (max − reserved): reserved —
+        HP, зарезервированный аурами (Low-Life билды: max=1466, reserved≈958 →
+        доступно ~508). По max считать нельзя — полный доступный HP выглядел
+        бы как «низкое здоровье».
+
+        ES/Ward НЕ входят: фляги их НЕ восстанавливают (Ward самовосстанавливается
+        по таймеру, урон сперва съедает ES/Ward, потом Life). Для Low-Life
+        (Life=1/1, защита = Ward) hp_pct всегда 100% → фляги молчат.
+        Аналогично ReaderMobDetector.read_player_vitals."""
         if not self._area_instance or not self.reader:
             return None, None
 
         import game_offsets as off
-        import struct
 
         player_ptr = self.reader._mem.read_pointer(
             self._area_instance + off.AreaInstance.LOCAL_PLAYER
@@ -264,23 +312,19 @@ class MemoryMobDetector:
         if not life_addr:
             return None, None
 
-        # HP
+        # HP — self-healing offset из discovery; unreserved = max − reserved
+        health_off = self.reader._health_off if hasattr(self.reader, '_health_off') else off.Life.HEALTH
+        hp_cur, hp_avail = self.reader._read_vital_unreserved(life_addr + health_off)
         hp_pct = None
-        data = self.reader._mem.read_bytes(life_addr + off.Life.HEALTH, off.VitalStruct.SIZE)
-        if data:
-            hp_max = struct.unpack("<i", data[off.VitalStruct.MAX:off.VitalStruct.MAX+4])[0]
-            hp_cur = struct.unpack("<i", data[off.VitalStruct.CURRENT:off.VitalStruct.CURRENT+4])[0]
-            if hp_max > 0:
-                hp_pct = max(0.0, min(1.0, hp_cur / hp_max))
+        if hp_avail > 0:
+            hp_pct = max(0.0, min(1.0, hp_cur / hp_avail))
 
-        # Mana
+        # Mana — self-healing offset из discovery; unreserved = max − reserved
+        mana_off = self.reader._mana_off if hasattr(self.reader, '_mana_off') else off.Life.MANA
+        mp_cur, mp_avail = self.reader._read_vital_unreserved(life_addr + mana_off)
         mana_pct = None
-        data = self.reader._mem.read_bytes(life_addr + off.Life.MANA, off.VitalStruct.SIZE)
-        if data:
-            mp_max = struct.unpack("<i", data[off.VitalStruct.MAX:off.VitalStruct.MAX+4])[0]
-            mp_cur = struct.unpack("<i", data[off.VitalStruct.CURRENT:off.VitalStruct.CURRENT+4])[0]
-            if mp_max > 0:
-                mana_pct = max(0.0, min(1.0, mp_cur / mp_max))
+        if mp_avail > 0:
+            mana_pct = max(0.0, min(1.0, mp_cur / mp_avail))
 
         return hp_pct, mana_pct
 
@@ -440,11 +484,52 @@ class MemoryMobDetector:
             game_state = self.mem.read_pointer(slot_addr)
             if not game_state or game_state < 0x10000:
                 continue
-            igs = self.mem.read_pointer(self.mem.read_pointer(game_state + 0x08))
-            if not igs:
-                continue
-            area_inst = self.reader.find_area_instance(game_state)
-            if not area_inst or area_inst < 0x10000:
+            # InGameState: States[]-перебор (пост-патч 2026-09-04).
+            # vec-deref может дать ненулевой МУСОР — каждый кандидат валидируется.
+            _cands = []
+            _v = self.mem.read_pointer(game_state + 0x08)
+            if _v:
+                _cands.append(self.mem.read_pointer(_v))
+            for _i in range(off.GameState.STATES_COUNT):
+                _cands.append(self.mem.read_pointer(
+                    game_state + off.GameState.STATES_ARRAY + _i * off.GameState.STATES_STRIDE))
+            igs = 0
+            area_inst = 0
+            for _c in _cands:
+                if not _c or _c < 0x10000:
+                    continue
+                _ai = self.mem.read_pointer(_c + off.InGameState.AREA_INSTANCE)
+                if not _ai or _ai < 0x10000:
+                    continue
+                _vt = self.mem.read_pointer(_ai)
+                if not _vt or not (self.mem._base <= _vt <= self.mem._base + self.mem._size):
+                    continue
+                _pl = self.mem.read_pointer(_ai + off.AreaInstance.LOCAL_PLAYER)
+                if not _pl or _pl < 0x10000:
+                    continue
+                # Метадата игрока должна быть "Metadata/" — иначе мусорный кандидат
+                # (States[0] в некоторых зонах даёт area с валидным vtable, но пустой path)
+                _d = self.mem.read_pointer(_pl + off.Entity.DETAILS_PTR)
+                _sp = self.mem.read_pointer(_d + off.EntityDetails.NAME) if _d else 0
+                _buf = self.mem.read_bytes(_sp, 256) if _sp and _sp > 0x100000000 else None
+                _meta = ""
+                if _buf:
+                    _chars = []
+                    for _j in range(0, min(len(_buf), 512) - 1, 2):
+                        _cc = (_buf[_j] | (_buf[_j + 1] << 8)) & 0xFFFF
+                        if _cc == 0:
+                            break
+                        if 0x20 <= _cc <= 0x7E:
+                            _chars.append(chr(_cc))
+                        else:
+                            break
+                    _meta = "".join(_chars)
+                if not _meta.startswith("Metadata/"):
+                    continue
+                igs = _c
+                area_inst = _ai
+                break
+            if not igs or not area_inst:
                 continue
             vtable = self.mem.read_pointer(area_inst)
             if not vtable or not (self.mem._base <= vtable <= self.mem._base + self.mem._size):

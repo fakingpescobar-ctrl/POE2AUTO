@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _log = logging.getLogger("poe2auto.monster_db")
 
 _CLEANUP_INTERVAL_S = 3600.0  # автоочистка: раз в час удаляем старше keep_days
+_WAL_CHECKPOINT_INTERVAL_S = 600.0  # WAL checkpoint: каждые 10 минут
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS monster_events (
@@ -83,6 +84,7 @@ class MonsterDB:
         self._thread: Optional[threading.Thread] = None
         self._stopping = threading.Event()
         self._last_cleanup = 0.0
+        self._last_wal_checkpoint = 0.0
         self.session_id: str = ""
 
     def start(self, session_id: str) -> None:
@@ -192,10 +194,24 @@ class MonsterDB:
         дорогой (пересборка всей БД), поэтому бежим только если реально
         удалили записи, и не чаще раза в час. В WAL/autocommit режиме безопасен:
         writer-поток — единственный пишущий, транзакции не открыты.
+
+        WAL CHECKPOINT: каждые 10 минут делаем TRUNCATE, чтобы WAL файл не рос.
         """
         if self.keep_days <= 0:
             return
         now = time.time()
+        
+        # WAL checkpoint каждые 10 минут (отдельно от cleanup)
+        if now - self._last_wal_checkpoint >= _WAL_CHECKPOINT_INTERVAL_S:
+            self._last_wal_checkpoint = now
+            try:
+                assert self._conn is not None
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                _log.debug("MonsterDB WAL checkpoint выполнен")
+            except sqlite3.Error as wce:
+                _log.warning("MonsterDB WAL checkpoint failed: %s", wce)
+        
+        # Cleanup (удаление старых записей + VACUUM)
         if now - self._last_cleanup < _CLEANUP_INTERVAL_S:
             return
         self._last_cleanup = now
@@ -492,6 +508,49 @@ class MonsterDB:
         finally:
             conn.close()
 
+    @staticmethod
+    def force_cleanup(path: str, keep_days: float = 3.0) -> dict:
+        """Принудительная очистка БД (вызывать когда бот НЕ запущен).
+
+        1. Удаляет записи старше keep_days
+        2. Делает WAL checkpoint (TRUNCATE)
+        3. Делает VACUUM (сжатие файла)
+
+        Returns:
+            {"deleted": int, "before_bytes": int, "after_bytes": int}
+        """
+        result = {"deleted": 0, "before_bytes": 0, "after_bytes": 0}
+        try:
+            result["before_bytes"] = os.path.getsize(path)
+        except OSError:
+            pass
+        
+        conn = sqlite3.connect(path)
+        try:
+            # Удаляем старые записи
+            cutoff = time.time() - keep_days * 86400
+            before = conn.total_changes
+            conn.execute("DELETE FROM monster_events WHERE ts < ?", (cutoff,))
+            result["deleted"] = conn.total_changes - before
+            
+            # WAL checkpoint
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            
+            # VACUUM
+            if result["deleted"] > 0:
+                conn.execute("VACUUM")
+            
+            _log.info("MonsterDB force cleanup: удалено %d записей", result["deleted"])
+        finally:
+            conn.close()
+        
+        try:
+            result["after_bytes"] = os.path.getsize(path)
+        except OSError:
+            pass
+        
+        return result
+
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -502,6 +561,7 @@ class MonsterDB:
 #   python monster_db.py --kills            — кого бот убил (детект убийств)
 #   python monster_db.py --sessions         — список всех сессий
 #   python monster_db.py --session ID       — сводка конкретной сессии
+#   python monster_db.py --cleanup          — принудительная очистка (бот НЕ запущен!)
 #   (опц. позиционный аргумент = путь к БД)
 # ──────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -513,7 +573,7 @@ if __name__ == "__main__":
                         datefmt="%H:%M:%S")
 
     opts = {"db": None, "name": None, "addr": None, "kills": False,
-            "sessions": False, "session": None}
+            "sessions": False, "session": None, "cleanup": False}
     rest = []
     i = 0
     argv = sys.argv[1:]
@@ -529,6 +589,8 @@ if __name__ == "__main__":
             opts["kills"] = True; i += 1
         elif a == "--sessions":
             opts["sessions"] = True; i += 1
+        elif a == "--cleanup":
+            opts["cleanup"] = True; i += 1
         else:
             rest.append(a); i += 1
     if rest:
@@ -539,6 +601,20 @@ if __name__ == "__main__":
 
     db_path = opts["db"] or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "monster_telemetry.db")
+    
+    # Принудительная очистка (бот НЕ должен быть запущен!)
+    if opts["cleanup"]:
+        if not os.path.exists(db_path):
+            print("БД не найдена: %s" % db_path); sys.exit(1)
+        size_before = os.path.getsize(db_path)
+        print("Очистка БД: %s" % db_path)
+        print("Размер ДО: %.1f МБ" % (size_before / 1024 / 1024))
+        result = MonsterDB.force_cleanup(db_path, keep_days=3.0)
+        size_after = os.path.getsize(db_path)
+        print("Удалено записей: %d" % result["deleted"])
+        print("Размер ПОСЛЕ: %.1f МБ" % (size_after / 1024 / 1024))
+        print("Освобождено: %.1f МБ" % ((size_before - size_after) / 1024 / 1024))
+        sys.exit(0)
     if not os.path.exists(db_path):
         print("БД не найдена: %s" % db_path)
         print("Запусти бота с monster_db.enabled: true — БД создастся сама.")

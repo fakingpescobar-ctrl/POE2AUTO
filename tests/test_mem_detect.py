@@ -152,6 +152,75 @@ class TestPresent:
         assert det.present() is False
 
 
+class TestHpBrokenSanity:
+    """Sanity-check на сломанный Vital offset (пачка однотипных ≠ поломка)."""
+
+    def _hostile_type(self, id, mtype, hp=100, dist=5.0):
+        return EntityData(
+            id=id, category=EntityCategory.MONSTER,
+            metadata="/Monsters/%s" % mtype,
+            x=5.0, y=5.0, z=0.0, grid_x=5.0, grid_y=5.0,
+            hp_current=hp, hp_max=100, hp_ratio=hp / 100,
+            rarity=Rarity.NORMAL, is_friendly=False, distance=dist,
+        )
+
+    def _det_with_entities(self, entities):
+        det = MemoryMobDetector()
+        det._connected = True
+        det._area_instance = 0x12345
+        det.mem = MagicMock()
+        det.mem.connected = True
+        det.mem.read_pointer.return_value = 0
+        det.reader = MagicMock()
+        det.reader.read_local_player.return_value = MagicMock(grid_x=0, grid_y=0)
+        det.reader.read_entities.return_value = entities
+        det._resolve_game_state = MagicMock()
+        det.update()
+        return det
+
+    def test_same_type_pack_not_broken(self):
+        """5 одинаковых зомби с одинаковым HP — НОРМА, не отключаем детект."""
+        pack = [self._hostile_type(i, "Zombie") for i in range(1, 6)]
+        det = self._det_with_entities(pack)
+        assert det.stats["hostile_in_range"] == 5
+
+    def test_different_types_same_hp_broken(self):
+        """Разные типы мобов с одинаковым HP — подозрительно (оффсет сломан)."""
+        mobs = [self._hostile_type(i, "Type%d" % i) for i in range(1, 6)]
+        det = self._det_with_entities(mobs)
+        assert det.stats["hostile_in_range"] == 0
+
+    def test_invalid_values_broken(self):
+        """hp_cur > hp_max — явно сломанный оффсет."""
+        bad = EntityData(
+            id=1, category=EntityCategory.MONSTER, metadata="/Monsters/Bad",
+            x=5.0, y=5.0, z=0.0, grid_x=5.0, grid_y=5.0,
+            hp_current=999, hp_max=100, hp_ratio=9.99,
+            rarity=Rarity.NORMAL, is_friendly=False, distance=5.0,
+        )
+        det = self._det_with_entities([bad])
+        assert det.stats["hostile_in_range"] == 0
+
+    def test_self_heal_attempted(self):
+        """При hp_broken вызывается self-heal (validate_offsets + ensure)."""
+        det = MemoryMobDetector()
+        det._connected = True
+        det._area_instance = 0x12345
+        det.mem = MagicMock()
+        det.mem.connected = True
+        det.mem.read_pointer.return_value = 0x777
+        det.reader = MagicMock()
+        det.reader._resolve_components.return_value = {"Life": 0x888}
+        det.reader.read_local_player.return_value = MagicMock(grid_x=0, grid_y=0)
+        mobs = [self._hostile_type(i, "Type%d" % i) for i in range(1, 6)]
+        det.reader.read_entities.return_value = mobs
+        det._resolve_game_state = MagicMock()
+        det._last_heal_attempt = 0.0
+        det.update()
+        det.reader.validate_offsets.assert_called_with(0x888)
+        det.reader._ensure_vital_offsets.assert_called_with(0x888)
+
+
 class TestInHideout:
     def test_no_area_instance(self):
         det = MemoryMobDetector()

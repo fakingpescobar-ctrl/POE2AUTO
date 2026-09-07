@@ -644,3 +644,92 @@ class TestFrameScenario:
                        rarity=2)  # RARE
         st = self._frame(det, [raw])
         assert st[1] == TargetStatus.COMBAT, f"rare: {st}"
+
+
+class TestPlayerVitals:
+    """read_player_vitals: hp_pct = ТОЛЬКО доступный Life% (max − reserved).
+
+    ES/Ward НЕ входят — фляги их НЕ восстанавливают (Ward в PoE2
+    самовосстанавливается по таймеру). Для Low-Life (Life=1/1, защита=Ward)
+    hp_pct всегда 100% → автофляги корректно молчат.
+    reserved (ауры) вычитается из max: Low-Life билды держат почти весь
+    Life в резерве — фляги считают % от доступного пула.
+
+    life = [hp_max, hp_cur, mp_max, mp_cur, es_max, es_cur, ward_max,
+    ward_cur, hp_reserved, mp_reserved] (см. reader_bridge.
+    _read_player_vitals_full; ES/Ward/reserved — диагностика).
+    """
+
+    def test_low_life_ward_dominant_no_flask(self):
+        """Low-Life: Life=1/1 + Ward=3801/2819 → hp_pct=1.0 (фляги молчат)."""
+        det = _make_detector(_player_hp=[1, 1, 100, 100, 0, 0, 3801, 2819, 0, 0])
+        hp, mana = det.read_player_vitals()
+        assert hp == 1.0, f"hp_pct={hp} (должен быть Life, не суммарный пул)"
+        assert mana == 1.0
+
+    def test_ward_does_not_affect_hp(self):
+        """Ward полный/пустой НЕ влияет: Life 50/100 → 0.5 в обоих случаях."""
+        d_full = _make_detector(_player_hp=[100, 50, 0, 0, 0, 0, 3801, 3801, 0, 0])
+        d_empty = _make_detector(_player_hp=[100, 50, 0, 0, 0, 0, 3801, 0, 0, 0])
+        assert d_full.read_player_vitals()[0] == 0.5
+        assert d_empty.read_player_vitals()[0] == 0.5
+
+    def test_es_does_not_affect_hp(self):
+        """ES не входит в hp_pct (не лечится флягой): Life 50/100 → 0.5."""
+        det = _make_detector(_player_hp=[100, 50, 0, 0, 40, 40, 0, 0, 0, 0])
+        hp, _ = det.read_player_vitals()
+        assert hp == 0.5
+
+    def test_reserved_life_full_available(self):
+        """Reserved Low-Life: max=1466, reserved=958, доступно=508.
+        Полный доступный пул (cur=508) → 1.0, НЕ 35% (иначе фляги
+        лились бы впустую)."""
+        det = _make_detector(_player_hp=[1466, 508, 0, 0, 0, 0, 0, 0, 958, 0])
+        hp, _ = det.read_player_vitals()
+        assert hp == 1.0
+
+    def test_reserved_life_half_available(self):
+        """Доступный Life на половине: cur=254/508 → 0.5."""
+        det = _make_detector(_player_hp=[1466, 254, 0, 0, 0, 0, 0, 0, 958, 0])
+        hp, _ = det.read_player_vitals()
+        assert hp == 0.5
+
+    def test_reserved_mana(self):
+        """Mana reserved: max=712, reserved=356, доступно=356, cur=178 → 0.5."""
+        det = _make_detector(_player_hp=[100, 100, 712, 178, 0, 0, 0, 0, 0, 356])
+        hp, mana = det.read_player_vitals()
+        assert hp == 1.0 and mana == 0.5
+
+    def test_reserved_whole_pool(self):
+        """Весь Life зарезервирован (available=0) → hp_pct=None (фляге нечего
+        лечить — не лить)."""
+        det = _make_detector(_player_hp=[100, 100, 0, 0, 0, 0, 0, 0, 100, 0])
+        hp, _ = det.read_player_vitals()
+        assert hp is None
+
+    def test_legacy_9_elem_no_reserved(self):
+        """Старый формат life (9 элементов, без reserved) → hp_cur/hp_max."""
+        det = _make_detector(_player_hp=[100, 50, 100, 80, 0, 0, 0, 0, 0])
+        hp, mana = det.read_player_vitals()
+        assert hp == 0.5 and mana == 0.8
+
+    def test_mana_pct(self):
+        """Mana: 80/100 → 0.8."""
+        det = _make_detector(_player_hp=[100, 100, 100, 80, 0, 0, 0, 0, 0, 0])
+        hp, mana = det.read_player_vitals()
+        assert hp == 1.0 and mana == 0.8
+
+    def test_zero_max_no_pools(self):
+        """hp_max=0 → (None, None)."""
+        det = _make_detector(_player_hp=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        assert det.read_player_vitals() == (None, None)
+
+    def test_none_data(self):
+        """_player_hp=None → (None, None)."""
+        det = _make_detector(_player_hp=None)
+        assert det.read_player_vitals() == (None, None)
+
+    def test_short_list_fallback(self):
+        """Аномально короткий life (len<4) → (None, None), не падаем."""
+        det = _make_detector(_player_hp=[100, 100, 0])
+        assert det.read_player_vitals() == (None, None)

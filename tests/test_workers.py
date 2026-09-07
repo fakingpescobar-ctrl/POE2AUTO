@@ -108,3 +108,65 @@ class TestAttackWorker:
         assert mob_present is False
         zone_det.in_hideout.assert_not_called()
         mob_det.present.assert_not_called()
+
+    def test_memory_cv_fallback_when_not_ready(self):
+        """RDR/MEM не готов (available=False) -> CV fallback (гибридный режим)."""
+        mob_det = MagicMock()
+        mob_det.update.return_value = None
+        mob_det.in_hideout.return_value = False
+        mob_det.available = False
+        cv_det = MagicMock()
+        cv_det.present.return_value = True
+        zone_det = MagicMock()
+        zone_det.in_hideout.return_value = False
+        w = AttackWorker(mob_det, zone_det=zone_det, use_memory=True, cv_det=cv_det)
+
+        full_frame = object()
+        foreground = True
+        mob_present = False
+        in_hideout = False
+        # = логика AttackWorker.run() (memory + CV fallback)
+        mob_det.update()
+        in_hideout = mob_det.in_hideout()
+        if not in_hideout and getattr(mob_det, "available", False):
+            mob_present = mob_det.present()
+        if not in_hideout and not getattr(mob_det, "available", False) and cv_det is not None:
+            in_hideout = zone_det is not None and zone_det.in_hideout(full_frame)
+            if not in_hideout:
+                mob_present = cv_det.present(full_frame)
+
+        assert mob_present is True
+        mob_det.present.assert_not_called()
+        cv_det.present.assert_called_once()
+        w.stop()
+
+    def test_memory_ready_no_cv_fallback(self):
+        """RDR готов (available=True) -> память, CV не трогаем."""
+        mob_det = MagicMock()
+        mob_det.update.return_value = None
+        mob_det.in_hideout.return_value = False
+        mob_det.available = True
+        mob_det.present.return_value = True
+        cv_det = MagicMock()
+        zone_det = MagicMock()
+        zone_det.in_hideout.return_value = False
+        w = AttackWorker(mob_det, zone_det=zone_det, use_memory=True, cv_det=cv_det)
+
+        full_frame = object()
+        foreground = True
+        mob_present = False
+        in_hideout = False
+        # = логика AttackWorker.run() (memory + CV fallback)
+        mob_det.update()
+        in_hideout = mob_det.in_hideout()
+        if not in_hideout and getattr(mob_det, "available", False):
+            mob_present = mob_det.present()
+        if not in_hideout and not getattr(mob_det, "available", False) and cv_det is not None:
+            in_hideout = zone_det is not None and zone_det.in_hideout(full_frame)
+            if not in_hideout:
+                mob_present = cv_det.present(full_frame)
+
+        assert mob_present is True
+        mob_det.present.assert_called_once()
+        cv_det.present.assert_not_called()
+        w.stop()

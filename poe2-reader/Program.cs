@@ -62,19 +62,43 @@ public class PatternScanner(MemoryReader _reader)
         return null;
     }
 
-    public ulong FindGsoSlot(ulong moduleBase, int moduleSize)
+    public ulong FindGsoSlot(ulong moduleBase, int moduleSize, Func<ulong, bool>? validateSlot = null)
     {
-        byte[] pattern = [0x48, 0x39, 0x2D, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x85, 0x16, 0x01, 0x00, 0x00];
+        // Relaxed "Game States" pattern: cmp [rip+rel32], rbp; jnz — jnz displacement
+        // wildcarded (per-patch the surrounding function shifts the jump distance).
+        // Patched 2026-09-04: strict jne=0x116 no longer matches (displacement changed).
+        // Multiple candidates are normal; the caller validates each by walking the full
+        // chain to a "Metadata/" local player (see GameReader.TryResolveChain).
         var data = _reader.ReadBytes(moduleBase, moduleSize);
         if (data.Length == 0) return 0;
-        for (int i = 0; i <= data.Length - pattern.Length; i++)
+        ulong fallback = 0;
+        for (int i = 0; i <= data.Length - 12; i++)
         {
             if (data[i] != 0x48 || data[i + 1] != 0x39 || data[i + 2] != 0x2D) continue;
-            if (data[i + 7] != 0x0F || data[i + 8] != 0x85 || data[i + 9] != 0x16 || data[i + 10] != 0x01 || data[i + 11] != 0x00 || data[i + 12] != 0x00) continue;
+            if (data[i + 7] != 0x0F || data[i + 8] != 0x85) continue;
             int rel = BitConverter.ToInt32(data, i + 3);
-            return moduleBase + (ulong)(i + 7) + (ulong)rel;
+            ulong slot = moduleBase + (ulong)(i + 7) + (ulong)rel;
+            if (validateSlot == null) return slot;
+            if (validateSlot(slot)) return slot;
+            if (fallback == 0) fallback = slot;
         }
-        return 0;
+        return fallback;
+    }
+
+    // Возвращает ВСЕ relaxed-кандидаты (для валидации на стороне Python по цепочке).
+    public ulong[] FindGsoSlots(ulong moduleBase, int moduleSize)
+    {
+        var data = _reader.ReadBytes(moduleBase, moduleSize);
+        if (data.Length == 0) return [];
+        var slots = new List<ulong>();
+        for (int i = 0; i <= data.Length - 12; i++)
+        {
+            if (data[i] != 0x48 || data[i + 1] != 0x39 || data[i + 2] != 0x2D) continue;
+            if (data[i + 7] != 0x0F || data[i + 8] != 0x85) continue;
+            int rel = BitConverter.ToInt32(data, i + 3);
+            slots.Add(moduleBase + (ulong)(i + 7) + (ulong)rel);
+        }
+        return slots.ToArray();
     }
 }
 
@@ -83,24 +107,29 @@ public class PatternScanner(MemoryReader _reader)
 // ──────────────────────────────────────
 public static class Off
 {
-    // IGS / AreaInstance
-    public const ulong IgsOff = 0x88;
-    public const ulong AreaInstanceOff = 0x290;
-    public const ulong CameraOff = 0x368;
+    // IGS / AreaInstance — версия после патча 2026-09-04 (все значения подтверждены live:
+    // игs = g+States[6] = g+0x48+6*0x10, area = igs+0x2A0, player = area+0x5D0, meta
+    // 'Metadata/Characters/Dex/DexFourb'). Старые: 0x290 / 0x368 / 0x5C0 / 0x6E0 / 0xA0 / 0x11C.
+    public const ulong IgsStatesBase = 0x48;     // GameState.States (inline array 12 x 0x10 ptr slots)
+    public const ulong IgsStateStride = 0x10;
+    public const ulong IgsStateSlotCount = 12;
+    public const ulong IgsCurrentStatePtr = 0x08; // GameState.CurrentStatePtr (StdVector: first elem = InGameState)
+    public const ulong AreaInstanceOff = 0x2A0;
+    public const ulong CameraOff = 0x378;
     public const ulong CameraMatrixOff = 0x1A0;
-    public const ulong TerrainWidthOff = 0x928;    // terrain cells per row (from poe2-offsets)
-    public const ulong TerrainHeightOff = 0x92C;   // terrain total rows (from poe2-offsets)
-    public const ulong Layer0Off = 0x990;           // terrain layer0 ptr (works for this PoE2 version)
-    public const ulong Layer1Off = 0x988;
-    public const ulong TerrainStrideOff = 0x9F0;   // stride in bytes per row (shifted +0x20 from poe2-offsets for this PoE2 version)
-    public const ulong AreaHashOff = 0x11C;
-    public const ulong AreaStrOff = 0xA0;
+    public const ulong TerrainWidthOff = 0x938;    // terrain cells per row (was 0x928, +0x10)
+    public const ulong TerrainHeightOff = 0x93C;   // terrain total rows (was 0x92C, +0x10)
+    public const ulong Layer0Off = 0x9A0;           // terrain layer0 ptr (was 0x990, +0x10)
+    public const ulong Layer1Off = 0x998;
+    public const ulong TerrainStrideOff = 0xA00;   // stride in bytes per row (was 0x9F0, +0x10)
+    public const ulong AreaHashOff = 0x114;         // was 0x11C, -0x08
+    public const ulong AreaStrOff = 0x098;          // AreaInfoPtr (was 0xA0, -0x08)
     public const ulong PlayerPosOff = 0xA90;       // протух (см. LocalPlayerOff) — только для /diag
-    public const ulong LocalPlayerOff = 0x5C0;     // ✓ AreaInstance → local player Entity (patch 2026-07-16: 0x5A0→0x5C0)
+    public const ulong LocalPlayerOff = 0x5D0;     // ✓ AreaInstance → local player Entity (2026-09-04: 0x5C0→0x5D0)
 
     // Entity tree (red-black, sentinel-based)
-    public const ulong AwakeSentinelOff = 0x6E0;   // AI+0x6E0 = sentinel
-    public const ulong AwakeCountOff = 0x6E8;      // AI+0x6E8 = count
+    public const ulong AwakeSentinelOff = 0x6F0;   // AI+0x6F0 = sentinel (was 0x6E0, +0x10)
+    public const ulong AwakeCountOff = 0x6F8;      // AI+0x6F8 = count
 
     // Tree node (0x30 bytes)
     public const ulong TreeNodeLeft = 0x00;
@@ -143,7 +172,44 @@ public class GameReader(MemoryReader _r)
     public void SetGso(ulong v) => _gso = v;
     public void SetModuleBase(ulong b) => _modBase = b;
 
-    public ulong Igs() { var g = _r.ReadU64(_gso); return g != 0 ? _r.ReadU64(g + Off.IgsOff) : 0; }
+    private ulong _igsCache;
+    private ulong _igsCacheFor;
+
+    public ulong Igs()
+    {
+        var g = _r.ReadU64(_gso);
+        if (g == 0) { _igsCache = 0; _igsCacheFor = 0; return 0; }
+        if (g == _igsCacheFor) return _igsCache;
+
+        // Как Poe2Live.TryResolve: InGameState = первый элемент CurrentStatePtr StdVector,
+        // fallback — 12 слотов States[]. Валидна только цепочка, дающая локального игрока
+        // с metadata "Metadata/…" (после патча 2026-09-04 игs = States[6] = g+0xA8).
+        ulong best = 0;
+        var vecFirst = _r.ReadU64(g + Off.IgsCurrentStatePtr);
+        if (vecFirst != 0 && IsHeap(vecFirst))
+        {
+            var igs = _r.ReadU64(vecFirst);
+            if (ValidateIgs(igs)) best = igs;
+        }
+        for (int i = 0; best == 0 && i < (int)Off.IgsStateSlotCount; i++)
+        {
+            var igs = _r.ReadU64(g + Off.IgsStatesBase + (ulong)((ulong)i * Off.IgsStateStride));
+            if (ValidateIgs(igs)) best = igs;
+        }
+        _igsCache = best; _igsCacheFor = g;
+        return best;
+    }
+
+    bool ValidateIgs(ulong igs)
+    {
+        if (igs == 0 || !IsHeap(igs)) return false;
+        var ai = _r.ReadU64(igs + Off.AreaInstanceOff);
+        if (ai == 0 || !IsHeap(ai)) return false;
+        var lp = _r.ReadU64(ai + Off.LocalPlayerOff);
+        if (lp == 0 || !IsHeap(lp)) return false;
+        return ReadEntityPath(lp).StartsWith("Metadata/", StringComparison.Ordinal);
+    }
+
     public ulong Area() { var i = Igs(); return i != 0 ? _r.ReadU64(i + Off.AreaInstanceOff) : 0; }
     public ulong Cam() { var i = Igs(); return i != 0 ? _r.ReadU64(i + Off.CameraOff) : 0; }
     public ulong Player() { var a = Area(); return a != 0 ? _r.ReadU64(a + Off.LocalPlayerOff) : 0; }

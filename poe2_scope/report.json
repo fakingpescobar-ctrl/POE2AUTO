@@ -1,0 +1,53 @@
+{
+  "cmd": "tests",
+  "ts": "2026-09-06T21:33:56+00:00",
+  "patch": "2026-09-04",
+  "game": {
+    "pid": 0,
+    "base": 0
+  },
+  "ok": true,
+  "pid": 0,
+  "base": 0,
+  "summary": "364 passed (7.5s)",
+  "notes": [
+    "Тесты: 364 passed (7.5s)"
+  ],
+  "findings": [
+    {
+      "name": "AreaInstance.LOCAL_PLAYER",
+      "old": 1488,
+      "new": 1488,
+      "score": 100,
+      "detail": "player=0x380A8F5F600 meta='Metadata/Characters/Dex/DexFourb'"
+    },
+    {
+      "name": "InGameState.CAMERA",
+      "old": 888,
+      "new": 888,
+      "score": 80,
+      "detail": "ptr=0x380D4DC0A00 cam=0x380D4DC0A00 zoom=1.0"
+    },
+    {
+      "name": "AreaInstance.AWAKE_ENTITIES",
+      "old": 1776,
+      "new": 1776,
+      "score": 90,
+      "detail": "ptr=0x380A65746B0 EntityTree+0x6F0=0x380A65746B0 n=384"
+    },
+    {
+      "name": "AreaInstance.AREA_INFO",
+      "old": 152,
+      "new": 152,
+      "score": 60,
+      "detail": "ptr=0x380B2249530 level=79 hash=0xA856346A code='MapSinkhole'"
+    },
+    {
+      "name": "AreaInstance.TERRAIN_METADATA",
+      "old": 2256,
+      "new": 2256,
+      "score": 50,
+      "detail": "ptr=0x7FF7ABCD2A90 terrain@area+0x8D0=0x380A8EF10D0 vtable=0x7FF7ABCD2A90 total_tiles=87 details=OK walkable=OK"
+    }
+  ]
+}

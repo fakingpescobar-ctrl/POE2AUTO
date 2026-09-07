@@ -193,6 +193,7 @@ class ReaderMobDetector:
         self._last_proj_ts = 0.0
 
         # Состояние
+        self._last_err_logged = ""
         self._connected = False
         self._last_entities: List[EntityData] = []
         self._status_by_id: Dict[int, str] = {}  # eid -> TargetStatus (кэш классификации на кадр)
@@ -227,9 +228,16 @@ class ReaderMobDetector:
             return True
         ok = self.bridge.initialize()
         if not ok:
+            # Пишем причину в лог один раз при её смене (иначе спам каждые ~2 с).
+            err = getattr(self.bridge, "_last_err", "")
+            if err and err != self._last_err_logged:
+                self._last_err_logged = err
+                _log.warning("ReaderBridge: %s — жду авто-переподключения "
+                             "(проверка каждые ~2 с)", err)
             _log.debug("ReaderBridge ещё не готов (PoE2 не запущен / нет admin?)")
             return False
         self._connected = True
+        self._last_err_logged = ""
         _log.info("ReaderDetector connected: pid=%d", self.bridge.pid)
         # Старт SQLite телеметрии (если включена в config). session_id = время.
         if self.db is not None:
@@ -518,13 +526,35 @@ class ReaderMobDetector:
 
         Returns:
             (hp_pct, mana_pct) — доли 0..1, или (None, None) если данных нет.
-            HP/Mana читаются из Life VitalStruct'ов (см. reader_bridge._read_life_hp):
-            life=[hp_max, hp_cur, mp_max, mp_cur, ...].
+
+        hp_pct = ТОЛЬКО доступный Life% = cur / (max − reserved): reserved —
+        HP, зарезервированный аурами (Low-Life билды держат почти весь пул
+        в резерве: max=1466, reserved≈958 → доступно ~508). Считать по max
+        нельзя: полный доступный HP (508/1466=35%) выглядел бы как «низкое
+        здоровье» и фляги лились бы впустую.
+
+        ES/Ward НЕ входят в hp_pct: фляги их НЕ восстанавливают (Ward в PoE2
+        самовосстанавливается по таймеру, урон сперва съедает ES/Ward и только
+        потом идёт в Life). Для Low-Life (Life=1/1, защита = Ward) hp_pct
+        всегда 100% → автофляги корректно молчат (лить бутылки бессмысленно).
+
+        Данные из reader_bridge: life=[hp_max,hp_cur,mp_max,mp_cur,
+        es_max,es_cur,ward_max,ward_cur,hp_res,mp_res].
         """
         lc = self._player_hp or []
-        if len(lc) >= 4 and lc[0] > 0:
-            hp_pct = lc[1] / lc[0]
-            mana_pct = (lc[3] / lc[2]) if lc[2] > 0 else None
+        if len(lc) >= 4 and lc[0] and lc[0] > 0:
+            hp_res = lc[8] if len(lc) >= 10 else 0
+            mp_res = lc[9] if len(lc) >= 10 else 0
+            hp_avail = lc[0] - hp_res
+            if hp_avail > 0:
+                hp_pct = max(0.0, min(1.0, lc[1] / hp_avail))
+            else:
+                hp_pct = None  # весь пул зарезервирован — фляге нечего лечить
+            mp_avail = lc[2] - mp_res
+            if mp_avail > 0:
+                mana_pct = max(0.0, min(1.0, lc[3] / mp_avail))
+            else:
+                mana_pct = None
             return hp_pct, mana_pct
         return None, None
 

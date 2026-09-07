@@ -72,6 +72,10 @@ class MobBarDetector:
         self._boot_box = None   # (x, y, w, h) текущего бутстрап-кандидата
         self._boot_since = 0.0  # когда кандидат впервые появился на этом месте
 
+        # CV-детектор всегда доступен, если создан (аналог .available у
+        # MemoryMobDetector/ReaderMobDetector — overlay_sync полагается на него)
+        self.available = True
+
     def _is_dark_zone(self, hsv_sub):
         """Тёмная зона по средней яркости V уже посчитанного HSV кропа ROI.
 

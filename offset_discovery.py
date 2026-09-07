@@ -232,15 +232,35 @@ class OffsetDiscovery:
                          life_addr, self.VITAL_SCAN_MIN, self.VITAL_SCAN_MAX)
             return False
 
-        # Health — используем default (off.Life.HEALTH), не переопределяем value-scan'ом
-        # value-scan может найти неверный VitalStruct для Ward/LowLife билдов
+        # Health — по умолчанию используем default (off.Life.HEALTH): value-scan
+        # может принять VitalStruct Ward/LowLife билда за Health. НО если default
+        # НЕ валиден (патч сдвинул Life layout) — переопределяем первым кандидатом,
+        # иначе HP мобов сломан навсегда (см. P1 self-healing conflict).
+        default_ok = self._vital_looks_valid(life_addr + off.Life.HEALTH)
         rest = [c for c in candidates if c[0] != off.Life.HEALTH]
         rest.sort(key=lambda x: x[1], reverse=True)
 
-        if len(rest) >= 1:
-            self._mana_off = rest[0][0]
-        if len(rest) >= 2:
-            self._es_off = rest[1][0]
+        if not default_ok and candidates:
+            # Патч сдвинул layout — Health теперь по другому адресу.
+            # Берём кандидат с максимальным Max (скорее всего Health); при равных
+            # Max — ближайший к default Health (page-alignment не сбивает выбор).
+            sorted_candidates = sorted(
+                candidates,
+                key=lambda x: (x[1], -abs(x[0] - off.Life.HEALTH)),
+                reverse=True,
+            )
+            self._health_off = sorted_candidates[0][0]
+            if len(sorted_candidates) > 1:
+                self._mana_off = sorted_candidates[1][0]
+            if len(sorted_candidates) > 2:
+                self._es_off = sorted_candidates[2][0]
+            _log.warning("Health offset auto-relocated: 0x%X -> 0x%X (default invalid after patch)",
+                         off.Life.HEALTH, self._health_off)
+        else:
+            if len(rest) >= 1:
+                self._mana_off = rest[0][0]
+            if len(rest) >= 2:
+                self._es_off = rest[1][0]
 
         _log.info("Value-scan found %d VitalStructs: Health=0x%X (default), Mana=0x%X (%d), ES=0x%X (%d)",
                   len(candidates),

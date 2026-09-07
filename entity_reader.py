@@ -94,8 +94,12 @@ class EntityReader:
         "Summoned", "/Daemon/", "Invisible", "MonsterMods", "TormentedSpirit",
         "Wisp", "/Spirit/", "Spectre", "Phantom", "Illusion", "Duplicate",
         "Clone", "Shade", "Wraith", "Ghost", "Undead",
-        "Rogue", "TreasureGuard", "Trap", "Mine", "Explosive",
-        "Blighted", "Seething", "Festering", "Carrion",
+        "Rogue", "TreasureGuard", "Trap", "/Mine", "Explosive",
+        "Blighted", "Seething", "Festering", "/Carrion",
+        # Спавнеры-энкаунтеры (руны/монолиты) и шип-паки: живут с hp>0 в
+        # памяти и тип 'm', но это НЕ мобы — атаковать нельзя, монстры
+        # появятся после активации (live 17.08.2026).
+        "RuneEncounterController", "DoodadDaemonShardPack",
     )
 
     def __init__(self, mem: GameMemory):
@@ -127,7 +131,10 @@ class EntityReader:
 
         queue = deque([root])
         visited = set()
-        max_iter = min(size * 2, 5000)
+        # std::map дерево = до size*2 узлов; лимит 10000 = запас на ~5000 сущностей
+        # (текущая плотность карт 1172-1328, запас >3.7x). Каждая итерация —
+        # один read_bytes(48) + Python overhead, 10000 итераций ≈ 3-5 мс.
+        max_iter = min(size * 2, 10000)
 
         for _ in range(max_iter):
             if not queue:
@@ -197,11 +204,28 @@ class EntityReader:
         """Прочитать информацию о текущей зоне."""
         info = {}
 
-        # Area code (UTF-16)
+        # Area code: area+0x98 → УКАЗАТЕЛЬ на std::wstring (ptr, len) → данные.
+        # НЕ прямой wchar_t* (в отличие от metadata name!). Копия validators.v4.
+        # Декод строго по первому NUL с ASCII-фильтром (в памяти может быть
+        # leaked-хвост/дубль после terminator).
         info_ptr = self._mem.read_pointer(area_instance + off.AreaInstance.AREA_INFO)
-        if info_ptr:
-            code = self._mem.read_std_wstring(info_ptr)
-            info["code"] = code or ""
+        code = ""
+        if info_ptr and info_ptr > 0x100000000:
+            p = self._mem.read_pointer(info_ptr)
+            if p and p > 0x100000000:
+                buf = self._mem.read_bytes(p, 128)
+                if buf:
+                    chars = []
+                    for i in range(0, min(len(buf), 256) - 1, 2):
+                        c = (buf[i] | (buf[i + 1] << 8)) & 0xFFFF
+                        if c == 0:
+                            break
+                        if 0x20 <= c <= 0x7E:
+                            chars.append(chr(c))
+                        else:
+                            break
+                    code = "".join(chars)
+        info["code"] = code
 
         # Area level
         level = self._mem.read_int(area_instance + off.AreaInstance.AREA_LEVEL)

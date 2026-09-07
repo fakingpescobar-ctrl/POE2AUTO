@@ -134,11 +134,17 @@ class AttackWorker(threading.Thread):
                 if use_memory and mob_det is not None:
                     mob_det.update()
                     in_hideout = mob_det.in_hideout()
-                    if not in_hideout:
+                    if not in_hideout and getattr(mob_det, "available", False):
                         # «Живость» мобов определяется в reader_detect по Life-vtable
                         # (трупы/латентные сущности отсекаются на уровне парсинга),
                         # поэтому CV-подтверждение не нужно.
                         mob_present = mob_det.present()
+                    if not in_hideout and not getattr(mob_det, "available", False) and cv_det is not None:
+                        # RDR/MEM временно не готовы (PoE2 не запущен / не в зоне) —
+                        # CV fallback. Детектор сам ретраит инициализацию (REINIT_INTERVAL_S).
+                        in_hideout = zone_det is not None and zone_det.in_hideout(full_frame)
+                        if not in_hideout:
+                            mob_present = cv_det.present(full_frame)
                 elif mob_det is not None and foreground:
                     in_hideout = zone_det is not None and zone_det.in_hideout(full_frame)
                     if not in_hideout:
